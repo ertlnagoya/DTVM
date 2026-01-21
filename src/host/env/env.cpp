@@ -52,7 +52,10 @@ static void abort(Instance *instance, int32_t code) {
       getErrorWithExtraMessage(ErrorCode::EnvAbort, buf));
 }
 #else
-#error "No abort implementation"
+static void abort(Instance *instance) {
+  using namespace common;
+  instance->setExceptionByHostapi(getError(ErrorCode::EnvAbort));
+}
 #endif
 
 #define FUNCTION_LISTS                                                         \
