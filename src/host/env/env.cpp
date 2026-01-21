@@ -154,7 +154,7 @@ static void keccak256(Instance *instance, int32_t InputOffset,
 
 static void emitLogEvent(Instance *instance, int32_t DataOffset,
                          int32_t Length, int32_t Topic1, int32_t Topic2,
-                         int32_t Topic3, int32_t Topic4) {
+                         int32_t Topic3, int32_t Topic4, int32_t Topic5) {
   (void)instance;
   (void)DataOffset;
   (void)Length;
@@ -162,6 +162,7 @@ static void emitLogEvent(Instance *instance, int32_t DataOffset,
   (void)Topic2;
   (void)Topic3;
   (void)Topic4;
+  (void)Topic5;
 }
 
 #define FUNCTION_LISTS                                                         \
