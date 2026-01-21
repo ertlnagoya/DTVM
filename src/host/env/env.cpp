@@ -95,7 +95,7 @@ static void callDataCopy(Instance *instance, int32_t ResultOffset,
   if (!zeroed_result(instance, ResultOffset, Length)) {
     return;
   }
-  // No actual calldata present in host stub; result remains zeroed.
+  (void)DataOffset;
 }
 
 static void getCaller(Instance *instance, int32_t ResultOffset) {
@@ -115,7 +115,7 @@ static void revert(Instance *instance, int32_t DataOffset, int32_t Length) {
 static void finish(Instance *instance, int32_t DataOffset, int32_t Length) {
   (void)DataOffset;
   (void)Length;
-  instance->setError(ErrorCode::InstanceExit);
+  instance->setError(common::ErrorCode::InstanceExit);
 }
 
 static int32_t getCodeSize(Instance *instance) {
@@ -128,7 +128,7 @@ static void codeCopy(Instance *instance, int32_t ResultOffset,
   (void)instance;
   (void)CodeOffset;
   (void)Length;
-  zeroed_result(instance, ResultOffset, Length > 0 ? Length : 0);
+  zeroed_result(instance, ResultOffset, (Length > 0) ? Length : 0);
 }
 
 static void storageStore(Instance *instance, int32_t KeyOffset,
@@ -167,6 +167,18 @@ static void emitLogEvent(Instance *instance, int32_t DataOffset,
 #define FUNCTION_LISTS                                                         \
   MOCK_CHAIN_HOST_API_LIST                                                     \
   LIBC_HOST_API_LIST                                                           \
+  NATIVE_FUNC_ENTRY(getCallDataSize)                                           \
+  NATIVE_FUNC_ENTRY(callDataCopy)                                              \
+  NATIVE_FUNC_ENTRY(getCaller)                                                 \
+  NATIVE_FUNC_ENTRY(getCallValue)                                              \
+  NATIVE_FUNC_ENTRY(revert)                                                    \
+  NATIVE_FUNC_ENTRY(finish)                                                    \
+  NATIVE_FUNC_ENTRY(getCodeSize)                                               \
+  NATIVE_FUNC_ENTRY(codeCopy)                                                  \
+  NATIVE_FUNC_ENTRY(storageStore)                                              \
+  NATIVE_FUNC_ENTRY(storageLoad)                                               \
+  NATIVE_FUNC_ENTRY(keccak256)                                                 \
+  NATIVE_FUNC_ENTRY(emitLogEvent)                                              \
   NATIVE_FUNC_ENTRY(abort)
 
 /*
