@@ -1,9 +1,12 @@
 // Copyright (C) 2021-2023 the DTVM authors. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#include "common/errors.h"
 #include "runtime/instance.h"
 // Note: must place env.h after instance.h to get correct EXPORT_MODULE_NAME
 #include "host/env/env.h"
+
+#include <cstring>
 
 namespace zen::host {
 
@@ -57,6 +60,109 @@ static void abort(Instance *instance) {
   instance->setExceptionByHostapi(getError(ErrorCode::EnvAbort));
 }
 #endif
+
+static void report_abort(Instance *instance,
+                         const char *msg = nullptr) {
+  using namespace common;
+  if (msg) {
+    instance->setExceptionByHostapi(getErrorWithExtraMessage(
+        ErrorCode::EnvAbort, msg));
+  } else {
+    instance->setExceptionByHostapi(getError(ErrorCode::EnvAbort));
+  }
+}
+
+static bool zeroed_result(Instance *instance, int32_t ResultOffset,
+                          size_t length) {
+  if (!VALIDATE_APP_ADDR(ResultOffset, length)) {
+    report_abort(instance, "env: invalid memory range");
+    return false;
+  }
+  std::memset(ADDR_APP_TO_NATIVE(ResultOffset), 0, length);
+  return true;
+}
+
+static int32_t getCallDataSize(Instance *instance) {
+  (void)instance;
+  return 4;
+}
+
+static void callDataCopy(Instance *instance, int32_t ResultOffset,
+                         int32_t DataOffset, int32_t Length) {
+  if (Length <= 0) {
+    return;
+  }
+  if (!zeroed_result(instance, ResultOffset, Length)) {
+    return;
+  }
+  // No actual calldata present in host stub; result remains zeroed.
+}
+
+static void getCaller(Instance *instance, int32_t ResultOffset) {
+  zeroed_result(instance, ResultOffset, 20);
+}
+
+static void getCallValue(Instance *instance, int32_t ResultOffset) {
+  zeroed_result(instance, ResultOffset, 32);
+}
+
+static void revert(Instance *instance, int32_t DataOffset, int32_t Length) {
+  (void)DataOffset;
+  (void)Length;
+  report_abort(instance, "env: revert");
+}
+
+static void finish(Instance *instance, int32_t DataOffset, int32_t Length) {
+  (void)DataOffset;
+  (void)Length;
+  instance->setError(ErrorCode::InstanceExit);
+}
+
+static int32_t getCodeSize(Instance *instance) {
+  (void)instance;
+  return 0;
+}
+
+static void codeCopy(Instance *instance, int32_t ResultOffset,
+                     int32_t CodeOffset, int32_t Length) {
+  (void)instance;
+  (void)CodeOffset;
+  (void)Length;
+  zeroed_result(instance, ResultOffset, Length > 0 ? Length : 0);
+}
+
+static void storageStore(Instance *instance, int32_t KeyOffset,
+                         int32_t ValueOffset) {
+  (void)instance;
+  (void)KeyOffset;
+  (void)ValueOffset;
+}
+
+static void storageLoad(Instance *instance, int32_t KeyOffset,
+                        int32_t ResultOffset) {
+  (void)KeyOffset;
+  zeroed_result(instance, ResultOffset, 32);
+}
+
+static void keccak256(Instance *instance, int32_t InputOffset,
+                      int32_t InputLength, int32_t ResultOffset) {
+  (void)instance;
+  (void)InputOffset;
+  (void)InputLength;
+  zeroed_result(instance, ResultOffset, 32);
+}
+
+static void emitLogEvent(Instance *instance, int32_t DataOffset,
+                         int32_t Length, int32_t Topic1, int32_t Topic2,
+                         int32_t Topic3, int32_t Topic4) {
+  (void)instance;
+  (void)DataOffset;
+  (void)Length;
+  (void)Topic1;
+  (void)Topic2;
+  (void)Topic3;
+  (void)Topic4;
+}
 
 #define FUNCTION_LISTS                                                         \
   MOCK_CHAIN_HOST_API_LIST                                                     \
