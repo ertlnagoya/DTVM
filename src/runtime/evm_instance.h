@@ -6,6 +6,7 @@
 
 #include "common/evm_traphandler.h"
 #include "evm/evm.h"
+#include "evm/storage_diff.h"
 #include "evmc/evmc.hpp"
 #include "intx/intx.hpp"
 #include "runtime/evm_module.h"
@@ -43,6 +44,14 @@ public:
   // ==================== Module Accessing Methods ====================
 
   const EVMModule *getModule() const { return Mod; }
+
+  void setStorageDiffSink(evm::StorageDiffSink *Sink) { DiffSink = Sink; }
+  evm::StorageDiffSink *getStorageDiffSink() const { return DiffSink; }
+  void setStorageProvider(evm::StorageProvider *Provider) { StorageProvider = Provider; }
+  evm::StorageProvider *getStorageProvider() const { return StorageProvider; }
+  evm::ExecutionDiffLog &getDiffLog() { return DiffLog; }
+  const evm::ExecutionDiffLog &getDiffLog() const { return DiffLog; }
+  void clearDiffLog() { DiffLog.clear(); }
 
   // ==================== Platform Feature Methods ====================
 
@@ -302,6 +311,10 @@ private:
 
   // Instance-level cache storage (shared across all messages in execution)
   ExecutionCache InstanceExecutionCache;
+
+  evm::StorageDiffSink *DiffSink = nullptr;
+  evm::StorageProvider *StorageProvider = nullptr;
+  evm::ExecutionDiffLog DiffLog;
 
   // Runtime stack data for EVM.
   uint8_t EVMStack[EVMStackCapacity];
