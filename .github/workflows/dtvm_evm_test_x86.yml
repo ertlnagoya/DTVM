@@ -45,6 +45,7 @@ jobs:
     steps:
       - name: Check out code
         run: |
+          git config --global --add safe.directory "$PWD"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
           git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
@@ -91,6 +92,7 @@ jobs:
     steps:
       - name: Check out code
         run: |
+          git config --global --add safe.directory "$PWD"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
           git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
@@ -128,6 +130,7 @@ jobs:
     steps:
       - name: Check out code
         run: |
+          git config --global --add safe.directory "$PWD"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
           git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
@@ -165,6 +168,7 @@ jobs:
     steps:
       - name: Check out code
         run: |
+          git config --global --add safe.directory "$PWD"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
           git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
@@ -203,6 +207,7 @@ jobs:
     steps:
       - name: Check out code
         run: |
+          git config --global --add safe.directory "$PWD"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
           git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
@@ -238,6 +243,7 @@ jobs:
     steps:
       - name: Check out code
         run: |
+          git config --global --add safe.directory "$PWD"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
           git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
@@ -273,6 +279,7 @@ jobs:
     steps:
       - name: Check out code
         run: |
+          git config --global --add safe.directory "$PWD"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
           git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
@@ -307,6 +314,7 @@ jobs:
     steps:
       - name: Check out code
         run: |
+          git config --global --add safe.directory "$PWD"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
           git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
