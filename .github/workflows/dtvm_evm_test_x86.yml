@@ -75,6 +75,45 @@ jobs:
 
           bash .ci/run_test_suite.sh
 
+  build_test_evm_state_shanghai_subset_x86:
+    name: Test DTVM-EVM Shanghai parameterized subset on x86-64
+    if: github.event_name != 'workflow_dispatch' || inputs.job_scope == 'all'
+    runs-on: ubuntu-latest
+    container:
+      image: dtvmdev1/dtvm-dev-x64:main
+    steps:
+      - name: Check out code
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
+          git init .
+          git remote add origin "https://github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --detach FETCH_HEAD
+          git submodule update --init --recursive
+      - name: Code Format Check
+        run: |
+          ./tools/format.sh check
+      - name: Build and Run Shanghai parameterized subset
+        run: |
+          echo "current home is $HOME"
+          export LLVM_SYS_150_PREFIX=/opt/llvm15
+          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
+          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
+          export CMAKE_BUILD_TARGET=Debug
+          export ENABLE_ASAN=true
+          export RUN_MODE=interpreter
+          export INPUT_FORMAT=evm
+          export ENABLE_LAZY=true
+          export ENABLE_MULTITHREAD=true
+          export TestSuite=evmstatesubset
+          export CPU_EXCEPTION_TYPE='check'
+          export ENABLE_GAS_METER=false
+          export DTVM_TEST_REVISION=Shanghai
+          export EVM_GTEST_FILTER='ExecuteAllStateTests/*'
+
+          bash .ci/run_test_suite.sh
+
   build_test_evm_state_roundtrip_x86:
     name: Test DTVM-EVM state roundtrip on x86-64
     if: github.event_name != 'workflow_dispatch' || inputs.job_scope == 'all'
