@@ -46,11 +46,12 @@ jobs:
       - name: Check out code
         run: |
           git config --global --add safe.directory "$PWD"
+          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
+          git fetch --depth=1 origin "${{ github.sha }}"
           git checkout --detach FETCH_HEAD
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" submodule update --init --recursive
+          git submodule update --init --recursive
       - name: Code Format Check
         run: |
           ./tools/format.sh check
@@ -93,11 +94,12 @@ jobs:
       - name: Check out code
         run: |
           git config --global --add safe.directory "$PWD"
+          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
+          git fetch --depth=1 origin "${{ github.sha }}"
           git checkout --detach FETCH_HEAD
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" submodule update --init --recursive
+          git submodule update --init --recursive
       - name: Code Format Check
         run: |
           ./tools/format.sh check
@@ -131,11 +133,12 @@ jobs:
       - name: Check out code
         run: |
           git config --global --add safe.directory "$PWD"
+          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
+          git fetch --depth=1 origin "${{ github.sha }}"
           git checkout --detach FETCH_HEAD
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" submodule update --init --recursive
+          git submodule update --init --recursive
       - name: Code Format Check
         run: |
           ./tools/format.sh check
@@ -169,11 +172,12 @@ jobs:
       - name: Check out code
         run: |
           git config --global --add safe.directory "$PWD"
+          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
+          git fetch --depth=1 origin "${{ github.sha }}"
           git checkout --detach FETCH_HEAD
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" submodule update --init --recursive
+          git submodule update --init --recursive
       - name: Code Format Check
         run: |
           ./tools/format.sh check
@@ -208,11 +212,12 @@ jobs:
       - name: Check out code
         run: |
           git config --global --add safe.directory "$PWD"
+          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
+          git fetch --depth=1 origin "${{ github.sha }}"
           git checkout --detach FETCH_HEAD
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" submodule update --init --recursive
+          git submodule update --init --recursive
       - name: Code Format Check
         run: |
           ./tools/format.sh check
@@ -244,11 +249,12 @@ jobs:
       - name: Check out code
         run: |
           git config --global --add safe.directory "$PWD"
+          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
+          git fetch --depth=1 origin "${{ github.sha }}"
           git checkout --detach FETCH_HEAD
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" submodule update --init --recursive
+          git submodule update --init --recursive
       - name: Code Format Check
         run: |
           ./tools/format.sh check
@@ -280,11 +286,12 @@ jobs:
       - name: Check out code
         run: |
           git config --global --add safe.directory "$PWD"
+          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
+          git fetch --depth=1 origin "${{ github.sha }}"
           git checkout --detach FETCH_HEAD
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" submodule update --init --recursive
+          git submodule update --init --recursive
       - name: Code Format Check
         run: |
           ./tools/format.sh check
@@ -315,11 +322,12 @@ jobs:
       - name: Check out code
         run: |
           git config --global --add safe.directory "$PWD"
+          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
           git init .
           git remote add origin "https://github.com/${{ github.repository }}.git"
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
+          git fetch --depth=1 origin "${{ github.sha }}"
           git checkout --detach FETCH_HEAD
-          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" submodule update --init --recursive
+          git submodule update --init --recursive
       - name: Code Format Check
         run: |
           ./tools/format.sh check
