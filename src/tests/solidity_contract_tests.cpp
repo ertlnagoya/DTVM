@@ -199,7 +199,13 @@ TEST_P(SolidityContractTest, TestContract) {
 }
 
 TEST(SolidityStatePersistence, SaveLoadRoundTripPreservesContractState) {
-  RuntimeConfig Config;
+  RuntimeConfig Config = SolidityContractTest::GetGlobalConfig();
+  if (Config.Format != InputFormat::EVM) {
+    Config.Format = InputFormat::EVM;
+  }
+  if (Config.Mode == RunMode::SinglepassMode) {
+    Config.Mode = RunMode::InterpMode;
+  }
   const uint64_t GasLimit = 1000000000ULL;
 
   SolcContractData ContractData{
@@ -238,8 +244,9 @@ TEST(SolidityStatePersistence, SaveLoadRoundTripPreservesContractState) {
   ASSERT_EQ(GetResult.status_code, EVMC_SUCCESS);
   ASSERT_NE(GetResult.output_data, nullptr);
   ASSERT_EQ(GetResult.output_size, 32U);
-  EXPECT_EQ(zen::utils::toHex(GetResult.output_data, GetResult.output_size),
-            "000000000000000000000000000000000000000000000000000000000000002a");
+  EXPECT_TRUE(hexEquals(
+      zen::utils::toHex(GetResult.output_data, GetResult.output_size),
+      "000000000000000000000000000000000000000000000000000000000000002a"));
 }
 
 TEST(SolidityDeployLifecycle,

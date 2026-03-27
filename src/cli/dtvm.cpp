@@ -358,8 +358,9 @@ int main(int argc, char *argv[]) {
                     "--evm-bytecode-kind=deploy");
       return exitMain(EXIT_FAILURE);
     }
-    if (!DeployMode && ContractAddress.empty()) {
-      ZEN_LOG_ERROR("--contract-address is required for EVM call mode");
+    if (!DeployMode && ContractAddress.empty() && !Calldata.empty()) {
+      ZEN_LOG_ERROR("--contract-address is required for calldata-driven EVM "
+                    "call mode");
       return exitMain(EXIT_FAILURE);
     }
     auto MockedEVMHost = std::make_unique<zen::evm::ZenMockedEVMHost>();

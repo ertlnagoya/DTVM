@@ -361,7 +361,11 @@ bool loadState(evmc::MockedHost &Host, const std::string &FilePath) {
 
       // Parse code
       if (AccountData.HasMember("code") && AccountData["code"].IsString()) {
-        Account.code = zen::utils::hexToBytes(AccountData["code"].GetString());
+        auto CodeBytes = zen::utils::fromHex(AccountData["code"].GetString());
+        if (!CodeBytes) {
+          return false;
+        }
+        Account.code = evmc::bytes(CodeBytes->data(), CodeBytes->size());
       }
 
       // Parse codehash
