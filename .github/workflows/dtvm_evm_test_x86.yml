@@ -282,9 +282,12 @@ jobs:
       image: dtvmdev1/dtvm-dev-x64:main
     steps:
       - name: Check out code
-        uses: actions/checkout@v3
-        with:
-          submodules: "true"
+        run: |
+          git init .
+          git remote add origin "https://github.com/${{ github.repository }}.git"
+          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --detach FETCH_HEAD
+          git -c http.extraheader="AUTHORIZATION: bearer ${{ github.token }}" submodule update --init --recursive
       - name: Code Format Check
         run: |
           ./tools/format.sh check
