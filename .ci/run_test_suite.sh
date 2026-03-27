@@ -65,6 +65,9 @@ case $TestSuite in
     "microsuite")
         CMAKE_OPTIONS="$CMAKE_OPTIONS -DZEN_ENABLE_SPEC_TEST=ON -DZEN_ENABLE_ASSEMBLYSCRIPT_TEST=ON -DZEN_ENABLE_CHECKED_ARITHMETIC=ON"
         ;;
+    "evmstatesubset")
+        CMAKE_OPTIONS="$CMAKE_OPTIONS -DZEN_ENABLE_SPEC_TEST=ON -DZEN_ENABLE_ASSEMBLYSCRIPT_TEST=ON -DZEN_ENABLE_CHECKED_ARITHMETIC=ON -DZEN_ENABLE_EVM=ON"
+        ;;
     "evmtestsuite")
         CMAKE_OPTIONS="$CMAKE_OPTIONS -DZEN_ENABLE_SPEC_TEST=ON -DZEN_ENABLE_ASSEMBLYSCRIPT_TEST=ON -DZEN_ENABLE_CHECKED_ARITHMETIC=ON -DZEN_ENABLE_EVM=ON"
         ;;
@@ -100,7 +103,7 @@ fi
 export PATH=$PATH:$PWD/build
 CMAKE_OPTIONS_ORIGIN="$CMAKE_OPTIONS"
 
-if [[ ${INPUT_FORMAT} == "evm" && ${TestSuite} != "evmfocusedregressions" ]]; then
+if [[ ${INPUT_FORMAT} == "evm" && ${TestSuite} != "evmfocusedregressions" && ${TestSuite} != "evmstatesubset" ]]; then
     ./tools/easm2bytecode.sh ./tests/evm_asm ./tests/evm_asm
     ./tools/solc_batch_compile.sh
 fi
@@ -151,6 +154,12 @@ for STACK_TYPE in ${STACK_TYPES[@]}; do
             cd build
             export DTVM_TEST_REVISION=${DTVM_TEST_REVISION:-ALL}
             ./evmStateTests --gtest_filter="${EVM_GTEST_FILTER:-EVMStateFocused.*}" --gtest_brief=1
+            cd ..
+            ;;
+        "evmstatesubset")
+            cd build
+            export DTVM_TEST_REVISION=${DTVM_TEST_REVISION:-Cancun}
+            ./evmStateTests --gtest_filter="${EVM_GTEST_FILTER:-ExecuteAllStateTests/*}" --gtest_brief=1
             cd ..
             ;;
         "evmrealsuite")
