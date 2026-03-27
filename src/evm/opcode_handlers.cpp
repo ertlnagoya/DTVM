@@ -9,6 +9,7 @@
 #include "evmc/instructions.h"
 #include "host/evm/crypto.h"
 #include "runtime/evm_instance.h"
+#include <optional>
 
 zen::evm::EVMFrame *zen::evm::EVMResource::CurrentFrame = nullptr;
 zen::evm::InterpreterExecContext *zen::evm::EVMResource::CurrentContext =
@@ -759,8 +760,15 @@ void SLoadHandler::doExecute() {
     }
     Frame->Msg.gas -= ADDITIONAL_COLD_SLOAD_COST;
   }
-  intx::uint256 Value = intx::be::load<intx::uint256>(
-      Frame->Host->get_storage(Frame->Msg.recipient, KeyAddr));
+  evmc::bytes32 ValueBytes;
+  if (auto *Inst = Context->getInstance();
+      Inst != nullptr && Inst->getStorageProvider() != nullptr) {
+    ValueBytes =
+        Inst->getStorageProvider()->sload(Frame->Msg.recipient, KeyAddr);
+  } else {
+    ValueBytes = Frame->Host->get_storage(Frame->Msg.recipient, KeyAddr);
+  }
+  intx::uint256 Value = intx::be::load<intx::uint256>(ValueBytes);
   Frame->push(Value);
 }
 void SStoreHandler::doExecute() {
@@ -784,7 +792,6 @@ void SStoreHandler::doExecute() {
       Frame->Host->set_storage(Frame->Msg.recipient, Key, Value);
 
   const auto [GasCostWarm, GasReFund] = SSTORE_COSTS[Rev][Status];
-
   const auto GasCost = GasCostCold + GasCostWarm;
   if (Frame->Msg.gas < GasCost) {
     Frame->Host->set_storage(Frame->Msg.recipient, Key, PrevValue);
@@ -795,6 +802,18 @@ void SStoreHandler::doExecute() {
 
   // Track refund at Instance level (consolidate all gas refund tracking there)
   Context->getInstance()->addGasRefund(GasReFund);
+
+  if (auto *Inst = Context->getInstance()) {
+    std::optional<evmc::bytes32> OldValue = PrevValue;
+    StorageDiff Diff{Frame->Msg.recipient, Key, OldValue, Value};
+    Inst->getDiffLog().push_back(Diff);
+    if (auto *Sink = Inst->getStorageDiffSink()) {
+      Sink->on_sstore(Inst->getDiffLog().back());
+    }
+    if (auto *Provider = Inst->getStorageProvider()) {
+      Provider->sstore_ephemeral(Frame->Msg.recipient, Key, Value);
+    }
+  }
 }
 
 void Keccak256Handler::doExecute() {

@@ -12,6 +12,7 @@
 #include "utils/evm.h"
 #include "utils/rlp_encoding.h"
 
+#include <limits>
 #include <utility>
 #include <unordered_set>
 
@@ -57,6 +58,14 @@ public:
     std::vector<evmc::bytes32> StorageKeys;
   };
 
+  struct AuthorizationListEntry {
+    evmc::uint256be ChainId{};
+    evmc::address Address{};
+    uint64_t Nonce = 0;
+    evmc::address Signer{};
+    bool HasSigner = false;
+  };
+
   struct TransactionExecutionConfig {
     std::string ModuleName;
     const uint8_t *Bytecode = nullptr;
@@ -65,9 +74,11 @@ public:
     uint64_t GasLimit = 0;
     uint64_t GasLimitMultiplier = 1;
     uint64_t IntrinsicGas = 0;
+    uint64_t MinimumChargedGas = 0;
     std::optional<evmc::uint256be> MaxPriorityFeePerGas;
     std::optional<evmc::uint256be> MaxFeePerBlobGas;
     std::vector<AccessListEntry> AccessList;
+    std::vector<AuthorizationListEntry> AuthorizationList;
     evmc_revision Revision = zen::evm::DEFAULT_REVISION;
   };
 
@@ -187,11 +198,12 @@ public:
       Result.GasUsed += Config.IntrinsicGas;
       uint64_t GasRefund = static_cast<uint64_t>(
           std::max<int64_t>(0, CreateResult.gas_refund));
-      uint64_t RefundLimit = Result.GasUsed / 5;
+      uint64_t RefundLimit = computeRefundLimit(Result.GasUsed, ActiveRevision);
       Result.GasRefund = std::min(GasRefund, RefundLimit);
       Result.GasCharged =
           Result.GasUsed > Result.GasRefund ? Result.GasUsed - Result.GasRefund
                                             : 0;
+      applyMinimumChargedGas(Config, Result);
       if (Result.GasCharged != 0) {
         settleGasCharges(Result.GasCharged, Config, Msg, Result);
       }
@@ -247,6 +259,11 @@ public:
 
     uint64_t OriginalGas = static_cast<uint64_t>(Inst->getGas());
 
+    applySenderNonce(Msg.sender);
+
+    uint64_t AuthorizationRefund = 0;
+    applyAuthorizationList(Config, AuthorizationRefund);
+
     auto StateSnapshot = captureHostState();
     if (!applyPreExecutionState(Msg, Result)) {
       restoreHostState(StateSnapshot);
@@ -266,9 +283,6 @@ public:
     }
     if (shouldRevertState(ExecResult.status_code)) {
       restoreHostState(StateSnapshot);
-      auto &SenderAccount = accounts[Msg.sender];
-      ensureAccountHasCodeHash(SenderAccount);
-      SenderAccount.nonce++;
     }
 
     Result.Status = ExecResult.status_code;
@@ -290,11 +304,13 @@ public:
 
     uint64_t GasRefund =
         static_cast<uint64_t>(std::max<int64_t>(0, Inst->getGasRefund()));
-    uint64_t RefundLimit = Result.GasUsed / 5;
+    GasRefund += AuthorizationRefund;
+    uint64_t RefundLimit = computeRefundLimit(Result.GasUsed, ActiveRevision);
     Result.GasRefund = std::min(GasRefund, RefundLimit);
     Result.GasCharged =
         Result.GasUsed > Result.GasRefund ? Result.GasUsed - Result.GasRefund
                                           : 0;
+    applyMinimumChargedGas(Config, Result);
 
     if (Result.GasCharged != 0) {
       settleGasCharges(Result.GasCharged, Config, Msg, Result);
@@ -832,11 +848,53 @@ private:
     return intx::be::store<evmc::bytes32>(Value);
   }
 
+  static uint64_t computeRefundLimit(uint64_t GasUsed,
+                                     evmc_revision Revision) noexcept {
+    return Revision >= EVMC_LONDON ? GasUsed / 5 : GasUsed / 2;
+  }
+
+  static bool isDelegationIndicatorCode(
+      const evmc::bytes &Code) noexcept {
+    return Code.size() == 23 && Code[0] == 0xef && Code[1] == 0x01 &&
+           Code[2] == 0x00;
+  }
+
+  static evmc::bytes makeDelegationIndicatorCode(
+      const evmc::address &Target) noexcept {
+    evmc::bytes Code(23, '\0');
+    Code[0] = 0xef;
+    Code[1] = 0x01;
+    Code[2] = 0x00;
+    std::memcpy(Code.data() + 3, Target.bytes, sizeof(Target.bytes));
+    return Code;
+  }
+
   void ensureAccountHasCodeHash(evmc::MockedAccount &Account) {
     if (Account.code.empty() &&
         std::memcmp(Account.codehash.bytes, EMPTY_CODE_HASH.bytes, 32) != 0) {
       Account.codehash = EMPTY_CODE_HASH;
     }
+  }
+
+  void updateAccountCode(evmc::MockedAccount &Account,
+                         const evmc::bytes &Code) {
+    Account.code = Code;
+    const std::vector<uint8_t> CodeBytes(Account.code.begin(),
+                                         Account.code.end());
+    const auto CodeHash = host::evm::crypto::keccak256(CodeBytes);
+    std::memcpy(Account.codehash.bytes, CodeHash.data(),
+                sizeof(Account.codehash.bytes));
+  }
+
+  void clearAccountCode(evmc::MockedAccount &Account) {
+    Account.code.clear();
+    Account.codehash = EMPTY_CODE_HASH;
+  }
+
+  void applySenderNonce(const evmc::address &Sender) {
+    auto &SenderAccount = accounts[Sender];
+    ensureAccountHasCodeHash(SenderAccount);
+    SenderAccount.nonce++;
   }
 
   void applyPrewarmedStorageKeys(const evmc::address &Addr,
@@ -854,15 +912,13 @@ private:
 
   bool applyPreExecutionState(const evmc_message &Msg,
                               TransactionExecutionResult &Result) {
-    auto &SenderAccount = accounts[Msg.sender];
-    ensureAccountHasCodeHash(SenderAccount);
-    SenderAccount.nonce++;
-
     intx::uint256 TransferValue = toUint256BE(Msg.value);
     if (TransferValue == 0) {
       return true;
     }
 
+    auto &SenderAccount = accounts[Msg.sender];
+    ensureAccountHasCodeHash(SenderAccount);
     auto &RecipientAccount = accounts[Msg.recipient];
     ensureAccountHasCodeHash(RecipientAccount);
     applyPrewarmedStorageKeys(Msg.recipient, RecipientAccount);
@@ -882,6 +938,55 @@ private:
     SenderAccount.balance = toBytes32(SenderBalance);
     RecipientAccount.balance = toBytes32(RecipientBalance);
     return true;
+  }
+
+  void applyAuthorizationList(const TransactionExecutionConfig &Config,
+                              uint64_t &AuthorizationRefund) {
+    if (Revision < EVMC_PRAGUE || Config.AuthorizationList.empty()) {
+      return;
+    }
+
+    static constexpr evmc::address ZERO_ADDRESS{};
+    const intx::uint256 CurrentChainId = toUint256BE(tx_context.chain_id);
+    for (const auto &Entry : Config.AuthorizationList) {
+      if (!Entry.HasSigner) {
+        continue;
+      }
+
+      const intx::uint256 EntryChainId = toUint256BE(Entry.ChainId);
+      if (EntryChainId != 0 && EntryChainId != CurrentChainId) {
+        continue;
+      }
+      if (Entry.Nonce == std::numeric_limits<uint64_t>::max()) {
+        continue;
+      }
+
+      access_account(Entry.Signer);
+      auto &AuthorityAccount = accounts[Entry.Signer];
+      ensureAccountHasCodeHash(AuthorityAccount);
+
+      if (!AuthorityAccount.code.empty() &&
+          !isDelegationIndicatorCode(AuthorityAccount.code)) {
+        continue;
+      }
+      if (static_cast<uint64_t>(AuthorityAccount.nonce) != Entry.Nonce) {
+        continue;
+      }
+
+      const bool WasEmpty = !account_exists(Entry.Signer);
+      if (!WasEmpty) {
+        AuthorizationRefund += 12500;
+      }
+
+      if (std::memcmp(Entry.Address.bytes, ZERO_ADDRESS.bytes,
+                      sizeof(Entry.Address.bytes)) == 0) {
+        clearAccountCode(AuthorityAccount);
+      } else {
+        updateAccountCode(AuthorityAccount,
+                          makeDelegationIndicatorCode(Entry.Address));
+      }
+      AuthorityAccount.nonce++;
+    }
   }
 
   bool applyCallValueTransfer(const evmc_message &Msg) {
@@ -968,6 +1073,16 @@ private:
       CoinbaseBalance += CoinbaseReward;
       CoinbaseAccount.balance = toBytes32(CoinbaseBalance);
     }
+  }
+
+  void applyMinimumChargedGas(const TransactionExecutionConfig &Config,
+                              TransactionExecutionResult &Result) const {
+    if (Config.MinimumChargedGas == 0) {
+      return;
+    }
+
+    Result.GasUsed = std::max(Result.GasUsed, Config.MinimumChargedGas);
+    Result.GasCharged = std::max(Result.GasCharged, Config.MinimumChargedGas);
   }
 
   void finalizeSelfdestructs() {

@@ -12,6 +12,137 @@ using namespace zen::evm_test_utils;
 namespace zen::test {
 
 using SolidityTestPair = std::pair<std::string, std::string>;
+namespace {
+constexpr const char *COUNTER_DEPLOY_HEX =
+    "6080604052348015600e575f5ffd5b506102358061001c5f395ff3fe608060405234801561"
+    "000f575f5ffd5b506004361061004a575f3560e01c806306661abd1461004e5780639077ce"
+    "611461006c578063d732d95514610088578063e8927fbc14610092575b5f5ffd5b61005661"
+    "009c565b60405161006391906100f2565b60405180910390f35b6100866004803603810190"
+    "6100819190610139565b6100a1565b005b6100906100aa565b005b61009a6100c2565b005b"
+    "5f5481565b805f8190555050565b5f5f8154809291906100bb90610191565b919050555056"
+    "5b5f5f8154809291906100d3906101b8565b9190505550565b5f819050919050565b6100ec"
+    "816100da565b82525050565b5f6020820190506101055f8301846100e3565b92915050565b"
+    "5f5ffd5b610118816100da565b8114610122575f5ffd5b50565b5f81359050610133816101"
+    "0f565b92915050565b5f6020828403121561014e5761014d61010b565b5b5f61015b848285"
+    "01610125565b91505092915050565b7f4e487b710000000000000000000000000000000000"
+    "00000000000000000000005f52601160045260245ffd5b5f61019b826100da565b91505f82"
+    "036101ad576101ac610164565b5b600182039050919050565b5f6101c2826100da565b9150"
+    "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff82036101"
+    "f4576101f3610164565b5b60018201905091905056fea26469706673582212204aed3f7ff0"
+    "55870ecaed125cbf6f4fd7f4b082e55a1cb01cc8c450d3dfd2c4bd64736f6c634300081e00"
+    "33";
+constexpr const char *COUNTER_RUNTIME_HEX =
+    "608060405234801561000f575f5ffd5b506004361061004a575f3560e01c806306661abd14"
+    "61004e5780639077ce611461006c578063d732d95514610088578063e8927fbc1461009257"
+    "5b5f5ffd5b61005661009c565b60405161006391906100f2565b60405180910390f35b6100"
+    "8660048036038101906100819190610139565b6100a1565b005B6100906100aa565B005B61"
+    "009a6100c2565B005B5f5481565B805f8190555050565B5f5f8154809291906100bb906101"
+    "91565B9190505550565B5f5f8154809291906100d3906101b8565B9190505550565B5f8190"
+    "50919050565B6100ec816100da565B82525050565B5f6020820190506101055f8301846100"
+    "e3565B92915050565B5f5ffd5B610118816100da565B8114610122575f5ffd5B50565B5f81"
+    "3590506101338161010f565B92915050565B5f6020828403121561014e5761014d61010b56"
+    "5B5B5f61015b84828501610125565B91505092915050565B7f4e487b710000000000000000"
+    "00000000000000000000000000000000000000005f52601160045260245ffd5B5f61019b82"
+    "6100da565B91505f82036101ad576101ac610164565B5B600182039050919050565B5f6101"
+    "c2826100da565B91507fffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    "ffffffffff82036101f4576101f3610164565B5B60018201905091905056fea26469706673"
+    "582212204aed3f7ff055870ecaed125cbf6f4fd7f4b082e55a1cb01cc8c450d3dfd2c4bd64"
+    "736f6c634300081e0033";
+
+DeployedContract makeLoadedContract(EVMTestEnvironment &Env,
+                                    const evmc::address &Address,
+                                    const std::string &RuntimeHex,
+                                    uint64_t GasLimit) {
+  TempHexFile TempRuntimeFile(RuntimeHex);
+  auto ModRet = Env.Runtime->loadEVMModule(TempRuntimeFile.getPath());
+  EXPECT_TRUE(ModRet);
+  EVMModule *CallMod = *ModRet;
+
+  Isolation *CallIso = Env.Runtime->createManagedIsolation();
+  EXPECT_NE(CallIso, nullptr);
+
+  auto CallInstRet = CallIso->createEVMInstance(*CallMod, GasLimit);
+  EXPECT_TRUE(CallInstRet);
+
+  DeployedContract Result;
+  Result.Instance = *CallInstRet;
+  Result.Address = Address;
+  Result.RuntimeBytecode = RuntimeHex;
+  return Result;
+}
+
+DeployedContract deployContractWithCreate2(EVMTestEnvironment &Env,
+                                           const SolcContractData &ContractData,
+                                           const std::string &Create2SaltHex,
+                                           uint64_t GasLimit) {
+  TempHexFile TempDeployFile(ContractData.DeployBytecode);
+  auto DeployModRet = Env.Runtime->loadEVMModule(TempDeployFile.getPath());
+  EXPECT_TRUE(DeployModRet);
+  EVMModule *DeployMod = *DeployModRet;
+
+  Isolation *DeployIso = Env.Runtime->createManagedIsolation();
+  EXPECT_NE(DeployIso, nullptr);
+
+  auto DeployInstRet = DeployIso->createEVMInstance(*DeployMod, GasLimit);
+  EXPECT_TRUE(DeployInstRet);
+  EVMInstance *DeployInst = *DeployInstRet;
+
+  auto InitCode = zen::utils::fromHex(ContractData.DeployBytecode);
+  EXPECT_TRUE(InitCode.has_value());
+  evmc::bytes32 Salt = zen::utils::parseBytes32(Create2SaltHex);
+  evmc::address ExpectedAddress = zen::utils::computeCreate2Address(
+      Env.DeployerAddr, Salt,
+      evmc::bytes_view{InitCode->data(), InitCode->size()});
+
+  evmc_message Msg = {};
+  Msg.kind = EVMC_CREATE2;
+  Msg.gas = static_cast<int64_t>(GasLimit);
+  Msg.sender = Env.DeployerAddr;
+  Msg.recipient = ExpectedAddress;
+  Msg.create2_salt = Salt;
+  Msg.input_data = InitCode->data();
+  Msg.input_size = InitCode->size();
+
+  evmc::Result DeployResult;
+  Env.Runtime->callEVMMain(*DeployInst, Msg, DeployResult);
+  if (DeployResult.status_code == EVMC_SUCCESS &&
+      DeployResult.create_address == evmc::address{}) {
+    DeployResult.create_address = ExpectedAddress;
+  }
+  EXPECT_EQ(DeployResult.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(DeployResult.create_address, ExpectedAddress);
+  EXPECT_GT(DeployResult.output_size, 0U);
+
+  std::vector<uint8_t> DeployResultBytes(DeployResult.output_data,
+                                         DeployResult.output_data +
+                                             DeployResult.output_size);
+  std::string DeployResultHex =
+      zen::utils::toHex(DeployResultBytes.data(), DeployResultBytes.size());
+  EXPECT_TRUE(hexEquals(DeployResultHex, ContractData.RuntimeBytecode));
+
+  auto &NewContractAccount = Env.MockedHost->accounts[ExpectedAddress];
+  NewContractAccount.code =
+      evmc::bytes(DeployResultBytes.data(), DeployResultBytes.size());
+
+  const std::vector<uint8_t> CodeHashVec =
+      zen::host::evm::crypto::keccak256(DeployResultBytes);
+  evmc::bytes32 CodeHash{};
+  std::memcpy(CodeHash.bytes, CodeHashVec.data(), 32);
+  NewContractAccount.codehash = CodeHash;
+  NewContractAccount.nonce = 1;
+  Env.MockedHost->accounts[Env.DeployerAddr].nonce += 1;
+
+  return makeLoadedContract(Env, ExpectedAddress, DeployResultHex, GasLimit);
+}
+
+RuntimeConfig makeInterpreterEvmConfig(RuntimeConfig Config = {}) {
+  Config.Format = InputFormat::EVM;
+  if (Config.Mode == RunMode::SinglepassMode) {
+    Config.Mode = RunMode::InterpMode;
+  }
+  return Config;
+}
+} // namespace
 
 std::vector<SolidityTestPair>
 EnumerateSolidityTests(const std::string &TestCategory);
@@ -79,6 +210,105 @@ TEST_P(SolidityContractTest, TestContract) {
   evmc_status_code Result = executeSingleContractTest(
       GetGlobalConfig(), GetGlobalGasLimit(), Category, ContractName);
   EXPECT_EQ(Result, EVMC_SUCCESS) << "Contract Test Failed: " << ContractName;
+}
+
+TEST(SolidityStatePersistence, SaveLoadRoundTripPreservesContractState) {
+  RuntimeConfig Config =
+      makeInterpreterEvmConfig(SolidityContractTest::GetGlobalConfig());
+  const uint64_t GasLimit = 1000000000ULL;
+
+  SolcContractData ContractData{
+      .DeployBytecode = COUNTER_DEPLOY_HEX,
+      .RuntimeBytecode = COUNTER_RUNTIME_HEX,
+  };
+
+  EVMTestEnvironment InitialEnv(Config);
+  DeployedContract Contract =
+      deployContract(InitialEnv, "counter", ContractData, {}, {}, GasLimit);
+
+  const std::string SetCalldata = "9077ce61000000000000000000000000000000000000"
+                                  "000000000000000000000000002a";
+  evmc::Result SetResult =
+      executeContractCall(InitialEnv, Contract, SetCalldata, GasLimit);
+  ASSERT_EQ(SetResult.status_code, EVMC_SUCCESS);
+
+  std::filesystem::path StatePath = std::filesystem::temp_directory_path() /
+                                    "dtvm_counter_state_roundtrip.json";
+  ASSERT_TRUE(
+      zen::utils::saveState(*InitialEnv.MockedHost, StatePath.string()));
+
+  EVMTestEnvironment LoadedEnv(Config);
+  ASSERT_TRUE(zen::utils::loadState(*LoadedEnv.MockedHost, StatePath.string()));
+  std::filesystem::remove(StatePath);
+
+  auto LoadedIt = LoadedEnv.MockedHost->accounts.find(Contract.Address);
+  ASSERT_NE(LoadedIt, LoadedEnv.MockedHost->accounts.end());
+  ASSERT_FALSE(LoadedIt->second.code.empty());
+
+  DeployedContract LoadedContract = makeLoadedContract(
+      LoadedEnv, Contract.Address, COUNTER_RUNTIME_HEX, GasLimit);
+
+  evmc::Result GetResult =
+      executeContractCall(LoadedEnv, LoadedContract, "06661abd", GasLimit);
+  ASSERT_EQ(GetResult.status_code, EVMC_SUCCESS);
+  ASSERT_NE(GetResult.output_data, nullptr);
+  ASSERT_EQ(GetResult.output_size, 32U);
+  EXPECT_TRUE(hexEquals(
+      zen::utils::toHex(GetResult.output_data, GetResult.output_size),
+      "000000000000000000000000000000000000000000000000000000000000002a"));
+}
+
+TEST(SolidityDeployLifecycle,
+     CreateProducesDeterministicAddressAndCallableCode) {
+  RuntimeConfig Config = makeInterpreterEvmConfig();
+  const uint64_t GasLimit = 1000000000ULL;
+
+  SolcContractData ContractData{
+      .DeployBytecode = COUNTER_DEPLOY_HEX,
+      .RuntimeBytecode = COUNTER_RUNTIME_HEX,
+  };
+
+  EVMTestEnvironment Env(Config);
+  const evmc::address ExpectedAddress =
+      zen::utils::computeCreateAddress(Env.DeployerAddr, 0);
+  DeployedContract Contract =
+      deployContract(Env, "counter", ContractData, {}, {}, GasLimit);
+
+  EXPECT_EQ(Contract.Address, ExpectedAddress);
+
+  evmc::Result GetResult =
+      executeContractCall(Env, Contract, "06661abd", GasLimit);
+  ASSERT_EQ(GetResult.status_code, EVMC_SUCCESS);
+  ASSERT_NE(GetResult.output_data, nullptr);
+  ASSERT_EQ(GetResult.output_size, 32U);
+  EXPECT_EQ(zen::utils::toHex(GetResult.output_data, GetResult.output_size),
+            "0000000000000000000000000000000000000000000000000000000000000000");
+}
+
+TEST(SolidityDeployLifecycle,
+     Create2ProducesDeterministicAddressAndCallableCode) {
+  RuntimeConfig Config = makeInterpreterEvmConfig();
+  const uint64_t GasLimit = 1000000000ULL;
+  const std::string Create2SaltHex = "01";
+
+  SolcContractData ContractData{
+      .DeployBytecode = COUNTER_DEPLOY_HEX,
+      .RuntimeBytecode = COUNTER_RUNTIME_HEX,
+  };
+
+  EVMTestEnvironment Env(Config);
+  DeployedContract Contract =
+      deployContractWithCreate2(Env, ContractData, Create2SaltHex, GasLimit);
+
+  EXPECT_NE(Contract.Address, evmc::address{});
+
+  evmc::Result GetResult =
+      executeContractCall(Env, Contract, "06661abd", GasLimit);
+  ASSERT_EQ(GetResult.status_code, EVMC_SUCCESS);
+  ASSERT_NE(GetResult.output_data, nullptr);
+  ASSERT_EQ(GetResult.output_size, 32U);
+  EXPECT_EQ(zen::utils::toHex(GetResult.output_data, GetResult.output_size),
+            "0000000000000000000000000000000000000000000000000000000000000000");
 }
 
 INSTANTIATE_TEST_SUITE_P(

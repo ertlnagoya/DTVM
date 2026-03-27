@@ -30,6 +30,9 @@ std::string bytesToHex(const std::vector<uint8_t> &Value);
 std::vector<uint8_t> uint256beToBytes(const evmc::uint256be &Value);
 evmc::address computeCreateAddress(const evmc::address &Sender,
                                    uint64_t SenderNonce);
+evmc::address computeCreate2Address(const evmc::address &Sender,
+                                    const evmc::bytes32 &Salt,
+                                    evmc::bytes_view InitCode);
 bool saveState(const evmc::MockedHost &Host, const std::string &FilePath);
 bool loadState(evmc::MockedHost &Host, const std::string &FilePath);
 } // namespace zen::utils

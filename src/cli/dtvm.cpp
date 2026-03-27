@@ -8,9 +8,12 @@
 #include "zetaengine.h"
 #include <CLI/CLI.hpp>
 #ifdef ZEN_ENABLE_EVM
+#include "host/evm/crypto.h"
 #include "tests/evm_test_host.hpp"
 #include "utils/evm.h"
 #endif // ZEN_ENABLE_EVM
+#include <fstream>
+#include <limits>
 #include <unistd.h>
 
 #ifdef ZEN_ENABLE_BUILTIN_WASI
@@ -62,6 +65,7 @@ struct EVMMessageConfig {
   std::vector<uint8_t> Calldata;
   std::string SenderAddress;
   std::string ContractAddress;
+  std::string Create2Salt;
 };
 
 static evmc_message createEvmMessage(evmc::MockedHost &Host,
@@ -98,6 +102,19 @@ static evmc_message createEvmMessage(evmc::MockedHost &Host,
     DeployerAccount.set_balance(100000000UL);
     Msg.recipient = computeCreateAddress(DeployerAddr, DeployerAccount.nonce);
     Msg.sender = DeployerAddr;
+  } else if (EVMC_CREATE2 == Config.Kind) {
+    Msg.input_data = Bytecode.data();
+    Msg.input_size = Bytecode.size();
+
+    evmc::address DeployerAddr = zen::utils::parseAddress(Config.SenderAddress);
+    auto &DeployerAccount = Host.accounts[DeployerAddr];
+    DeployerAccount.nonce = 0;
+    DeployerAccount.set_balance(100000000UL);
+    Msg.sender = DeployerAddr;
+    Msg.create2_salt = zen::utils::parseBytes32(Config.Create2Salt);
+    Msg.recipient = computeCreate2Address(
+        DeployerAddr, Msg.create2_salt,
+        evmc::bytes_view{Bytecode.data(), Bytecode.size()});
   } else {
     evmc::address ContractAddr =
         zen::utils::parseAddress(Config.ContractAddress);
@@ -107,6 +124,30 @@ static evmc_message createEvmMessage(evmc::MockedHost &Host,
   }
 
   return Msg;
+}
+
+static bool loadEVMHexFileBytes(const std::string &Filename,
+                                std::vector<uint8_t> &Bytecode) {
+  if (Filename.empty()) {
+    return false;
+  }
+
+  std::ifstream File(Filename);
+  if (!File.is_open()) {
+    return false;
+  }
+
+  std::string HexContent((std::istreambuf_iterator<char>(File)),
+                         std::istreambuf_iterator<char>());
+  utils::trimString(HexContent);
+
+  auto DecodedBytes = utils::fromHex(std::string_view(HexContent));
+  if (!DecodedBytes.has_value()) {
+    return false;
+  }
+
+  Bytecode = std::move(*DecodedBytes);
+  return true;
 }
 
 static bool runEVMBenchmark(const std::string &Filename,
@@ -171,7 +212,8 @@ int main(int argc, char *argv[]) {
   std::vector<std::string> Dirs;
   std::string SaveStateFile;
   std::string LoadStateFile;
-  uint64_t GasLimit = UINT64_MAX;
+  uint64_t GasLimit =
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
   LoggerLevel LogLevel = LoggerLevel::Info;
   uint32_t NumExtraCompilations = 0;
   uint32_t NumExtraExecutions = 0;
@@ -179,6 +221,9 @@ int main(int argc, char *argv[]) {
   bool EnableBenchmark = false;
   bool DeployMode = false;
   std::string ContractAddress;
+  std::string ContractAddressOutFile;
+  std::string EVMBytecodeKind = "auto";
+  std::string Create2Salt;
   std::string SenderAddress = "1000000000000000000000000000000000000000";
 
   const std::unordered_map<std::string, InputFormat> FormatMap = {
@@ -197,6 +242,11 @@ int main(int argc, char *argv[]) {
       {"info", LoggerLevel::Info},   {"warn", LoggerLevel::Warn},
       {"error", LoggerLevel::Error}, {"fatal", LoggerLevel::Fatal},
       {"off", LoggerLevel::Off},
+  };
+  const std::unordered_map<std::string, std::string> EVMBytecodeKindMap = {
+      {"auto", "auto"},
+      {"deploy", "deploy"},
+      {"runtime", "runtime"},
   };
 
   try {
@@ -219,6 +269,15 @@ int main(int argc, char *argv[]) {
     CLIParser->add_flag("--deploy", DeployMode, "Deploy contract mode");
     CLIParser->add_option("--contract-address", ContractAddress,
                           "Contract address for call mode");
+    CLIParser->add_option("--contract-address-out", ContractAddressOutFile,
+                          "Write deployed contract address to file");
+    CLIParser
+        ->add_option("--evm-bytecode-kind", EVMBytecodeKind,
+                     "Interpret INPUT_FILE as deploy or runtime bytecode")
+        ->transform(
+            CLI::CheckedTransformer(EVMBytecodeKindMap, CLI::ignore_case));
+    CLIParser->add_option("--create2-salt", Create2Salt,
+                          "CREATE2 salt for deploy mode");
     CLIParser->add_option("--sender", SenderAddress,
                           "Sender address for transactions");
     CLIParser->add_option("--num-extra-compilations", NumExtraCompilations,
@@ -276,6 +335,34 @@ int main(int argc, char *argv[]) {
   /// ================ EVM mode ================
 #ifdef ZEN_ENABLE_EVM
   if (Config.Format == InputFormat::EVM) {
+    if (GasLimit > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+      ZEN_LOG_ERROR("gas limit out of range for EVM execution: %llu",
+                    static_cast<unsigned long long>(GasLimit));
+      return exitMain(EXIT_FAILURE);
+    }
+    if (!Create2Salt.empty() && !DeployMode) {
+      ZEN_LOG_ERROR("--create2-salt requires --deploy");
+      return exitMain(EXIT_FAILURE);
+    }
+    if (!ContractAddressOutFile.empty() && !DeployMode) {
+      ZEN_LOG_ERROR("--contract-address-out requires --deploy");
+      return exitMain(EXIT_FAILURE);
+    }
+    if (DeployMode && EVMBytecodeKind == "runtime") {
+      ZEN_LOG_ERROR(
+          "--deploy requires deploy bytecode; got --evm-bytecode-kind=runtime");
+      return exitMain(EXIT_FAILURE);
+    }
+    if (!DeployMode && EVMBytecodeKind == "deploy") {
+      ZEN_LOG_ERROR("EVM call mode requires runtime bytecode; got "
+                    "--evm-bytecode-kind=deploy");
+      return exitMain(EXIT_FAILURE);
+    }
+    if (!DeployMode && ContractAddress.empty() && !Calldata.empty()) {
+      ZEN_LOG_ERROR("--contract-address is required for calldata-driven EVM "
+                    "call mode");
+      return exitMain(EXIT_FAILURE);
+    }
     auto MockedEVMHost = std::make_unique<zen::evm::ZenMockedEVMHost>();
     // Load state if specified
     if (!LoadStateFile.empty() &&
@@ -323,18 +410,18 @@ int main(int argc, char *argv[]) {
       return exitMain(EXIT_FAILURE, RT.get());
     }
     EVMInstance *Inst = *InstRet;
-    evmc_call_kind MsgKind = DeployMode ? EVMC_CREATE : EVMC_CALL;
+    evmc_call_kind MsgKind = EVMC_CALL;
+    if (DeployMode) {
+      MsgKind = Create2Salt.empty() ? EVMC_CREATE : EVMC_CREATE2;
+    }
     evmc::Result ExeResult;
     std::vector<uint8_t> Bytecode;
     if (EVMC_CREATE == MsgKind) {
-      std::ifstream File(Filename, std::ios::binary);
-      if (!File) {
-        ZEN_LOG_ERROR("failed to open contract file: %s", Filename.c_str());
+      if (!loadEVMHexFileBytes(Filename, Bytecode)) {
+        SIMPLE_LOG_ERROR("failed to read deploy bytecode from hex file: %s",
+                         Filename.c_str());
         return exitMain(EXIT_FAILURE, RT.get());
       }
-
-      Bytecode.assign((std::istreambuf_iterator<char>(File)),
-                      std::istreambuf_iterator<char>());
     }
 
     static thread_local std::vector<uint8_t> CalldataBytes;
@@ -350,11 +437,34 @@ int main(int argc, char *argv[]) {
                                .GasLimit = GasLimit,
                                .Calldata = CalldataBytes,
                                .SenderAddress = SenderAddress,
-                               .ContractAddress = ContractAddress};
+                               .ContractAddress = ContractAddress,
+                               .Create2Salt = Create2Salt};
     evmc_message Msg = createEvmMessage(MockedHost, MsgConfig, Bytecode);
     RT->callEVMMain(*Inst, Msg, ExeResult);
 
-    if (EVMC_CREATE == MsgKind && ExeResult.status_code == EVMC_SUCCESS) {
+    if (EVMC_CREATE == MsgKind || EVMC_CREATE2 == MsgKind) {
+      ExeResult.create_address = Msg.recipient;
+      if (ExeResult.status_code == EVMC_SUCCESS) {
+        auto &NewContractAccount = MockedHost.accounts[Msg.recipient];
+        if (ExeResult.output_data && ExeResult.output_size > 0) {
+          std::vector<uint8_t> DeployResultBytes(ExeResult.output_data,
+                                                 ExeResult.output_data +
+                                                     ExeResult.output_size);
+          NewContractAccount.code =
+              evmc::bytes(DeployResultBytes.data(), DeployResultBytes.size());
+          const std::vector<uint8_t> CodeHashVec =
+              zen::host::evm::crypto::keccak256(DeployResultBytes);
+          evmc::bytes32 CodeHash{};
+          std::memcpy(CodeHash.bytes, CodeHashVec.data(),
+                      sizeof(CodeHash.bytes));
+          NewContractAccount.codehash = CodeHash;
+        } else {
+          NewContractAccount.code.clear();
+          NewContractAccount.codehash = evmc::bytes32{};
+        }
+        NewContractAccount.nonce = 1;
+      }
+
       evmc::address DeployerAddr = zen::utils::parseAddress(SenderAddress);
       auto &DeployerAccount = MockedHost.accounts[DeployerAddr];
       DeployerAccount.nonce++;
@@ -362,10 +472,31 @@ int main(int argc, char *argv[]) {
 
     // Use EVM status code directly as process exit code
     int ExitCode = static_cast<int>(ExeResult.status_code);
+    printf("status code: %d\n", ExitCode);
+    printf("status: %s\n", evmc::to_string(ExeResult.status_code));
+    printf("gas left: %lld\n", static_cast<long long>(ExeResult.gas_left));
+    if (EVMC_CREATE == MsgKind || EVMC_CREATE2 == MsgKind) {
+      printf("contract address: %s\n",
+             zen::utils::addressToHex(ExeResult.create_address).c_str());
+      if (ExeResult.status_code == EVMC_SUCCESS &&
+          !ContractAddressOutFile.empty()) {
+        std::ofstream OutFile(ContractAddressOutFile);
+        if (!OutFile.is_open()) {
+          ZEN_LOG_ERROR("failed to open contract address output file: %s",
+                        ContractAddressOutFile.c_str());
+          return exitMain(EXIT_FAILURE, RT.get());
+        }
+        OutFile << zen::utils::addressToHex(ExeResult.create_address) << '\n';
+      }
+    }
     if (ExeResult.output_data && ExeResult.output_size > 0) {
       std::string output =
           zen::utils::toHex(ExeResult.output_data, ExeResult.output_size);
-      printf("output: 0x%s\n", output.c_str());
+      if (ExeResult.status_code == EVMC_REVERT) {
+        printf("revert data: 0x%s\n", output.c_str());
+      } else {
+        printf("output: 0x%s\n", output.c_str());
+      }
     }
 
     if (!SaveStateFile.empty()) {

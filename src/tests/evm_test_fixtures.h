@@ -19,14 +19,22 @@ struct AccessListEntry {
   std::vector<evmc::bytes32> StorageKeys;
 };
 
+struct AuthorizationListEntry {
+  evmc::uint256be ChainId{};
+  evmc::address Address{};
+  uint64_t Nonce = 0;
+  evmc::address Signer{};
+  bool HasSigner = false;
+};
+
 struct ParsedTransaction {
   evmc_tx_context TxContext;
   std::unique_ptr<evmc_message> Message;
   std::vector<uint8_t> CallData;
   std::vector<AccessListEntry> AccessList;
+  std::vector<AuthorizationListEntry> AuthorizationList;
   std::vector<evmc::bytes32> BlobHashes;
   std::optional<evmc::uint256be> MaxFeePerBlobGas;
-  size_t AuthorizationListSize = 0;
 };
 
 struct StateTestFixture {

@@ -4,10 +4,12 @@
 #include "dt_evmc_vm.h"
 #include "common/enums.h"
 #include "common/errors.h"
+#include "evm/storage_diff.h"
 #include "runtime/config.h"
 #include "runtime/evm_instance.h"
 #include "runtime/isolation.h"
 #include "runtime/runtime.h"
+#include "storage_persistence.h"
 #include "wrapped_host.h"
 
 #include <evmc/evmc.h>
@@ -15,6 +17,8 @@
 #include <evmc/helpers.h>
 
 #include <cstring>
+#include <memory>
+#include <vector>
 
 namespace {
 
@@ -23,6 +27,101 @@ using namespace zen::common;
 
 // JIT compilation limits (95% < 10KB)
 const size_t MAX_JIT_BYTECODE_SIZE = 0x6000;
+
+namespace {
+
+static dtvm_storage_diff_t
+to_c_storage_diff(const zen::evm::StorageDiff &Diff) {
+  dtvm_storage_diff_t Result{};
+  std::memcpy(&Result.address, &Diff.address, sizeof(Result.address));
+  std::memcpy(&Result.key, &Diff.key, sizeof(Result.key));
+  Result.has_old_value = Diff.old_value.has_value() ? 1 : 0;
+  if (Diff.old_value) {
+    std::memcpy(&Result.old_value, &*Diff.old_value, sizeof(Result.old_value));
+  } else {
+    std::memset(&Result.old_value, 0, sizeof(Result.old_value));
+  }
+  std::memcpy(&Result.new_value, &Diff.new_value, sizeof(Result.new_value));
+  return Result;
+}
+
+class CallbackStorageDiffSink final : public zen::evm::StorageDiffSink {
+public:
+  CallbackStorageDiffSink(void *Context,
+                          dtvm_storage_diff_sink_on_sstore_fn OnSstore,
+                          dtvm_storage_diff_sink_on_finish_fn OnFinish)
+      : Ctx(Context), OnSstore(OnSstore), OnFinish(OnFinish) {}
+
+  void on_sstore(const zen::evm::StorageDiff &Diff) override {
+    if (!OnSstore) {
+      return;
+    }
+    const auto DiffData = to_c_storage_diff(Diff);
+    OnSstore(Ctx, &DiffData);
+  }
+
+  void on_finish(const zen::evm::ExecutionDiffLog &Diffs) override {
+    if (!OnFinish) {
+      return;
+    }
+    if (Diffs.empty()) {
+      OnFinish(Ctx, nullptr, 0);
+      return;
+    }
+    Buffer.clear();
+    Buffer.reserve(Diffs.size());
+    for (const auto &Diff : Diffs) {
+      Buffer.push_back(to_c_storage_diff(Diff));
+    }
+    OnFinish(Ctx, Buffer.data(), Buffer.size());
+  }
+
+private:
+  void *Ctx = nullptr;
+  dtvm_storage_diff_sink_on_sstore_fn OnSstore = nullptr;
+  dtvm_storage_diff_sink_on_finish_fn OnFinish = nullptr;
+  std::vector<dtvm_storage_diff_t> Buffer;
+};
+
+class CallbackStorageProvider final : public zen::evm::StorageProvider {
+public:
+  CallbackStorageProvider(void *Context, dtvm_storage_provider_sload_fn OnSload,
+                          dtvm_storage_provider_sstore_fn OnEphemeralStore)
+      : Ctx(Context), OnSload(OnSload), OnEphemeralStore(OnEphemeralStore) {}
+
+  evmc::bytes32 sload(const evmc::address &Address,
+                      const evmc::bytes32 &Key) override {
+    if (!OnSload) {
+      return {};
+    }
+    struct evmc_address AddressC;
+    struct evmc_bytes32 KeyC;
+    std::memcpy(&AddressC, &Address, sizeof(AddressC));
+    std::memcpy(&KeyC, &Key, sizeof(KeyC));
+    return OnSload(Ctx, &AddressC, &KeyC);
+  }
+
+  void sstore_ephemeral(const evmc::address &Address, const evmc::bytes32 &Key,
+                        const evmc::bytes32 &Value) override {
+    if (!OnEphemeralStore) {
+      return;
+    }
+    struct evmc_address AddressC;
+    struct evmc_bytes32 KeyC;
+    struct evmc_bytes32 ValueC;
+    std::memcpy(&AddressC, &Address, sizeof(AddressC));
+    std::memcpy(&KeyC, &Key, sizeof(KeyC));
+    std::memcpy(&ValueC, &Value, sizeof(ValueC));
+    OnEphemeralStore(Ctx, &AddressC, &KeyC, &ValueC);
+  }
+
+private:
+  void *Ctx = nullptr;
+  dtvm_storage_provider_sload_fn OnSload = nullptr;
+  dtvm_storage_provider_sstore_fn OnEphemeralStore = nullptr;
+};
+
+} // namespace
 
 // RAII helper for temporarily changing runtime configuration
 class ScopedConfig {
@@ -77,8 +176,17 @@ struct DTVM : evmc_vm {
                           .EnableEvmGasMetering = true};
   std::unique_ptr<Runtime> RT;
   std::unique_ptr<WrappedHost> ExecHost;
+  std::unique_ptr<zen::evm::StorageDiffSink> StorageDiffSinkImpl;
+  std::unique_ptr<zen::evm::StorageProvider> StorageProviderImpl;
   std::unordered_map<uint64_t, EVMModule *> LoadedMods;
   Isolation *Iso = nullptr;
+
+  void
+  configureStoragePersistence(void *Context,
+                              dtvm_storage_diff_sink_on_sstore_fn OnSstore,
+                              dtvm_storage_diff_sink_on_finish_fn OnFinish,
+                              dtvm_storage_provider_sload_fn OnSload,
+                              dtvm_storage_provider_sstore_fn OnEphemeralStore);
 };
 
 /// The implementation of the evmc_vm::destroy() method.
@@ -184,6 +292,8 @@ evmc_result execute(evmc_vm *EVMInstance, const evmc_host_interface *Host,
     return evmc_make_result(EVMC_FAILURE, 0, 0, nullptr, 0);
   }
   TheInst->setRevision(Rev);
+  TheInst->setStorageDiffSink(VM->StorageDiffSinkImpl.get());
+  TheInst->setStorageProvider(VM->StorageProviderImpl.get());
 
   evmc_message Message = *Msg;
   evmc::Result Result;
@@ -200,6 +310,25 @@ evmc_result execute(evmc_vm *EVMInstance, const evmc_host_interface *Host,
 #endif
 /// @endcond
 
+void DTVM::configureStoragePersistence(
+    void *Context, dtvm_storage_diff_sink_on_sstore_fn OnSstore,
+    dtvm_storage_diff_sink_on_finish_fn OnFinish,
+    dtvm_storage_provider_sload_fn OnSload,
+    dtvm_storage_provider_sstore_fn OnEphemeralStore) {
+  if (OnSstore || OnFinish) {
+    StorageDiffSinkImpl =
+        std::make_unique<CallbackStorageDiffSink>(Context, OnSstore, OnFinish);
+  } else {
+    StorageDiffSinkImpl.reset();
+  }
+  if (OnSload || OnEphemeralStore) {
+    StorageProviderImpl = std::make_unique<CallbackStorageProvider>(
+        Context, OnSload, OnEphemeralStore);
+  } else {
+    StorageProviderImpl.reset();
+  }
+}
+
 DTVM::DTVM()
     : evmc_vm{EVMC_ABI_VERSION, "dtvm",    PROJECT_VERSION,
               ::destroy,        ::execute, ::get_capabilities,
@@ -208,3 +337,14 @@ DTVM::DTVM()
 } // namespace
 
 extern "C" evmc_vm *evmc_create_dtvmapi() { return new DTVM; }
+
+extern "C" void dtvm_set_storage_persistence_callbacks(
+    evmc_vm *VMInstance, void *Context,
+    dtvm_storage_diff_sink_on_sstore_fn OnSstore,
+    dtvm_storage_diff_sink_on_finish_fn OnFinish,
+    dtvm_storage_provider_sload_fn OnSload,
+    dtvm_storage_provider_sstore_fn OnEphemeralStore) {
+  auto *VM = static_cast<DTVM *>(VMInstance);
+  VM->configureStoragePersistence(Context, OnSstore, OnFinish, OnSload,
+                                  OnEphemeralStore);
+}

@@ -680,6 +680,7 @@ void Runtime::callEVMMain(EVMInstance &Inst, evmc_message &Msg,
   auto Timer = Stats.startRecord(utils::StatisticPhase::Execution);
 #endif
   Inst.clearMessageCache();
+  Inst.clearDiffLog();
   evmc_message MsgWithCode = Msg;
   MsgWithCode.code = reinterpret_cast<uint8_t *>(Inst.getModule()->Code);
   MsgWithCode.code_size = Inst.getModule()->CodeSize;
@@ -695,6 +696,11 @@ void Runtime::callEVMMain(EVMInstance &Inst, evmc_message &Msg,
 #endif
   }
   Result.gas_left = Inst.getGas();
+  if (auto *Sink = Inst.getStorageDiffSink();
+      Sink != nullptr && Result.status_code == EVMC_SUCCESS) {
+    Sink->on_finish(Inst.getDiffLog());
+  }
+  Inst.clearDiffLog();
 #ifdef ZEN_ENABLE_LINUX_PERF
   Stats.stopRecord(Timer);
 #endif

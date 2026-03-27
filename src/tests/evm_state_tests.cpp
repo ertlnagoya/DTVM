@@ -62,8 +62,9 @@ TxIntrinsicCost computeTxIntrinsicCost(const evmc_revision Revision,
     }
   }
 
-  const int64_t AuthListCost = static_cast<int64_t>(PT.AuthorizationListSize) *
-                               AuthorizationEmptyAccountCost;
+  const int64_t AuthListCost =
+      static_cast<int64_t>(PT.AuthorizationList.size()) *
+      AuthorizationEmptyAccountCost;
 
   int64_t InitcodeCost = 0;
   if (IsCreateTx && Revision >= EVMC_SHANGHAI) {
@@ -201,6 +202,7 @@ ExecutionResult executeStateTest(const StateTestFixture &Fixture,
                          " (" + Fork + ")");
     }
 
+    const int64_t MinimumChargedGas = IntrinsicCost.Min;
     const int64_t ExecutionGasLimit = TxGasLimit - IntrinsicCost.Intrinsic;
     PT.Message->gas = ExecutionGasLimit;
 
@@ -281,6 +283,7 @@ ExecutionResult executeStateTest(const StateTestFixture &Fixture,
     ExecConfig.Message = *PT.Message;
     ExecConfig.Revision = Revision;
     ExecConfig.IntrinsicGas = static_cast<uint64_t>(IntrinsicCost.Intrinsic);
+    ExecConfig.MinimumChargedGas = static_cast<uint64_t>(MinimumChargedGas);
 
     // Convert AccessList from ParsedTransaction to TransactionExecutionConfig
     for (const auto &Entry : PT.AccessList) {
@@ -288,6 +291,16 @@ ExecutionResult executeStateTest(const StateTestFixture &Fixture,
       ALE.Address = Entry.Address;
       ALE.StorageKeys = Entry.StorageKeys;
       ExecConfig.AccessList.push_back(std::move(ALE));
+    }
+
+    for (const auto &Entry : PT.AuthorizationList) {
+      ZenMockedEVMHost::AuthorizationListEntry ALE;
+      ALE.ChainId = Entry.ChainId;
+      ALE.Address = Entry.Address;
+      ALE.Nonce = Entry.Nonce;
+      ALE.Signer = Entry.Signer;
+      ALE.HasSigner = Entry.HasSigner;
+      ExecConfig.AuthorizationList.push_back(std::move(ALE));
     }
 
     ExecConfig.GasLimit = static_cast<uint64_t>(PT.Message->gas);
@@ -513,6 +526,171 @@ std::string sanitizeTestName(const std::string &Name) {
 }
 
 class EVMStateTest : public testing::TestWithParam<StateTestCaseParam> {};
+
+TEST(EVMStateFocused, Blake2PrecompileDelegatecallBerlin) {
+  const evmc_revision TargetRevision = getTargetRevision();
+  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_BERLIN) {
+    GTEST_SKIP() << "Focused Berlin regression skipped for requested revision";
+  }
+
+  const std::string FixturePath =
+      DEFAULT_TEST_DIR +
+      "/istanbul/eip152_blake2/test_blake2_precompile_delegatecall.json";
+  const std::string FixtureName =
+      "tests/istanbul/eip152_blake2/test_blake2_delegatecall.py::"
+      "test_blake2_precompile_delegatecall[fork_Berlin-state_test]";
+  const std::string ForkName = "Berlin";
+
+  auto Fixtures = parseStateTestFile(FixturePath);
+  auto FixtureIt = std::find_if(Fixtures.begin(), Fixtures.end(),
+                                [&](const StateTestFixture &Fixture) {
+                                  return Fixture.TestName == FixtureName;
+                                });
+
+  ASSERT_NE(FixtureIt, Fixtures.end())
+      << "Focused fixture not found in " << FixturePath;
+  ASSERT_NE(FixtureIt->Post, nullptr)
+      << "Focused fixture is missing post state";
+
+  const auto ForkIt = FixtureIt->Post->FindMember(ForkName.c_str());
+  ASSERT_NE(ForkIt, FixtureIt->Post->MemberEnd())
+      << "Fork " << ForkName << " not found in focused fixture";
+  ASSERT_TRUE(ForkIt->value.IsArray())
+      << "Fork " << ForkName << " does not contain a result array";
+  ASSERT_GT(ForkIt->value.Size(), 0u)
+      << "Fork " << ForkName << " result array is empty";
+
+  ForkPostResult ExpectedResult = parseForkPostResult(ForkIt->value[0]);
+  ExecutionResult Result =
+      executeStateTest(*FixtureIt, ForkName, ExpectedResult);
+
+  if (!Result.Passed) {
+    std::string CombinedErrors = "\n";
+    CombinedErrors += "=================================================\n";
+    CombinedErrors +=
+        "Focused Berlin blake2 delegatecall regression failed with " +
+        std::to_string(Result.ErrorMessages.size()) +
+        (Result.ErrorMessages.size() == 1 ? " error:" : " errors:") + "\n";
+    CombinedErrors += "=================================================\n";
+    for (size_t I = 0; I < Result.ErrorMessages.size(); ++I) {
+      CombinedErrors += "\n[Error " + std::to_string(I + 1) + "]\n";
+      CombinedErrors += Result.ErrorMessages[I];
+      CombinedErrors += "\n";
+    }
+    CombinedErrors += "=================================================\n";
+    FAIL() << CombinedErrors;
+  }
+}
+
+TEST(EVMStateFocused, ChainIdTypedTransaction4Prague) {
+  const evmc_revision TargetRevision = getTargetRevision();
+  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_PRAGUE) {
+    GTEST_SKIP() << "Focused Prague regression skipped for requested revision";
+  }
+
+  const std::string FixturePath =
+      DEFAULT_TEST_DIR + "/istanbul/eip1344_chainid/test_chainid.json";
+  const std::string FixtureName =
+      "tests/istanbul/eip1344_chainid/test_chainid.py::"
+      "test_chainid[fork_Prague-typed_transaction_4-state_test]";
+  const std::string ForkName = "Prague";
+
+  auto Fixtures = parseStateTestFile(FixturePath);
+  auto FixtureIt = std::find_if(Fixtures.begin(), Fixtures.end(),
+                                [&](const StateTestFixture &Fixture) {
+                                  return Fixture.TestName == FixtureName;
+                                });
+
+  ASSERT_NE(FixtureIt, Fixtures.end())
+      << "Focused fixture not found in " << FixturePath;
+  ASSERT_NE(FixtureIt->Post, nullptr)
+      << "Focused fixture is missing post state";
+
+  const auto ForkIt = FixtureIt->Post->FindMember(ForkName.c_str());
+  ASSERT_NE(ForkIt, FixtureIt->Post->MemberEnd())
+      << "Fork " << ForkName << " not found in focused fixture";
+  ASSERT_TRUE(ForkIt->value.IsArray())
+      << "Fork " << ForkName << " does not contain a result array";
+  ASSERT_GT(ForkIt->value.Size(), 0u)
+      << "Fork " << ForkName << " result array is empty";
+
+  ForkPostResult ExpectedResult = parseForkPostResult(ForkIt->value[0]);
+  ExecutionResult Result =
+      executeStateTest(*FixtureIt, ForkName, ExpectedResult);
+
+  if (!Result.Passed) {
+    std::string CombinedErrors = "\n";
+    CombinedErrors += "=================================================\n";
+    CombinedErrors +=
+        "Focused Prague CHAINID typed_transaction_4 regression failed with " +
+        std::to_string(Result.ErrorMessages.size()) +
+        (Result.ErrorMessages.size() == 1 ? " error:" : " errors:") + "\n";
+    CombinedErrors += "=================================================\n";
+    for (size_t I = 0; I < Result.ErrorMessages.size(); ++I) {
+      CombinedErrors += "\n[Error " + std::to_string(I + 1) + "]\n";
+      CombinedErrors += Result.ErrorMessages[I];
+      CombinedErrors += "\n";
+    }
+    CombinedErrors += "=================================================\n";
+    FAIL() << CombinedErrors;
+  }
+}
+
+TEST(EVMStateFocused, ContractCreatingTxMaxSizeOnesPrague) {
+  const evmc_revision TargetRevision = getTargetRevision();
+  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_PRAGUE) {
+    GTEST_SKIP() << "Focused Prague regression skipped for requested revision";
+  }
+
+  const std::string FixturePath =
+      DEFAULT_TEST_DIR +
+      "/shanghai/eip3860_initcode/test_contract_creating_tx.json";
+  const std::string FixtureName =
+      "tests/shanghai/eip3860_initcode/test_initcode.py::"
+      "test_contract_creating_tx[fork_Prague-state_test-max_size_ones]";
+  const std::string ForkName = "Prague";
+
+  auto Fixtures = parseStateTestFile(FixturePath);
+  auto FixtureIt = std::find_if(Fixtures.begin(), Fixtures.end(),
+                                [&](const StateTestFixture &Fixture) {
+                                  return Fixture.TestName == FixtureName;
+                                });
+
+  ASSERT_NE(FixtureIt, Fixtures.end())
+      << "Focused fixture not found in " << FixturePath;
+  ASSERT_NE(FixtureIt->Post, nullptr)
+      << "Focused fixture is missing post state";
+
+  const auto ForkIt = FixtureIt->Post->FindMember(ForkName.c_str());
+  ASSERT_NE(ForkIt, FixtureIt->Post->MemberEnd())
+      << "Fork " << ForkName << " not found in focused fixture";
+  ASSERT_TRUE(ForkIt->value.IsArray())
+      << "Fork " << ForkName << " does not contain a result array";
+  ASSERT_GT(ForkIt->value.Size(), 0u)
+      << "Fork " << ForkName << " result array is empty";
+
+  ForkPostResult ExpectedResult = parseForkPostResult(ForkIt->value[0]);
+  ExecutionResult Result =
+      executeStateTest(*FixtureIt, ForkName, ExpectedResult);
+
+  if (!Result.Passed) {
+    std::string CombinedErrors = "\n";
+    CombinedErrors += "=================================================\n";
+    CombinedErrors +=
+        "Focused Prague max_size_ones contract-creation regression failed "
+        "with " +
+        std::to_string(Result.ErrorMessages.size()) +
+        (Result.ErrorMessages.size() == 1 ? " error:" : " errors:") + "\n";
+    CombinedErrors += "=================================================\n";
+    for (size_t I = 0; I < Result.ErrorMessages.size(); ++I) {
+      CombinedErrors += "\n[Error " + std::to_string(I + 1) + "]\n";
+      CombinedErrors += Result.ErrorMessages[I];
+      CombinedErrors += "\n";
+    }
+    CombinedErrors += "=================================================\n";
+    FAIL() << CombinedErrors;
+  }
+}
 
 TEST_P(EVMStateTest, ExecutesStateTest) {
   const auto &Param = GetParam();
