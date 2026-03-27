@@ -30,7 +30,8 @@ const size_t MAX_JIT_BYTECODE_SIZE = 0x6000;
 
 namespace {
 
-static dtvm_storage_diff_t to_c_storage_diff(const evm::StorageDiff &Diff) {
+static dtvm_storage_diff_t
+to_c_storage_diff(const zen::evm::StorageDiff &Diff) {
   dtvm_storage_diff_t Result{};
   std::memcpy(&Result.address, &Diff.address, sizeof(Result.address));
   std::memcpy(&Result.key, &Diff.key, sizeof(Result.key));
@@ -51,7 +52,7 @@ public:
                           dtvm_storage_diff_sink_on_finish_fn OnFinish)
       : Ctx(Context), OnSstore(OnSstore), OnFinish(OnFinish) {}
 
-  void on_sstore(const StorageDiff &Diff) override {
+  void on_sstore(const zen::evm::StorageDiff &Diff) override {
     if (!OnSstore) {
       return;
     }
@@ -59,7 +60,7 @@ public:
     OnSstore(Ctx, &DiffData);
   }
 
-  void on_finish(const ExecutionDiffLog &Diffs) override {
+  void on_finish(const zen::evm::ExecutionDiffLog &Diffs) override {
     if (!OnFinish) {
       return;
     }
@@ -175,8 +176,8 @@ struct DTVM : evmc_vm {
                           .EnableEvmGasMetering = true};
   std::unique_ptr<Runtime> RT;
   std::unique_ptr<WrappedHost> ExecHost;
-  std::unique_ptr<evm::StorageDiffSink> StorageDiffSinkImpl;
-  std::unique_ptr<evm::StorageProvider> StorageProviderImpl;
+  std::unique_ptr<zen::evm::StorageDiffSink> StorageDiffSinkImpl;
+  std::unique_ptr<zen::evm::StorageProvider> StorageProviderImpl;
   std::unordered_map<uint64_t, EVMModule *> LoadedMods;
   Isolation *Iso = nullptr;
 
