@@ -221,6 +221,10 @@ class TestRunner:
             start = stdout.find("output: 0x") + 10
             hex_value = stdout[start:].split("\n", 1)[0].strip()
             return_value = hex_value[2:] if hex_value.startswith("0x") else hex_value
+        elif "revert data: 0x" in stdout:
+            start = stdout.find("revert data: 0x") + 15
+            hex_value = stdout[start:].split("\n", 1)[0].strip()
+            return_value = hex_value[2:] if hex_value.startswith("0x") else hex_value
 
         return {
             "status": status_map.get(returncode, "failure"),

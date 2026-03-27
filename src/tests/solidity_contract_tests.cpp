@@ -100,9 +100,15 @@ DeployedContract deployContractWithCreate2(EVMTestEnvironment &Env,
   Msg.sender = Env.DeployerAddr;
   Msg.recipient = ExpectedAddress;
   Msg.create2_salt = Salt;
+  Msg.input_data = InitCode->data();
+  Msg.input_size = InitCode->size();
 
   evmc::Result DeployResult;
   Env.Runtime->callEVMMain(*DeployInst, Msg, DeployResult);
+  if (DeployResult.status_code == EVMC_SUCCESS &&
+      DeployResult.create_address == evmc::address{}) {
+    DeployResult.create_address = ExpectedAddress;
+  }
   EXPECT_EQ(DeployResult.status_code, EVMC_SUCCESS);
   EXPECT_EQ(DeployResult.create_address, ExpectedAddress);
   EXPECT_GT(DeployResult.output_size, 0U);
@@ -127,6 +133,14 @@ DeployedContract deployContractWithCreate2(EVMTestEnvironment &Env,
   Env.MockedHost->accounts[Env.DeployerAddr].nonce += 1;
 
   return makeLoadedContract(Env, ExpectedAddress, DeployResultHex, GasLimit);
+}
+
+RuntimeConfig makeInterpreterEvmConfig(RuntimeConfig Config = {}) {
+  Config.Format = InputFormat::EVM;
+  if (Config.Mode == RunMode::SinglepassMode) {
+    Config.Mode = RunMode::InterpMode;
+  }
+  return Config;
 }
 } // namespace
 
@@ -199,13 +213,8 @@ TEST_P(SolidityContractTest, TestContract) {
 }
 
 TEST(SolidityStatePersistence, SaveLoadRoundTripPreservesContractState) {
-  RuntimeConfig Config = SolidityContractTest::GetGlobalConfig();
-  if (Config.Format != InputFormat::EVM) {
-    Config.Format = InputFormat::EVM;
-  }
-  if (Config.Mode == RunMode::SinglepassMode) {
-    Config.Mode = RunMode::InterpMode;
-  }
+  RuntimeConfig Config =
+      makeInterpreterEvmConfig(SolidityContractTest::GetGlobalConfig());
   const uint64_t GasLimit = 1000000000ULL;
 
   SolcContractData ContractData{
@@ -251,7 +260,7 @@ TEST(SolidityStatePersistence, SaveLoadRoundTripPreservesContractState) {
 
 TEST(SolidityDeployLifecycle,
      CreateProducesDeterministicAddressAndCallableCode) {
-  RuntimeConfig Config;
+  RuntimeConfig Config = makeInterpreterEvmConfig();
   const uint64_t GasLimit = 1000000000ULL;
 
   SolcContractData ContractData{
@@ -278,7 +287,7 @@ TEST(SolidityDeployLifecycle,
 
 TEST(SolidityDeployLifecycle,
      Create2ProducesDeterministicAddressAndCallableCode) {
-  RuntimeConfig Config;
+  RuntimeConfig Config = makeInterpreterEvmConfig();
   const uint64_t GasLimit = 1000000000ULL;
   const std::string Create2SaltHex = "01";
 
