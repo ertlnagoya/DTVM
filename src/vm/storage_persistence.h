@@ -28,8 +28,7 @@ typedef void (*dtvm_storage_provider_sstore_fn)(
     const struct evmc_bytes32 *key, const struct evmc_bytes32 *value);
 
 void dtvm_set_storage_persistence_callbacks(
-    evmc_vm *vm, void *context,
-    dtvm_storage_diff_sink_on_sstore_fn on_sstore,
+    evmc_vm *vm, void *context, dtvm_storage_diff_sink_on_sstore_fn on_sstore,
     dtvm_storage_diff_sink_on_finish_fn on_finish,
     dtvm_storage_provider_sload_fn on_sload,
     dtvm_storage_provider_sstore_fn on_ephemeral_store);

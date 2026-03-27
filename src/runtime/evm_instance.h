@@ -47,7 +47,9 @@ public:
 
   void setStorageDiffSink(evm::StorageDiffSink *Sink) { DiffSink = Sink; }
   evm::StorageDiffSink *getStorageDiffSink() const { return DiffSink; }
-  void setStorageProvider(evm::StorageProvider *Provider) { StorageProvider = Provider; }
+  void setStorageProvider(evm::StorageProvider *Provider) {
+    StorageProvider = Provider;
+  }
   evm::StorageProvider *getStorageProvider() const { return StorageProvider; }
   evm::ExecutionDiffLog &getDiffLog() { return DiffLog; }
   const evm::ExecutionDiffLog &getDiffLog() const { return DiffLog; }

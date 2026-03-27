@@ -17,8 +17,8 @@ using namespace zen::utils;
 
 namespace {
 
-constexpr uint8_t CLEAR_SLOT_RUNTIME[] = {
-    0x60, 0x00, 0x60, 0x00, 0x55, 0x60, 0x00, 0x60, 0x01, 0x55, 0x00};
+constexpr uint8_t CLEAR_SLOT_RUNTIME[] = {0x60, 0x00, 0x60, 0x00, 0x55, 0x60,
+                                          0x00, 0x60, 0x01, 0x55, 0x00};
 
 intx::uint256 toUint256(const evmc::uint256be &Value) {
   return intx::be::load<intx::uint256>(Value.bytes);
@@ -34,16 +34,13 @@ struct GasSettlementObservation {
   intx::uint256 CoinbaseBalance;
 };
 
-GasSettlementObservation
-runGasSettlementScenario(evmc_revision Revision, const intx::uint256 &GasPrice,
-                         const intx::uint256 &BaseFee = intx::uint256(0),
-                         const std::optional<intx::uint256> &MaxPriorityFee =
-                             std::nullopt,
-                         const std::optional<intx::uint256> &BlobBaseFee =
-                             std::nullopt,
-                         const std::optional<intx::uint256> &MaxFeePerBlobGas =
-                             std::nullopt,
-                         size_t BlobHashesCount = 0) {
+GasSettlementObservation runGasSettlementScenario(
+    evmc_revision Revision, const intx::uint256 &GasPrice,
+    const intx::uint256 &BaseFee = intx::uint256(0),
+    const std::optional<intx::uint256> &MaxPriorityFee = std::nullopt,
+    const std::optional<intx::uint256> &BlobBaseFee = std::nullopt,
+    const std::optional<intx::uint256> &MaxFeePerBlobGas = std::nullopt,
+    size_t BlobHashesCount = 0) {
   RuntimeConfig Config;
   Config.Mode = common::RunMode::InterpMode;
   Config.EnableEvmGasMetering = true;
@@ -56,15 +53,12 @@ runGasSettlementScenario(evmc_revision Revision, const intx::uint256 &GasPrice,
   }
   Host->setRuntime(RT.get());
 
-  const evmc::address Sender =
-      evmc::literals::operator""_address(
-          "1000000000000000000000000000000000000001");
-  const evmc::address Contract =
-      evmc::literals::operator""_address(
-          "2000000000000000000000000000000000000002");
-  const evmc::address Coinbase =
-      evmc::literals::operator""_address(
-          "3000000000000000000000000000000000000003");
+  const evmc::address Sender = evmc::literals::operator""_address(
+      "1000000000000000000000000000000000000001");
+  const evmc::address Contract = evmc::literals::operator""_address(
+      "2000000000000000000000000000000000000002");
+  const evmc::address Coinbase = evmc::literals::operator""_address(
+      "3000000000000000000000000000000000000003");
   const evmc::bytes32 SlotKey0 = parseBytes32("0x00");
   const evmc::bytes32 SlotKey1 = parseBytes32("0x01");
   const intx::uint256 InitialSenderBalance = intx::uint256(1000000000);
@@ -96,10 +90,8 @@ runGasSettlementScenario(evmc_revision Revision, const intx::uint256 &GasPrice,
   ContractAccount.nonce = 1;
   ContractAccount.code.assign(std::begin(CLEAR_SLOT_RUNTIME),
                               std::end(CLEAR_SLOT_RUNTIME));
-  ContractAccount.storage[SlotKey0] =
-      evmc::StorageValue{parseBytes32("0x01")};
-  ContractAccount.storage[SlotKey1] =
-      evmc::StorageValue{parseBytes32("0x01")};
+  ContractAccount.storage[SlotKey0] = evmc::StorageValue{parseBytes32("0x01")};
+  ContractAccount.storage[SlotKey1] = evmc::StorageValue{parseBytes32("0x01")};
   const std::vector<uint8_t> ContractCodeVec(ContractAccount.code.begin(),
                                              ContractAccount.code.end());
   const std::vector<uint8_t> CodeHash =
@@ -264,18 +256,14 @@ TEST(EVMHostGasSettlement, PragueAuthorizationListAppliesDelegationState) {
   ASSERT_TRUE(RT != nullptr);
   Host->setRuntime(RT.get());
 
-  const evmc::address Sender =
-      evmc::literals::operator""_address(
-          "1000000000000000000000000000000000000001");
-  const evmc::address Contract =
-      evmc::literals::operator""_address(
-          "2000000000000000000000000000000000000002");
-  const evmc::address Signer =
-      evmc::literals::operator""_address(
-          "3000000000000000000000000000000000000003");
-  const evmc::address DelegateTarget =
-      evmc::literals::operator""_address(
-          "4000000000000000000000000000000000000004");
+  const evmc::address Sender = evmc::literals::operator""_address(
+      "1000000000000000000000000000000000000001");
+  const evmc::address Contract = evmc::literals::operator""_address(
+      "2000000000000000000000000000000000000002");
+  const evmc::address Signer = evmc::literals::operator""_address(
+      "3000000000000000000000000000000000000003");
+  const evmc::address DelegateTarget = evmc::literals::operator""_address(
+      "4000000000000000000000000000000000000004");
 
   evmc_tx_context TxContext{};
   TxContext.chain_id = parseUint256("0x01");
@@ -309,8 +297,8 @@ TEST(EVMHostGasSettlement, PragueAuthorizationListAppliesDelegationState) {
 
   ZenMockedEVMHost::TransactionExecutionConfig ExecConfig;
   ExecConfig.ModuleName = "prague_authorization_host_test";
-  ExecConfig.Bytecode = reinterpret_cast<const uint8_t *>(
-      ContractAccount.code.data());
+  ExecConfig.Bytecode =
+      reinterpret_cast<const uint8_t *>(ContractAccount.code.data());
   ExecConfig.BytecodeSize = ContractAccount.code.size();
   ExecConfig.Message = Msg;
   ExecConfig.GasLimit = 80000;
@@ -351,12 +339,10 @@ TEST(EVMHostGasSettlement, RevertedTransactionKeepsSingleSenderNonceBump) {
   ASSERT_TRUE(RT != nullptr);
   Host->setRuntime(RT.get());
 
-  const evmc::address Sender =
-      evmc::literals::operator""_address(
-          "5000000000000000000000000000000000000005");
-  const evmc::address Contract =
-      evmc::literals::operator""_address(
-          "6000000000000000000000000000000000000006");
+  const evmc::address Sender = evmc::literals::operator""_address(
+      "5000000000000000000000000000000000000005");
+  const evmc::address Contract = evmc::literals::operator""_address(
+      "6000000000000000000000000000000000000006");
   constexpr uint8_t REVERT_RUNTIME[] = {0x60, 0x00, 0x60, 0x00, 0xfd};
 
   evmc_tx_context TxContext{};
@@ -374,9 +360,8 @@ TEST(EVMHostGasSettlement, RevertedTransactionKeepsSingleSenderNonceBump) {
   const auto ContractCodeHash = zen::host::evm::crypto::keccak256(ContractCode);
   std::memcpy(ContractAccount.codehash.bytes, ContractCodeHash.data(), 32);
 
-  Host->loadInitialState(TxContext,
-                         {{Sender, SenderAccount}, {Contract, ContractAccount}},
-                         true);
+  Host->loadInitialState(
+      TxContext, {{Sender, SenderAccount}, {Contract, ContractAccount}}, true);
 
   evmc_message Msg{};
   Msg.kind = EVMC_CALL;

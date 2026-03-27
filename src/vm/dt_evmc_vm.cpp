@@ -4,10 +4,10 @@
 #include "dt_evmc_vm.h"
 #include "common/enums.h"
 #include "common/errors.h"
+#include "evm/storage_diff.h"
 #include "runtime/config.h"
 #include "runtime/evm_instance.h"
 #include "runtime/isolation.h"
-#include "evm/storage_diff.h"
 #include "runtime/runtime.h"
 #include "storage_persistence.h"
 #include "wrapped_host.h"
@@ -84,11 +84,9 @@ private:
 
 class CallbackStorageProvider final : public zen::evm::StorageProvider {
 public:
-  CallbackStorageProvider(void *Context,
-                          dtvm_storage_provider_sload_fn OnSload,
+  CallbackStorageProvider(void *Context, dtvm_storage_provider_sload_fn OnSload,
                           dtvm_storage_provider_sstore_fn OnEphemeralStore)
-      : Ctx(Context), OnSload(OnSload),
-        OnEphemeralStore(OnEphemeralStore) {}
+      : Ctx(Context), OnSload(OnSload), OnEphemeralStore(OnEphemeralStore) {}
 
   evmc::bytes32 sload(const evmc::address &Address,
                       const evmc::bytes32 &Key) override {
@@ -102,8 +100,7 @@ public:
     return OnSload(Ctx, &AddressC, &KeyC);
   }
 
-  void sstore_ephemeral(const evmc::address &Address,
-                        const evmc::bytes32 &Key,
+  void sstore_ephemeral(const evmc::address &Address, const evmc::bytes32 &Key,
                         const evmc::bytes32 &Value) override {
     if (!OnEphemeralStore) {
       return;
@@ -183,11 +180,12 @@ struct DTVM : evmc_vm {
   std::unordered_map<uint64_t, EVMModule *> LoadedMods;
   Isolation *Iso = nullptr;
 
-  void configureStoragePersistence(
-      void *Context, dtvm_storage_diff_sink_on_sstore_fn OnSstore,
-      dtvm_storage_diff_sink_on_finish_fn OnFinish,
-      dtvm_storage_provider_sload_fn OnSload,
-      dtvm_storage_provider_sstore_fn OnEphemeralStore);
+  void
+  configureStoragePersistence(void *Context,
+                              dtvm_storage_diff_sink_on_sstore_fn OnSstore,
+                              dtvm_storage_diff_sink_on_finish_fn OnFinish,
+                              dtvm_storage_provider_sload_fn OnSload,
+                              dtvm_storage_provider_sstore_fn OnEphemeralStore);
 };
 
 /// The implementation of the evmc_vm::destroy() method.

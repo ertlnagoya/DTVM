@@ -763,8 +763,8 @@ void SLoadHandler::doExecute() {
   evmc::bytes32 ValueBytes;
   if (auto *Inst = Context->getInstance();
       Inst != nullptr && Inst->getStorageProvider() != nullptr) {
-    ValueBytes = Inst->getStorageProvider()->sload(Frame->Msg.recipient,
-                                                   KeyAddr);
+    ValueBytes =
+        Inst->getStorageProvider()->sload(Frame->Msg.recipient, KeyAddr);
   } else {
     ValueBytes = Frame->Host->get_storage(Frame->Msg.recipient, KeyAddr);
   }

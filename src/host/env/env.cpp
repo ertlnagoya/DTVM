@@ -61,12 +61,11 @@ static void abort(Instance *instance) {
 }
 #endif
 
-static void report_abort(Instance *instance,
-                         const char *msg = nullptr) {
+static void report_abort(Instance *instance, const char *msg = nullptr) {
   using namespace common;
   if (msg) {
-    instance->setExceptionByHostapi(getErrorWithExtraMessage(
-        ErrorCode::EnvAbort, msg));
+    instance->setExceptionByHostapi(
+        getErrorWithExtraMessage(ErrorCode::EnvAbort, msg));
   } else {
     instance->setExceptionByHostapi(getError(ErrorCode::EnvAbort));
   }
@@ -152,10 +151,10 @@ static void keccak256(Instance *instance, int32_t InputOffset,
   zeroed_result(instance, ResultOffset, 32);
 }
 
-static void emitLogEvent(Instance *instance, int32_t DataOffset,
-                         int32_t Length, int32_t NumTopics,
-                         int32_t Topic1Offset, int32_t Topic2Offset,
-                         int32_t Topic3Offset, int32_t Topic4Offset) {
+static void emitLogEvent(Instance *instance, int32_t DataOffset, int32_t Length,
+                         int32_t NumTopics, int32_t Topic1Offset,
+                         int32_t Topic2Offset, int32_t Topic3Offset,
+                         int32_t Topic4Offset) {
   (void)instance;
   (void)DataOffset;
   (void)Length;

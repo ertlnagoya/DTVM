@@ -379,8 +379,7 @@ createTransactionFromIndex(const rapidjson::Document &Transaction,
         AuthorizationListEntry ALE;
         if (Entry.HasMember("chainId") && Entry["chainId"].IsString()) {
           ALE.ChainId = parseUint256(Entry["chainId"].GetString());
-        } else if (Entry.HasMember("chainid") &&
-                   Entry["chainid"].IsString()) {
+        } else if (Entry.HasMember("chainid") && Entry["chainid"].IsString()) {
           ALE.ChainId = parseUint256(Entry["chainid"].GetString());
         }
 

@@ -8,13 +8,13 @@
 #include "zetaengine.h"
 #include <CLI/CLI.hpp>
 #ifdef ZEN_ENABLE_EVM
-#include "tests/evm_test_host.hpp"
 #include "host/evm/crypto.h"
+#include "tests/evm_test_host.hpp"
 #include "utils/evm.h"
 #endif // ZEN_ENABLE_EVM
 #include <fstream>
-#include <unistd.h>
 #include <limits>
+#include <unistd.h>
 
 #ifdef ZEN_ENABLE_BUILTIN_WASI
 #include "host/wasi/wasi.h"
@@ -212,7 +212,8 @@ int main(int argc, char *argv[]) {
   std::vector<std::string> Dirs;
   std::string SaveStateFile;
   std::string LoadStateFile;
-  uint64_t GasLimit = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+  uint64_t GasLimit =
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
   LoggerLevel LogLevel = LoggerLevel::Info;
   uint32_t NumExtraCompilations = 0;
   uint32_t NumExtraExecutions = 0;
@@ -270,8 +271,9 @@ int main(int argc, char *argv[]) {
                           "Contract address for call mode");
     CLIParser->add_option("--contract-address-out", ContractAddressOutFile,
                           "Write deployed contract address to file");
-    CLIParser->add_option("--evm-bytecode-kind", EVMBytecodeKind,
-                          "Interpret INPUT_FILE as deploy or runtime bytecode")
+    CLIParser
+        ->add_option("--evm-bytecode-kind", EVMBytecodeKind,
+                     "Interpret INPUT_FILE as deploy or runtime bytecode")
         ->transform(
             CLI::CheckedTransformer(EVMBytecodeKindMap, CLI::ignore_case));
     CLIParser->add_option("--create2-salt", Create2Salt,
@@ -347,11 +349,13 @@ int main(int argc, char *argv[]) {
       return exitMain(EXIT_FAILURE);
     }
     if (DeployMode && EVMBytecodeKind == "runtime") {
-      ZEN_LOG_ERROR("--deploy requires deploy bytecode; got --evm-bytecode-kind=runtime");
+      ZEN_LOG_ERROR(
+          "--deploy requires deploy bytecode; got --evm-bytecode-kind=runtime");
       return exitMain(EXIT_FAILURE);
     }
     if (!DeployMode && EVMBytecodeKind == "deploy") {
-      ZEN_LOG_ERROR("EVM call mode requires runtime bytecode; got --evm-bytecode-kind=deploy");
+      ZEN_LOG_ERROR("EVM call mode requires runtime bytecode; got "
+                    "--evm-bytecode-kind=deploy");
       return exitMain(EXIT_FAILURE);
     }
     if (!DeployMode && ContractAddress.empty()) {
@@ -442,14 +446,16 @@ int main(int argc, char *argv[]) {
       if (ExeResult.status_code == EVMC_SUCCESS) {
         auto &NewContractAccount = MockedHost.accounts[Msg.recipient];
         if (ExeResult.output_data && ExeResult.output_size > 0) {
-          std::vector<uint8_t> DeployResultBytes(
-              ExeResult.output_data, ExeResult.output_data + ExeResult.output_size);
-          NewContractAccount.code = evmc::bytes(DeployResultBytes.data(),
-                                                DeployResultBytes.size());
+          std::vector<uint8_t> DeployResultBytes(ExeResult.output_data,
+                                                 ExeResult.output_data +
+                                                     ExeResult.output_size);
+          NewContractAccount.code =
+              evmc::bytes(DeployResultBytes.data(), DeployResultBytes.size());
           const std::vector<uint8_t> CodeHashVec =
               zen::host::evm::crypto::keccak256(DeployResultBytes);
           evmc::bytes32 CodeHash{};
-          std::memcpy(CodeHash.bytes, CodeHashVec.data(), sizeof(CodeHash.bytes));
+          std::memcpy(CodeHash.bytes, CodeHashVec.data(),
+                      sizeof(CodeHash.bytes));
           NewContractAccount.codehash = CodeHash;
         } else {
           NewContractAccount.code.clear();
@@ -471,7 +477,8 @@ int main(int argc, char *argv[]) {
     if (EVMC_CREATE == MsgKind || EVMC_CREATE2 == MsgKind) {
       printf("contract address: %s\n",
              zen::utils::addressToHex(ExeResult.create_address).c_str());
-      if (ExeResult.status_code == EVMC_SUCCESS && !ContractAddressOutFile.empty()) {
+      if (ExeResult.status_code == EVMC_SUCCESS &&
+          !ContractAddressOutFile.empty()) {
         std::ofstream OutFile(ContractAddressOutFile);
         if (!OutFile.is_open()) {
           ZEN_LOG_ERROR("failed to open contract address output file: %s",

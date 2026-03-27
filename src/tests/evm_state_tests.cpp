@@ -283,8 +283,7 @@ ExecutionResult executeStateTest(const StateTestFixture &Fixture,
     ExecConfig.Message = *PT.Message;
     ExecConfig.Revision = Revision;
     ExecConfig.IntrinsicGas = static_cast<uint64_t>(IntrinsicCost.Intrinsic);
-    ExecConfig.MinimumChargedGas =
-        static_cast<uint64_t>(MinimumChargedGas);
+    ExecConfig.MinimumChargedGas = static_cast<uint64_t>(MinimumChargedGas);
 
     // Convert AccessList from ParsedTransaction to TransactionExecutionConfig
     for (const auto &Entry : PT.AccessList) {
@@ -543,10 +542,10 @@ TEST(EVMStateFocused, Blake2PrecompileDelegatecallBerlin) {
   const std::string ForkName = "Berlin";
 
   auto Fixtures = parseStateTestFile(FixturePath);
-  auto FixtureIt = std::find_if(
-      Fixtures.begin(), Fixtures.end(), [&](const StateTestFixture &Fixture) {
-        return Fixture.TestName == FixtureName;
-      });
+  auto FixtureIt = std::find_if(Fixtures.begin(), Fixtures.end(),
+                                [&](const StateTestFixture &Fixture) {
+                                  return Fixture.TestName == FixtureName;
+                                });
 
   ASSERT_NE(FixtureIt, Fixtures.end())
       << "Focused fixture not found in " << FixturePath;
@@ -597,10 +596,10 @@ TEST(EVMStateFocused, ChainIdTypedTransaction4Prague) {
   const std::string ForkName = "Prague";
 
   auto Fixtures = parseStateTestFile(FixturePath);
-  auto FixtureIt = std::find_if(
-      Fixtures.begin(), Fixtures.end(), [&](const StateTestFixture &Fixture) {
-        return Fixture.TestName == FixtureName;
-      });
+  auto FixtureIt = std::find_if(Fixtures.begin(), Fixtures.end(),
+                                [&](const StateTestFixture &Fixture) {
+                                  return Fixture.TestName == FixtureName;
+                                });
 
   ASSERT_NE(FixtureIt, Fixtures.end())
       << "Focused fixture not found in " << FixturePath;
@@ -652,10 +651,10 @@ TEST(EVMStateFocused, ContractCreatingTxMaxSizeOnesPrague) {
   const std::string ForkName = "Prague";
 
   auto Fixtures = parseStateTestFile(FixturePath);
-  auto FixtureIt = std::find_if(
-      Fixtures.begin(), Fixtures.end(), [&](const StateTestFixture &Fixture) {
-        return Fixture.TestName == FixtureName;
-      });
+  auto FixtureIt = std::find_if(Fixtures.begin(), Fixtures.end(),
+                                [&](const StateTestFixture &Fixture) {
+                                  return Fixture.TestName == FixtureName;
+                                });
 
   ASSERT_NE(FixtureIt, Fixtures.end())
       << "Focused fixture not found in " << FixturePath;
