@@ -7,6 +7,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <rapidjson/istreamwrapper.h>
 #include <stdexcept>
 
@@ -358,11 +359,52 @@ createTransactionFromIndex(const rapidjson::Document &Transaction,
       Transaction["authorizationList"].IsArray()) {
     const rapidjson::Value &AuthorizationLists =
         Transaction["authorizationList"];
-    if (Result.Indexes.Data < AuthorizationLists.Size()) {
-      const rapidjson::Value &AuthListForIndex =
-          AuthorizationLists[Result.Indexes.Data];
-      if (AuthListForIndex.IsArray()) {
-        PT.AuthorizationListSize = AuthListForIndex.Size();
+
+    const rapidjson::Value *AuthListForIndex = &AuthorizationLists;
+    if (!AuthorizationLists.Empty() && AuthorizationLists[0].IsArray()) {
+      if (Result.Indexes.Data < AuthorizationLists.Size()) {
+        AuthListForIndex = &AuthorizationLists[Result.Indexes.Data];
+      } else {
+        AuthListForIndex = nullptr;
+      }
+    }
+
+    if (AuthListForIndex && AuthListForIndex->IsArray()) {
+      for (rapidjson::SizeType I = 0; I < AuthListForIndex->Size(); ++I) {
+        const rapidjson::Value &Entry = (*AuthListForIndex)[I];
+        if (!Entry.IsObject()) {
+          continue;
+        }
+
+        AuthorizationListEntry ALE;
+        if (Entry.HasMember("chainId") && Entry["chainId"].IsString()) {
+          ALE.ChainId = parseUint256(Entry["chainId"].GetString());
+        } else if (Entry.HasMember("chainid") &&
+                   Entry["chainid"].IsString()) {
+          ALE.ChainId = parseUint256(Entry["chainid"].GetString());
+        }
+
+        if (Entry.HasMember("address") && Entry["address"].IsString()) {
+          ALE.Address = parseAddress(Entry["address"].GetString());
+        }
+
+        if (Entry.HasMember("nonce") && Entry["nonce"].IsString()) {
+          const std::string NonceStr =
+              stripHexPrefix(Entry["nonce"].GetString());
+          try {
+            ALE.Nonce =
+                std::stoull(NonceStr.empty() ? "0" : NonceStr, nullptr, 16);
+          } catch (const std::exception &) {
+            ALE.Nonce = std::numeric_limits<uint64_t>::max();
+          }
+        }
+
+        if (Entry.HasMember("signer") && Entry["signer"].IsString()) {
+          ALE.Signer = parseAddress(Entry["signer"].GetString());
+          ALE.HasSigner = true;
+        }
+
+        PT.AuthorizationList.push_back(std::move(ALE));
       }
     }
   }

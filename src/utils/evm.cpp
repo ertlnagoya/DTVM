@@ -156,6 +156,29 @@ evmc::address computeCreateAddress(const evmc::address &Sender,
   return Addr;
 }
 
+evmc::address computeCreate2Address(const evmc::address &Sender,
+                                    const evmc::bytes32 &Salt,
+                                    evmc::bytes_view InitCode) {
+  std::vector<uint8_t> InitCodeBytes(InitCode.begin(), InitCode.end());
+  const auto InitCodeHash =
+      zen::host::evm::crypto::CryptoProvider::getInstance().keccak256(
+          InitCodeBytes);
+  uint8_t Buffer[1 + sizeof(Sender) + sizeof(Salt) + 32];
+  auto *It = std::begin(Buffer);
+  *It++ = 0xff;
+  It = std::copy_n(Sender.bytes, sizeof(Sender), It);
+  It = std::copy_n(Salt.bytes, sizeof(Salt), It);
+  std::copy_n(InitCodeHash.data(), 32, It);
+  std::vector<uint8_t> BufferBytes(Buffer, Buffer + sizeof(Buffer));
+  const auto BaseHash =
+      zen::host::evm::crypto::CryptoProvider::getInstance().keccak256(
+          BufferBytes);
+  evmc::address Addr{};
+  std::copy_n(&BaseHash.data()[BaseHash.size() - sizeof(Addr)], sizeof(Addr),
+              Addr.bytes);
+  return Addr;
+}
+
 void writeJsonString(std::ostream &Os, const std::string &Str) {
   Os << '"';
   for (char C : Str) {
@@ -184,12 +207,14 @@ void writeJsonString(std::ostream &Os, const std::string &Str) {
 }
 
 bool saveState(const evmc::MockedHost &Host, const std::string &FilePath) {
+  constexpr uint32_t STATE_FORMAT_VERSION = 1;
   std::ofstream File(FilePath);
   if (!File.is_open()) {
     return false;
   }
 
   File << "{\n";
+  File << "  \"format_version\": " << STATE_FORMAT_VERSION << ",\n";
 
   // Serialize accounts
   File << "  \"accounts\": {\n";
@@ -277,6 +302,7 @@ bool saveState(const evmc::MockedHost &Host, const std::string &FilePath) {
 }
 
 bool loadState(evmc::MockedHost &Host, const std::string &FilePath) {
+  constexpr uint32_t STATE_FORMAT_VERSION = 1;
   std::ifstream File(FilePath);
   if (!File.is_open()) {
     return false;
@@ -292,6 +318,15 @@ bool loadState(evmc::MockedHost &Host, const std::string &FilePath) {
 
   if (!Doc.IsObject()) {
     return false;
+  }
+
+  if (Doc.HasMember("format_version")) {
+    if (!Doc["format_version"].IsUint()) {
+      return false;
+    }
+    if (Doc["format_version"].GetUint() != STATE_FORMAT_VERSION) {
+      return false;
+    }
   }
 
   Host.accounts.clear();

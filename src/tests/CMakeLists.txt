@@ -60,6 +60,7 @@ if(ZEN_ENABLE_SPEC_TEST)
   if(ZEN_ENABLE_EVM)
     add_subdirectory(mpt)
     add_executable(evmInterpTests evm_interp_tests.cpp)
+    add_executable(evmHostTests evm_host_tests.cpp)
     add_executable(
       solidityContractTests evm_precompiles.hpp solidity_contract_tests.cpp
                             solidity_test_helpers.cpp
@@ -91,6 +92,7 @@ if(ZEN_ENABLE_SPEC_TEST)
 
     if(ZEN_ENABLE_EVM)
       target_compile_options(evmInterpTests PRIVATE -fsanitize=address)
+      target_compile_options(evmHostTests PRIVATE -fsanitize=address)
       target_compile_options(solidityContractTests PRIVATE -fsanitize=address)
       target_compile_options(mptCompareCpp PRIVATE -fsanitize=address)
     endif()
@@ -110,6 +112,11 @@ if(ZEN_ENABLE_SPEC_TEST)
       if(ZEN_ENABLE_EVM)
         target_link_libraries(
           evmInterpTests
+          PRIVATE dtvmcore rapidjson yaml-cpp gtest_main -fsanitize=address
+          PUBLIC ${GTEST_BOTH_LIBRARIES}
+        )
+        target_link_libraries(
+          evmHostTests
           PRIVATE dtvmcore rapidjson yaml-cpp gtest_main -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
@@ -142,6 +149,16 @@ if(ZEN_ENABLE_SPEC_TEST)
       if(ZEN_ENABLE_EVM)
         target_link_libraries(
           evmInterpTests
+          PRIVATE dtvmcore
+                  rapidjson
+                  yaml-cpp
+                  gtest_main
+                  -fsanitize=address
+                  -static-libasan
+          PUBLIC ${GTEST_BOTH_LIBRARIES}
+        )
+        target_link_libraries(
+          evmHostTests
           PRIVATE dtvmcore
                   rapidjson
                   yaml-cpp
@@ -196,6 +213,11 @@ if(ZEN_ENABLE_SPEC_TEST)
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(
+        evmHostTests
+        PRIVATE dtvmcore rapidjson yaml-cpp gtest_main
+        PUBLIC ${GTEST_BOTH_LIBRARIES}
+      )
+      target_link_libraries(
         solidityContractTests
         PRIVATE dtvmcore rapidjson mpt gtest_main CLI11::CLI11
         PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -223,6 +245,7 @@ if(ZEN_ENABLE_SPEC_TEST)
 
   if(ZEN_ENABLE_EVM)
     add_test(NAME evmInterpTests COMMAND evmInterpTests)
+    add_test(NAME evmHostTests COMMAND evmHostTests)
     add_test(
       NAME solidityContractTests
       COMMAND

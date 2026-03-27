@@ -13,10 +13,121 @@ on:
       - 'resources/**'
       - '*.md'
       - '.gitignore'
+  workflow_dispatch:
 permissions:
     contents: read
 
 jobs:
+  build_test_evm_state_roundtrip_x86:
+    name: Test DTVM-EVM state roundtrip on x86-64
+    runs-on: ubuntu-latest
+    container:
+      image: dtvmdev1/dtvm-dev-x64:main
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+        with:
+          submodules: "true"
+      - name: Code Format Check
+        run: |
+          ./tools/format.sh check
+      - name: Build and Run state roundtrip and host gas settlement tests
+        run: |
+          export LLVM_SYS_150_PREFIX=/opt/llvm15
+          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
+          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
+
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DZEN_ENABLE_ASAN=ON \
+            -DZEN_ENABLE_SPEC_TEST=ON \
+            -DZEN_ENABLE_EVM=ON \
+            -DZEN_ENABLE_CPU_EXCEPTION=OFF \
+            -DZEN_ENABLE_SINGLEPASS_JIT=OFF \
+            -DZEN_ENABLE_MULTIPASS_JIT=OFF
+
+          cmake --build build -j 16 --target solidityContractTests evmHostTests
+
+          ./build/solidityContractTests \
+            --gtest_filter=SolidityStatePersistence.SaveLoadRoundTripPreservesContractState \
+            --log-level error \
+            --mode interpreter \
+            --format evm
+
+          ./build/evmHostTests --gtest_brief=1
+
+  build_test_evm_state_revision_subset_x86:
+    name: Test DTVM-EVM state revision subset on x86-64 (${{ matrix.revision }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [Cancun, Shanghai, Berlin]
+    container:
+      image: dtvmdev1/dtvm-dev-x64:main
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+        with:
+          submodules: "true"
+      - name: Code Format Check
+        run: |
+          ./tools/format.sh check
+      - name: Build and Run evmStateTests subset
+        run: |
+          export LLVM_SYS_150_PREFIX=/opt/llvm15
+          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
+          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
+
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DZEN_ENABLE_ASAN=ON \
+            -DZEN_ENABLE_SPEC_TEST=ON \
+            -DZEN_ENABLE_EVM=ON \
+            -DZEN_ENABLE_CPU_EXCEPTION=OFF \
+            -DZEN_ENABLE_SINGLEPASS_JIT=OFF \
+            -DZEN_ENABLE_MULTIPASS_JIT=OFF
+
+          cmake --build build -j 16 --target evmStateTests
+
+          export DTVM_TEST_REVISION=${{ matrix.revision }}
+          ./build/evmStateTests --gtest_brief=1
+
+  build_test_evm_focused_regressions_all_x86:
+    name: Test DTVM-EVM focused regressions on x86-64 (ALL)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    container:
+      image: dtvmdev1/dtvm-dev-x64:main
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v3
+        with:
+          submodules: "true"
+      - name: Code Format Check
+        run: |
+          ./tools/format.sh check
+      - name: Build and Run focused regressions
+        run: |
+          export LLVM_SYS_150_PREFIX=/opt/llvm15
+          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
+          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
+
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DZEN_ENABLE_ASAN=ON \
+            -DZEN_ENABLE_SPEC_TEST=ON \
+            -DZEN_ENABLE_EVM=ON \
+            -DZEN_ENABLE_CPU_EXCEPTION=OFF \
+            -DZEN_ENABLE_SINGLEPASS_JIT=OFF \
+            -DZEN_ENABLE_MULTIPASS_JIT=OFF
+
+          cmake --build build -j 16 --target evmStateTests
+
+          export DTVM_TEST_REVISION=ALL
+          ./build/evmStateTests --gtest_filter="EVMStateFocused.*" --gtest_brief=1
+
   build_test_evm_interpreter_x86_ctest:
     name: Test DTVM-EVM interpreter with ctest on x86-64
     runs-on: ubuntu-latest
