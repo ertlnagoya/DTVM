@@ -36,6 +36,13 @@ struct GasSettlementObservation {
   intx::uint256 CoinbaseBalance;
 };
 
+using AccountMap = decltype(std::declval<ZenMockedEVMHost>().accounts);
+
+struct RuntimeExecutionObservation {
+  evmc::Result Result;
+  AccountMap Accounts;
+};
+
 std::string returnSingleContextOpcode(uint8_t Opcode) {
   return zen::utils::toHex(&Opcode, 1) + "60005260206000f3";
 }
@@ -113,6 +120,81 @@ evmc::Result runContextOpcodeScenario(
   evmc::Result Result;
   RT->callEVMMain(*Inst, CallMsg, Result);
   return Result;
+}
+
+RuntimeExecutionObservation runRuntimeExecutionScenario(
+    const std::string &RuntimeHex, const evmc_message &Msg,
+    const evmc_tx_context &TxContext, evmc_revision Revision,
+    const std::vector<ZenMockedEVMHost::AccountInitEntry> &AdditionalAccounts =
+        {},
+    const intx::uint256 &ContractBalance = intx::uint256(0)) {
+  RuntimeExecutionObservation Observation{};
+
+  RuntimeConfig Config;
+  Config.Mode = common::RunMode::InterpMode;
+  Config.EnableEvmGasMetering = true;
+
+  auto Host = std::make_unique<ZenMockedEVMHost>();
+  auto RT = Runtime::newEVMRuntime(Config, Host.get());
+  EXPECT_TRUE(RT != nullptr);
+  if (!RT) {
+    return Observation;
+  }
+  Host->setRuntime(RT.get());
+
+  auto Bytecode = zen::utils::fromHex(RuntimeHex);
+  EXPECT_TRUE(Bytecode.has_value());
+  if (!Bytecode.has_value()) {
+    return Observation;
+  }
+
+  auto ModRet =
+      RT->loadEVMModule("nested_call_test", Bytecode->data(), Bytecode->size());
+  EXPECT_TRUE(ModRet);
+  if (!ModRet) {
+    return Observation;
+  }
+  EVMModule *Mod = *ModRet;
+
+  auto InstIso = RT->createManagedIsolation();
+  EXPECT_TRUE(InstIso != nullptr);
+  if (!InstIso) {
+    return Observation;
+  }
+  auto InstRet = InstIso->createEVMInstance(*Mod, 1000000);
+  EXPECT_TRUE(InstRet);
+  if (!InstRet) {
+    return Observation;
+  }
+  EVMInstance *Inst = *InstRet;
+
+  evmc::MockedAccount SenderAccount;
+  SenderAccount.balance = toBytes32(intx::uint256(1000000000));
+
+  evmc::MockedAccount ContractAccount;
+  ContractAccount.nonce = 1;
+  ContractAccount.balance = toBytes32(ContractBalance);
+  ContractAccount.code.assign(Bytecode->begin(), Bytecode->end());
+  const auto CodeHash = zen::host::evm::crypto::keccak256(*Bytecode);
+  std::memcpy(ContractAccount.codehash.bytes, CodeHash.data(), 32);
+
+  std::vector<ZenMockedEVMHost::AccountInitEntry> Accounts;
+  Accounts.push_back({Msg.sender, SenderAccount});
+  Accounts.push_back({Msg.recipient, ContractAccount});
+  if (std::memcmp(TxContext.block_coinbase.bytes, evmc::address{}.bytes,
+                  sizeof(TxContext.block_coinbase.bytes)) != 0) {
+    Accounts.push_back({TxContext.block_coinbase, evmc::MockedAccount{}});
+  }
+  Accounts.insert(Accounts.end(), AdditionalAccounts.begin(),
+                  AdditionalAccounts.end());
+
+  Host->loadInitialState(TxContext, Accounts, true);
+  Host->setRevision(Revision);
+
+  evmc_message CallMsg = Msg;
+  RT->callEVMMain(*Inst, CallMsg, Observation.Result);
+  Observation.Accounts = Host->accounts;
+  return Observation;
 }
 
 GasSettlementObservation runGasSettlementScenario(
@@ -650,4 +732,131 @@ TEST(EVMStatePersistence, SaveLoadRoundTripPreservesExtendedTxContext) {
             bytes32ToHex(Host.tx_context.block_base_fee));
   EXPECT_EQ(bytes32ToHex(ReloadedHost.tx_context.blob_base_fee),
             bytes32ToHex(Host.tx_context.blob_base_fee));
+}
+
+TEST(EVMCallSemantics, StaticCallRejectsStateWrites) {
+  const evmc::address Sender = evmc::literals::operator""_address(
+      "1000000000000000000000000000000000000001");
+  const evmc::address Parent = evmc::literals::operator""_address(
+      "2000000000000000000000000000000000000002");
+  const evmc::address Child = evmc::literals::operator""_address(
+      "3000000000000000000000000000000000000003");
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 1000000;
+  Msg.sender = Sender;
+  Msg.recipient = Parent;
+  Msg.code_address = Parent;
+
+  evmc_tx_context TxContext{};
+
+  evmc::MockedAccount ChildAccount;
+  ChildAccount.nonce = 1;
+  auto ChildBytecode = fromHex("600160005500");
+  ASSERT_TRUE(ChildBytecode.has_value());
+  ChildAccount.code.assign(ChildBytecode->begin(), ChildBytecode->end());
+  const auto ChildCodeHash = zen::host::evm::crypto::keccak256(*ChildBytecode);
+  std::memcpy(ChildAccount.codehash.bytes, ChildCodeHash.data(), 32);
+
+  const std::string ParentRuntimeHex =
+      "60006000600060007330000000000000000000000000000000000000036300100000"
+      "fa60005260206000f3";
+  auto Observation = runRuntimeExecutionScenario(
+      ParentRuntimeHex, Msg, TxContext, EVMC_CANCUN, {{Child, ChildAccount}});
+
+  ASSERT_EQ(Observation.Result.status_code, EVMC_SUCCESS);
+  ASSERT_EQ(Observation.Result.output_size, 32U);
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(Observation.Result.output_data,
+                        Observation.Result.output_size),
+      "0000000000000000000000000000000000000000000000000000000000000000"));
+
+  auto ChildIt = Observation.Accounts.find(Child);
+  ASSERT_NE(ChildIt, Observation.Accounts.end());
+  auto StorageIt = ChildIt->second.storage.find(parseBytes32("0x00"));
+  EXPECT_TRUE(StorageIt == ChildIt->second.storage.end() ||
+              StorageIt->second.current == parseBytes32("0x00"));
+}
+
+TEST(EVMCallSemantics, DelegateCallPreservesSenderValueAndReturndata) {
+  const evmc::address Sender = evmc::literals::operator""_address(
+      "1000000000000000000000000000000000000001");
+  const evmc::address Parent = evmc::literals::operator""_address(
+      "2000000000000000000000000000000000000002");
+  const evmc::address Child = evmc::literals::operator""_address(
+      "3000000000000000000000000000000000000003");
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 1000000;
+  Msg.sender = Sender;
+  Msg.recipient = Parent;
+  Msg.code_address = Parent;
+  Msg.value = parseUint256("0x2a");
+
+  evmc_tx_context TxContext{};
+  TxContext.tx_origin = Sender;
+
+  evmc::MockedAccount ChildAccount;
+  ChildAccount.nonce = 1;
+  auto ChildBytecode = fromHex("336000523460205260406000f3");
+  ASSERT_TRUE(ChildBytecode.has_value());
+  ChildAccount.code.assign(ChildBytecode->begin(), ChildBytecode->end());
+  const auto ChildCodeHash = zen::host::evm::crypto::keccak256(*ChildBytecode);
+  std::memcpy(ChildAccount.codehash.bytes, ChildCodeHash.data(), 32);
+
+  const std::string ParentRuntimeHex =
+      "60006000600060007330000000000000000000000000000000000000036300100000"
+      "f4503d80600060003e6000f3";
+  auto Observation = runRuntimeExecutionScenario(
+      ParentRuntimeHex, Msg, TxContext, EVMC_CANCUN, {{Child, ChildAccount}});
+
+  ASSERT_EQ(Observation.Result.status_code, EVMC_SUCCESS);
+  ASSERT_EQ(Observation.Result.output_size, 64U);
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(Observation.Result.output_data, 32),
+      "0000000000000000000000001000000000000000000000000000000000000001"));
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(Observation.Result.output_data + 32, 32),
+      "000000000000000000000000000000000000000000000000000000000000002a"));
+}
+
+TEST(EVMCallSemantics, CallCanBubbleChildRevertData) {
+  const evmc::address Sender = evmc::literals::operator""_address(
+      "1000000000000000000000000000000000000001");
+  const evmc::address Parent = evmc::literals::operator""_address(
+      "2000000000000000000000000000000000000002");
+  const evmc::address Child = evmc::literals::operator""_address(
+      "3000000000000000000000000000000000000003");
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 1000000;
+  Msg.sender = Sender;
+  Msg.recipient = Parent;
+  Msg.code_address = Parent;
+
+  evmc_tx_context TxContext{};
+
+  evmc::MockedAccount ChildAccount;
+  ChildAccount.nonce = 1;
+  auto ChildBytecode = fromHex("602a60005260206000fd");
+  ASSERT_TRUE(ChildBytecode.has_value());
+  ChildAccount.code.assign(ChildBytecode->begin(), ChildBytecode->end());
+  const auto ChildCodeHash = zen::host::evm::crypto::keccak256(*ChildBytecode);
+  std::memcpy(ChildAccount.codehash.bytes, ChildCodeHash.data(), 32);
+
+  const std::string ParentRuntimeHex =
+      "60006000600060006000733000000000000000000000000000000000000003630010"
+      "0000f1503d80600060003e6000fd";
+  auto Observation = runRuntimeExecutionScenario(
+      ParentRuntimeHex, Msg, TxContext, EVMC_CANCUN, {{Child, ChildAccount}});
+
+  ASSERT_EQ(Observation.Result.status_code, EVMC_REVERT);
+  ASSERT_EQ(Observation.Result.output_size, 32U);
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(Observation.Result.output_data,
+                        Observation.Result.output_size),
+      "000000000000000000000000000000000000000000000000000000000000002a"));
 }
