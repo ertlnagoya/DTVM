@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <openssl/ripemd.h>
 #include <vector>
 
 namespace zen::evm::precompile {
@@ -31,6 +32,10 @@ inline bool isIdentityPrecompile(const evmc::address &Addr) noexcept {
 
 inline bool isSha256Precompile(const evmc::address &Addr) noexcept {
   return isCanonicalPrecompileAddress(Addr, 0x02);
+}
+
+inline bool isRipemd160Precompile(const evmc::address &Addr) noexcept {
+  return isCanonicalPrecompileAddress(Addr, 0x03);
 }
 
 inline bool isModExpPrecompile(const evmc::address &Addr,
@@ -189,6 +194,30 @@ inline evmc::Result executeSha256(const evmc_message &Msg,
                              : static_cast<const uint8_t *>(Msg.input_data);
   const auto Digest = sha256Digest(Input, InputSize);
   ReturnData.assign(Digest.begin(), Digest.end());
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
+}
+
+inline evmc::Result executeRipemd160(const evmc_message &Msg,
+                                     std::vector<uint8_t> &ReturnData) {
+  constexpr uint64_t BaseGas = 600;
+  constexpr uint64_t GasPerWord = 120;
+  const uint64_t InputSize = Msg.input_size;
+  const uint64_t WordCount = (InputSize + 31) / 32;
+  const uint64_t GasCost = BaseGas + WordCount * GasPerWord;
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (GasCost > MsgGas) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_OUT_OF_GAS, 0, 0, nullptr, 0);
+  }
+
+  const uint8_t *Input = InputSize == 0
+                             ? nullptr
+                             : static_cast<const uint8_t *>(Msg.input_data);
+  unsigned char Digest[RIPEMD160_DIGEST_LENGTH];
+  RIPEMD160(Input, InputSize, Digest);
+  ReturnData.assign(32, 0);
+  std::memcpy(ReturnData.data() + 12, Digest, RIPEMD160_DIGEST_LENGTH);
   return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
                       ReturnData.data(), ReturnData.size());
 }

@@ -392,6 +392,9 @@ public:
     if (precompile::isSha256Precompile(PrecompileAddr)) {
       return precompile::executeSha256(Msg, ReturnData);
     }
+    if (precompile::isRipemd160Precompile(PrecompileAddr)) {
+      return precompile::executeRipemd160(Msg, ReturnData);
+    }
     if (precompile::isIdentityPrecompile(PrecompileAddr)) {
       return precompile::executeIdentity(Msg, ReturnData);
     }

@@ -1,6 +1,10 @@
 # Copyright (C) 2021-2025 the DTVM authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+if(ZEN_ENABLE_EVM)
+  find_package(OpenSSL REQUIRED)
+endif()
+
 function(PROCESS_SPEC_FILES SPEC_CATEGORY_DIR)
   get_filename_component(CATEGORY ${SPEC_CATEGORY_DIR} NAME)
   file(GLOB SPEC_FILE_PATHS "${SPEC_CATEGORY_DIR}/*.wast")
@@ -117,17 +121,32 @@ if(ZEN_ENABLE_SPEC_TEST)
         )
         target_link_libraries(
           evmHostTests
-          PRIVATE dtvmcore rapidjson yaml-cpp gtest_main -fsanitize=address
+          PRIVATE dtvmcore
+                  rapidjson
+                  yaml-cpp
+                  gtest_main
+                  OpenSSL::Crypto
+                  -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
         target_link_libraries(
           solidityContractTests
-          PRIVATE dtvmcore rapidjson mpt gtest_main -fsanitize=address
+          PRIVATE dtvmcore
+                  rapidjson
+                  mpt
+                  gtest_main
+                  OpenSSL::Crypto
+                  -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
         target_link_libraries(
           evmStateTests
-          PRIVATE dtvmcore rapidjson mpt gtest_main -fsanitize=address
+          PRIVATE dtvmcore
+                  rapidjson
+                  mpt
+                  gtest_main
+                  OpenSSL::Crypto
+                  -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
         target_link_libraries(
@@ -163,6 +182,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   rapidjson
                   yaml-cpp
                   gtest_main
+                  OpenSSL::Crypto
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -174,6 +194,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   mpt
                   gtest_main
                   CLI11::CLI11
+                  OpenSSL::Crypto
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -184,6 +205,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   rapidjson
                   mpt
                   gtest_main
+                  OpenSSL::Crypto
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -214,17 +236,17 @@ if(ZEN_ENABLE_SPEC_TEST)
       )
       target_link_libraries(
         evmHostTests
-        PRIVATE dtvmcore rapidjson yaml-cpp gtest_main
+        PRIVATE dtvmcore rapidjson yaml-cpp gtest_main OpenSSL::Crypto
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(
         solidityContractTests
-        PRIVATE dtvmcore rapidjson mpt gtest_main CLI11::CLI11
+        PRIVATE dtvmcore rapidjson mpt gtest_main CLI11::CLI11 OpenSSL::Crypto
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(
         evmStateTests
-        PRIVATE dtvmcore rapidjson mpt gtest_main
+        PRIVATE dtvmcore rapidjson mpt gtest_main OpenSSL::Crypto
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(mptCompareCpp PRIVATE dtvmcore rapidjson mpt)

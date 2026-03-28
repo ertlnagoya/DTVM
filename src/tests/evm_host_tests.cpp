@@ -968,6 +968,28 @@ TEST(EVMPrecompiles, Sha256ReturnsDigestAndChargesWordGas) {
       "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
 }
 
+TEST(EVMPrecompiles, Ripemd160ReturnsDigestAndChargesWordGas) {
+  const evmc::address Ripemd160 = parseAddress(
+      "0x0000000000000000000000000000000000000003");
+  const std::array<uint8_t, 3> Input = {'a', 'b', 'c'};
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 1000;
+  Msg.recipient = Ripemd160;
+  Msg.code_address = Ripemd160;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_FRONTIER);
+  ASSERT_EQ(Result.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(Result.gas_left, 280);
+  EXPECT_EQ(Result.output_size, 32U);
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(Result.output_data, Result.output_size),
+      "0000000000000000000000008eb208f7e05d987a9b044a8e98c6b087f15a0bfc"));
+}
+
 TEST(EVMPrecompiles, ModExpAvailabilityDependsOnFork) {
   const evmc::address ModExp = parseAddress(
       "0x0000000000000000000000000000000000000005");
