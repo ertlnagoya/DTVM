@@ -13,8 +13,8 @@
 #include "utils/rlp_encoding.h"
 
 #include <limits>
-#include <utility>
 #include <unordered_set>
+#include <utility>
 
 using namespace zen;
 using namespace zen::runtime;
@@ -96,6 +96,8 @@ public:
 
   void setRuntime(Runtime *NewRT) { RT = NewRT; }
   Runtime *getRuntime() const { return RT; }
+  void setRevision(evmc_revision NewRevision) { Revision = NewRevision; }
+  evmc_revision getRevision() const { return Revision; }
 
   void loadInitialState(const evmc_tx_context &Context,
                         const std::vector<AccountInitEntry> &Accounts,
@@ -191,18 +193,18 @@ public:
       Result.Status = CreateResult.status_code;
       Result.Success = true;
       Result.RemainingGas = CreateResult.gas_left;
-      const uint64_t GasLeft =
-          Result.RemainingGas > 0 ? static_cast<uint64_t>(Result.RemainingGas)
-                                  : 0;
+      const uint64_t GasLeft = Result.RemainingGas > 0
+                                   ? static_cast<uint64_t>(Result.RemainingGas)
+                                   : 0;
       Result.GasUsed = AvailableGas > GasLeft ? AvailableGas - GasLeft : 0;
       Result.GasUsed += Config.IntrinsicGas;
-      uint64_t GasRefund = static_cast<uint64_t>(
-          std::max<int64_t>(0, CreateResult.gas_refund));
+      uint64_t GasRefund =
+          static_cast<uint64_t>(std::max<int64_t>(0, CreateResult.gas_refund));
       uint64_t RefundLimit = computeRefundLimit(Result.GasUsed, ActiveRevision);
       Result.GasRefund = std::min(GasRefund, RefundLimit);
-      Result.GasCharged =
-          Result.GasUsed > Result.GasRefund ? Result.GasUsed - Result.GasRefund
-                                            : 0;
+      Result.GasCharged = Result.GasUsed > Result.GasRefund
+                              ? Result.GasUsed - Result.GasRefund
+                              : 0;
       applyMinimumChargedGas(Config, Result);
       if (Result.GasCharged != 0) {
         settleGasCharges(Result.GasCharged, Config, Msg, Result);
@@ -228,13 +230,12 @@ public:
     }
 
     uint64_t Counter = ModuleCounter++;
-    std::string ModuleName = Config.ModuleName.empty()
-                                 ? ("tx_exec_mod_" + std::to_string(Counter))
-                                 : (Config.ModuleName + "_" +
-                                    std::to_string(Counter));
+    std::string ModuleName =
+        Config.ModuleName.empty()
+            ? ("tx_exec_mod_" + std::to_string(Counter))
+            : (Config.ModuleName + "_" + std::to_string(Counter));
 
-    auto ModRet =
-        RT->loadEVMModule(ModuleName, BytecodePtr, BytecodeSize);
+    auto ModRet = RT->loadEVMModule(ModuleName, BytecodePtr, BytecodeSize);
     if (!ModRet) {
       Result.ErrorMessage = "Failed to load EVM module: " + ModuleName;
       return Result;
@@ -250,8 +251,8 @@ public:
 
     auto InstRet = Iso->createEVMInstance(*Mod, AvailableGas);
     if (!InstRet) {
-      Result.ErrorMessage = "Failed to create EVM instance for module " +
-                            ModuleName;
+      Result.ErrorMessage =
+          "Failed to create EVM instance for module " + ModuleName;
       return Result;
     }
     EVMInstance *Inst = *InstRet;
@@ -307,9 +308,9 @@ public:
     GasRefund += AuthorizationRefund;
     uint64_t RefundLimit = computeRefundLimit(Result.GasUsed, ActiveRevision);
     Result.GasRefund = std::min(GasRefund, RefundLimit);
-    Result.GasCharged =
-        Result.GasUsed > Result.GasRefund ? Result.GasUsed - Result.GasRefund
-                                          : 0;
+    Result.GasCharged = Result.GasUsed > Result.GasRefund
+                            ? Result.GasUsed - Result.GasRefund
+                            : 0;
     applyMinimumChargedGas(Config, Result);
 
     if (Result.GasCharged != 0) {
@@ -351,8 +352,7 @@ public:
     ensureAccountHasCodeHash(SelfAcc);
 
     const bool CreatedThisTx = CreatedInTx.count(Addr) > 0;
-    const bool ShouldDelete =
-        (Revision < EVMC_CANCUN) || CreatedThisTx;
+    const bool ShouldDelete = (Revision < EVMC_CANCUN) || CreatedThisTx;
 
     intx::uint256 SelfBalance = toUint256Bytes(SelfAcc.balance);
     if (SelfBalance != 0) {
@@ -504,9 +504,8 @@ public:
       } else {
         ReturnData.clear();
       }
-      int64_t RemainingGas = (InterpGasLeft >= 0)
-                                 ? InterpGasLeft
-                                 : ExecResult.gas_left;
+      int64_t RemainingGas =
+          (InterpGasLeft >= 0) ? InterpGasLeft : ExecResult.gas_left;
       if (RemainingGas < 0) {
         RemainingGas = static_cast<int64_t>(Inst->getGas());
       }
@@ -534,7 +533,8 @@ public:
 
     evmc_uint256be NonceUint256 = {};
     intx::be::store(NonceUint256.bytes, intx::uint256{SenderNonce});
-    std::vector<uint8_t> NonceMinimalBytes = zen::utils::uint256beToBytes(NonceUint256);
+    std::vector<uint8_t> NonceMinimalBytes =
+        zen::utils::uint256beToBytes(NonceUint256);
 
     std::vector<std::vector<uint8_t>> RlpListItems = {SenderBytes,
                                                       NonceMinimalBytes};
@@ -724,14 +724,12 @@ public:
         ReturnData.clear();
       }
 
-      int64_t RemainingGas = (InterpGasLeft >= 0)
-                                 ? InterpGasLeft
-                                 : ExecResult.gas_left;
+      int64_t RemainingGas =
+          (InterpGasLeft >= 0) ? InterpGasLeft : ExecResult.gas_left;
       if (RemainingGas < 0) {
         RemainingGas = static_cast<int64_t>(Inst->getGas());
       }
-      const int64_t GasRefund =
-          static_cast<int64_t>(Inst->getGasRefund());
+      const int64_t GasRefund = static_cast<int64_t>(Inst->getGasRefund());
 
       // 6 Deploy the contract code (the output is the runtime code)
       if (ExecResult.status_code != EVMC_SUCCESS) {
@@ -794,10 +792,10 @@ public:
         }
       }
 
-      evmc::Result CreateResult(EVMC_SUCCESS, RemainingGas, GasRefund,
-                                NewAccPost.code.empty() ? nullptr
-                                                        : NewAccPost.code.data(),
-                                NewAccPost.code.size());
+      evmc::Result CreateResult(
+          EVMC_SUCCESS, RemainingGas, GasRefund,
+          NewAccPost.code.empty() ? nullptr : NewAccPost.code.data(),
+          NewAccPost.code.size());
       CreateResult.create_address = NewAddr;
       return CreateResult;
     } catch (const std::exception &E) {
@@ -818,9 +816,9 @@ private:
   };
 
   HostStateSnapshot captureHostState() const {
-    return HostStateSnapshot{accounts, recorded_logs, recorded_selfdestructs,
-                             CreatedInTx, PendingSelfdestructs,
-                             recorded_account_accesses};
+    return HostStateSnapshot{
+        accounts,    recorded_logs,        recorded_selfdestructs,
+        CreatedInTx, PendingSelfdestructs, recorded_account_accesses};
   }
 
   void restoreHostState(const HostStateSnapshot &Snapshot) {
@@ -853,14 +851,13 @@ private:
     return Revision >= EVMC_LONDON ? GasUsed / 5 : GasUsed / 2;
   }
 
-  static bool isDelegationIndicatorCode(
-      const evmc::bytes &Code) noexcept {
+  static bool isDelegationIndicatorCode(const evmc::bytes &Code) noexcept {
     return Code.size() == 23 && Code[0] == 0xef && Code[1] == 0x01 &&
            Code[2] == 0x00;
   }
 
-  static evmc::bytes makeDelegationIndicatorCode(
-      const evmc::address &Target) noexcept {
+  static evmc::bytes
+  makeDelegationIndicatorCode(const evmc::address &Target) noexcept {
     evmc::bytes Code(23, '\0');
     Code[0] = 0xef;
     Code[1] = 0x01;
@@ -1027,8 +1024,7 @@ private:
     intx::uint256 EffectiveGasPrice = GasPrice;
 
     if (Config.MaxPriorityFeePerGas) {
-      intx::uint256 MaxPriority =
-          toUint256BE(*Config.MaxPriorityFeePerGas);
+      intx::uint256 MaxPriority = toUint256BE(*Config.MaxPriorityFeePerGas);
       intx::uint256 MaxFeeMinusBase =
           GasPrice > BaseFee ? GasPrice - BaseFee : intx::uint256{0};
       PriorityFee =
@@ -1043,13 +1039,11 @@ private:
     if (Config.MaxFeePerBlobGas && tx_context.blob_hashes_count > 0) {
       constexpr uint64_t BlobGasPerBlob = 131072;
       intx::uint256 BlobBaseFee = toUint256BE(tx_context.blob_base_fee);
-      intx::uint256 MaxFeePerBlobGas =
-          toUint256BE(*Config.MaxFeePerBlobGas);
+      intx::uint256 MaxFeePerBlobGas = toUint256BE(*Config.MaxFeePerBlobGas);
       intx::uint256 EffectiveBlobFee =
           BlobBaseFee <= MaxFeePerBlobGas ? BlobBaseFee : MaxFeePerBlobGas;
-      intx::uint256 BlobGasUsed =
-          intx::uint256(tx_context.blob_hashes_count) *
-          intx::uint256(BlobGasPerBlob);
+      intx::uint256 BlobGasUsed = intx::uint256(tx_context.blob_hashes_count) *
+                                  intx::uint256(BlobGasPerBlob);
       BlobFee = BlobGasUsed * EffectiveBlobFee;
     }
 

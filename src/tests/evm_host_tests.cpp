@@ -6,8 +6,10 @@
 #include "host/evm/crypto.h"
 #include "utils/evm.h"
 
+#include <filesystem>
 #include <gtest/gtest.h>
 #include <intx/intx.hpp>
+#include <limits>
 #include <optional>
 
 using namespace zen;
@@ -33,6 +35,85 @@ struct GasSettlementObservation {
   intx::uint256 SenderBalance;
   intx::uint256 CoinbaseBalance;
 };
+
+std::string returnSingleContextOpcode(uint8_t Opcode) {
+  return zen::utils::toHex(&Opcode, 1) + "60005260206000f3";
+}
+
+bool hexEqualsIgnoreCase(const std::string &Hex1, const std::string &Hex2) {
+  auto Normalize = [](std::string Value) {
+    for (char &C : Value) {
+      C = static_cast<char>(std::tolower(static_cast<unsigned char>(C)));
+    }
+    return Value;
+  };
+  return Normalize(Hex1) == Normalize(Hex2);
+}
+
+evmc::Result runContextOpcodeScenario(
+    const std::string &RuntimeHex, const evmc_message &Msg,
+    const evmc_tx_context &TxContext, evmc_revision Revision,
+    const intx::uint256 &ContractBalance = intx::uint256(0)) {
+  RuntimeConfig Config;
+  Config.Mode = common::RunMode::InterpMode;
+  Config.EnableEvmGasMetering = true;
+
+  auto Host = std::make_unique<ZenMockedEVMHost>();
+  auto RT = Runtime::newEVMRuntime(Config, Host.get());
+  EXPECT_TRUE(RT != nullptr);
+  if (!RT) {
+    return {};
+  }
+  Host->setRuntime(RT.get());
+
+  auto Bytecode = zen::utils::fromHex(RuntimeHex);
+  EXPECT_TRUE(Bytecode.has_value());
+  if (!Bytecode.has_value()) {
+    return evmc::Result{};
+  }
+
+  auto ModRet = RT->loadEVMModule("context_opcode_test", Bytecode->data(),
+                                  Bytecode->size());
+  EXPECT_TRUE(ModRet);
+  if (!ModRet) {
+    return evmc::Result{};
+  }
+  EVMModule *Mod = *ModRet;
+
+  auto InstIso = RT->createManagedIsolation();
+  EXPECT_TRUE(InstIso != nullptr);
+  if (!InstIso) {
+    return evmc::Result{};
+  }
+  auto InstRet = InstIso->createEVMInstance(*Mod, 1000000);
+  EXPECT_TRUE(InstRet);
+  if (!InstRet) {
+    return evmc::Result{};
+  }
+  EVMInstance *Inst = *InstRet;
+
+  evmc::MockedAccount SenderAccount;
+  SenderAccount.balance = toBytes32(intx::uint256(1000000000));
+
+  evmc::MockedAccount ContractAccount;
+  ContractAccount.nonce = 1;
+  ContractAccount.balance = toBytes32(ContractBalance);
+  ContractAccount.code.assign(Bytecode->begin(), Bytecode->end());
+  const auto CodeHash = zen::host::evm::crypto::keccak256(*Bytecode);
+  std::memcpy(ContractAccount.codehash.bytes, CodeHash.data(), 32);
+
+  Host->loadInitialState(TxContext,
+                         {{Msg.sender, SenderAccount},
+                          {Msg.recipient, ContractAccount},
+                          {TxContext.block_coinbase, evmc::MockedAccount{}}},
+                         true);
+
+  Host->setRevision(Revision);
+  evmc_message CallMsg = Msg;
+  evmc::Result Result;
+  RT->callEVMMain(*Inst, CallMsg, Result);
+  return Result;
+}
 
 GasSettlementObservation runGasSettlementScenario(
     evmc_revision Revision, const intx::uint256 &GasPrice,
@@ -386,4 +467,187 @@ TEST(EVMHostGasSettlement, RevertedTransactionKeepsSingleSenderNonceBump) {
   auto SenderIt = Host->accounts.find(Sender);
   ASSERT_NE(SenderIt, Host->accounts.end());
   EXPECT_EQ(SenderIt->second.nonce, 1);
+}
+
+TEST(EVMRunnerDefaults, DefaultGasLimitIsSafeForInt64BackedExecution) {
+  EXPECT_EQ(zen::utils::defaultEvmGasLimit(),
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+}
+
+TEST(EVMTransactionContext,
+     AddressCallerOriginAndValueOpcodesUseMessageContext) {
+  const evmc::address Sender = evmc::literals::operator""_address(
+      "1000000000000000000000000000000000000001");
+  const evmc::address Recipient = evmc::literals::operator""_address(
+      "2000000000000000000000000000000000000002");
+  const evmc::address TxOrigin = evmc::literals::operator""_address(
+      "3000000000000000000000000000000000000003");
+  const evmc::uint256be CallValue = parseUint256("0x2a");
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 1000000;
+  Msg.sender = Sender;
+  Msg.recipient = Recipient;
+  Msg.code_address = Recipient;
+  Msg.value = CallValue;
+
+  evmc_tx_context TxContext{};
+  TxContext.tx_origin = TxOrigin;
+
+  auto AddressResult = runContextOpcodeScenario(
+      returnSingleContextOpcode(evmc_opcode::OP_ADDRESS), Msg, TxContext,
+      EVMC_CANCUN);
+  ASSERT_EQ(AddressResult.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(
+      zen::utils::toHex(AddressResult.output_data, AddressResult.output_size),
+      "0000000000000000000000002000000000000000000000000000000000000002");
+
+  auto CallerResult = runContextOpcodeScenario(
+      returnSingleContextOpcode(evmc_opcode::OP_CALLER), Msg, TxContext,
+      EVMC_CANCUN);
+  ASSERT_EQ(CallerResult.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(
+      zen::utils::toHex(CallerResult.output_data, CallerResult.output_size),
+      "0000000000000000000000001000000000000000000000000000000000000001");
+
+  auto OriginResult = runContextOpcodeScenario(
+      returnSingleContextOpcode(evmc_opcode::OP_ORIGIN), Msg, TxContext,
+      EVMC_CANCUN);
+  ASSERT_EQ(OriginResult.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(
+      zen::utils::toHex(OriginResult.output_data, OriginResult.output_size),
+      "0000000000000000000000003000000000000000000000000000000000000003");
+
+  auto ValueResult = runContextOpcodeScenario(
+      returnSingleContextOpcode(evmc_opcode::OP_CALLVALUE), Msg, TxContext,
+      EVMC_CANCUN);
+  ASSERT_EQ(ValueResult.status_code, EVMC_SUCCESS);
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(ValueResult.output_data, ValueResult.output_size),
+      "000000000000000000000000000000000000000000000000000000000000002a"));
+}
+
+TEST(EVMTransactionContext, BlockContextOpcodesUseTxContextFields) {
+  const evmc::address Sender = evmc::literals::operator""_address(
+      "1000000000000000000000000000000000000001");
+  const evmc::address Recipient = evmc::literals::operator""_address(
+      "2000000000000000000000000000000000000002");
+  const evmc::address Coinbase = evmc::literals::operator""_address(
+      "4000000000000000000000000000000000000004");
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 1000000;
+  Msg.sender = Sender;
+  Msg.recipient = Recipient;
+  Msg.code_address = Recipient;
+
+  evmc_tx_context TxContext{};
+  TxContext.block_coinbase = Coinbase;
+  TxContext.block_timestamp = 0x1234;
+  TxContext.block_number = 0x5678;
+  TxContext.tx_gas_price = parseUint256("0x77");
+  TxContext.block_base_fee = parseUint256("0x9a");
+  TxContext.block_prev_randao = parseBytes32("0xabcdef");
+  TxContext.chain_id = parseUint256("0x42");
+
+  auto CoinbaseResult = runContextOpcodeScenario(
+      returnSingleContextOpcode(evmc_opcode::OP_COINBASE), Msg, TxContext,
+      EVMC_CANCUN);
+  ASSERT_EQ(CoinbaseResult.status_code, EVMC_SUCCESS);
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(CoinbaseResult.output_data, CoinbaseResult.output_size),
+      "0000000000000000000000004000000000000000000000000000000000000004"));
+
+  auto TimestampResult = runContextOpcodeScenario(
+      returnSingleContextOpcode(evmc_opcode::OP_TIMESTAMP), Msg, TxContext,
+      EVMC_CANCUN);
+  ASSERT_EQ(TimestampResult.status_code, EVMC_SUCCESS);
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(TimestampResult.output_data,
+                        TimestampResult.output_size),
+      "0000000000000000000000000000000000000000000000000000000000001234"));
+
+  auto NumberResult = runContextOpcodeScenario(
+      returnSingleContextOpcode(evmc_opcode::OP_NUMBER), Msg, TxContext,
+      EVMC_CANCUN);
+  ASSERT_EQ(NumberResult.status_code, EVMC_SUCCESS);
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(NumberResult.output_data, NumberResult.output_size),
+      "0000000000000000000000000000000000000000000000000000000000005678"));
+
+  auto ChainIdResult = runContextOpcodeScenario(
+      returnSingleContextOpcode(evmc_opcode::OP_CHAINID), Msg, TxContext,
+      EVMC_CANCUN);
+  ASSERT_EQ(ChainIdResult.status_code, EVMC_SUCCESS);
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(ChainIdResult.output_data, ChainIdResult.output_size),
+      "0000000000000000000000000000000000000000000000000000000000000042"));
+
+  auto GasPriceResult = runContextOpcodeScenario(
+      returnSingleContextOpcode(evmc_opcode::OP_GASPRICE), Msg, TxContext,
+      EVMC_CANCUN);
+  ASSERT_EQ(GasPriceResult.status_code, EVMC_SUCCESS);
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(GasPriceResult.output_data, GasPriceResult.output_size),
+      "0000000000000000000000000000000000000000000000000000000000000077"));
+
+  auto BaseFeeResult = runContextOpcodeScenario(
+      returnSingleContextOpcode(evmc_opcode::OP_BASEFEE), Msg, TxContext,
+      EVMC_CANCUN);
+  ASSERT_EQ(BaseFeeResult.status_code, EVMC_SUCCESS);
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(BaseFeeResult.output_data, BaseFeeResult.output_size),
+      "000000000000000000000000000000000000000000000000000000000000009a"));
+
+  auto PrevRandaoResult = runContextOpcodeScenario(
+      returnSingleContextOpcode(evmc_opcode::OP_PREVRANDAO), Msg, TxContext,
+      EVMC_CANCUN);
+  ASSERT_EQ(PrevRandaoResult.status_code, EVMC_SUCCESS);
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(PrevRandaoResult.output_data,
+                        PrevRandaoResult.output_size),
+      "0000000000000000000000000000000000000000000000000000000000abcdef"));
+}
+
+TEST(EVMStatePersistence, SaveLoadRoundTripPreservesExtendedTxContext) {
+  evmc::MockedHost Host;
+  Host.tx_context.tx_origin =
+      parseAddress("0x3000000000000000000000000000000000000003");
+  Host.tx_context.tx_gas_price = parseUint256("0x77");
+  Host.tx_context.chain_id = parseUint256("0x42");
+  Host.tx_context.block_number = 0x5678;
+  Host.tx_context.block_timestamp = 0x1234;
+  Host.tx_context.block_coinbase =
+      parseAddress("0x4000000000000000000000000000000000000004");
+  Host.tx_context.block_prev_randao = parseBytes32("0xabcdef");
+  Host.tx_context.block_base_fee = parseUint256("0x9a");
+  Host.tx_context.blob_base_fee = parseUint256("0x55");
+
+  const auto StatePath = std::filesystem::temp_directory_path() /
+                         "dtvm_extended_tx_context_state_test.json";
+  ASSERT_TRUE(saveState(Host, StatePath.string()));
+
+  evmc::MockedHost ReloadedHost;
+  ASSERT_TRUE(loadState(ReloadedHost, StatePath.string()));
+  std::filesystem::remove(StatePath);
+
+  EXPECT_EQ(addressToHex(ReloadedHost.tx_context.tx_origin),
+            addressToHex(Host.tx_context.tx_origin));
+  EXPECT_EQ(bytes32ToHex(ReloadedHost.tx_context.tx_gas_price),
+            bytes32ToHex(Host.tx_context.tx_gas_price));
+  EXPECT_EQ(bytes32ToHex(ReloadedHost.tx_context.chain_id),
+            bytes32ToHex(Host.tx_context.chain_id));
+  EXPECT_EQ(ReloadedHost.tx_context.block_number, Host.tx_context.block_number);
+  EXPECT_EQ(ReloadedHost.tx_context.block_timestamp,
+            Host.tx_context.block_timestamp);
+  EXPECT_EQ(addressToHex(ReloadedHost.tx_context.block_coinbase),
+            addressToHex(Host.tx_context.block_coinbase));
+  EXPECT_EQ(bytes32ToHex(ReloadedHost.tx_context.block_prev_randao),
+            bytes32ToHex(Host.tx_context.block_prev_randao));
+  EXPECT_EQ(bytes32ToHex(ReloadedHost.tx_context.block_base_fee),
+            bytes32ToHex(Host.tx_context.block_base_fee));
+  EXPECT_EQ(bytes32ToHex(ReloadedHost.tx_context.blob_base_fee),
+            bytes32ToHex(Host.tx_context.blob_base_fee));
 }

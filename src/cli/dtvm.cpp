@@ -66,6 +66,7 @@ struct EVMMessageConfig {
   std::string SenderAddress;
   std::string ContractAddress;
   std::string Create2Salt;
+  evmc::uint256be Value;
 };
 
 static evmc_message createEvmMessage(evmc::MockedHost &Host,
@@ -122,6 +123,7 @@ static evmc_message createEvmMessage(evmc::MockedHost &Host,
     Msg.sender = zen::utils::parseAddress(Config.SenderAddress);
     Msg.code_address = ContractAddr;
   }
+  Msg.value = Config.Value;
 
   return Msg;
 }
@@ -212,8 +214,7 @@ int main(int argc, char *argv[]) {
   std::vector<std::string> Dirs;
   std::string SaveStateFile;
   std::string LoadStateFile;
-  uint64_t GasLimit =
-      static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+  uint64_t GasLimit = zen::utils::defaultEvmGasLimit();
   LoggerLevel LogLevel = LoggerLevel::Info;
   uint32_t NumExtraCompilations = 0;
   uint32_t NumExtraExecutions = 0;
@@ -225,6 +226,17 @@ int main(int argc, char *argv[]) {
   std::string EVMBytecodeKind = "auto";
   std::string Create2Salt;
   std::string SenderAddress = "1000000000000000000000000000000000000000";
+  std::string TxOriginAddress;
+  std::string TxGasPriceHex = "0x0";
+  std::string ValueHex = "0x0";
+  std::string ChainIdHex = "0x1";
+  std::string CoinbaseAddress = "0000000000000000000000000000000000000000";
+  std::string PrevRandaoHex = "0x0";
+  std::string BaseFeeHex = "0x0";
+  std::string BlobBaseFeeHex = "0x0";
+  int64_t BlockNumber = 0;
+  int64_t BlockTimestamp = 0;
+  int64_t BlockGasLimit = 0;
 
   const std::unordered_map<std::string, InputFormat> FormatMap = {
       {"wasm", InputFormat::WASM},
@@ -280,6 +292,29 @@ int main(int argc, char *argv[]) {
                           "CREATE2 salt for deploy mode");
     CLIParser->add_option("--sender", SenderAddress,
                           "Sender address for transactions");
+    CLIParser->add_option("--tx-origin", TxOriginAddress,
+                          "Transaction origin address for EVM context");
+    CLIParser->add_option(
+        "--tx-gas-price", TxGasPriceHex,
+        "Transaction gas price as uint256 hex for EVM context");
+    CLIParser->add_option("--value", ValueHex,
+                          "Call value as uint256 hex for EVM execution");
+    CLIParser->add_option("--chain-id", ChainIdHex,
+                          "Chain ID as uint256 hex for EVM context");
+    CLIParser->add_option("--coinbase", CoinbaseAddress,
+                          "Coinbase address for EVM block context");
+    CLIParser->add_option("--block-number", BlockNumber,
+                          "Block number for EVM block context");
+    CLIParser->add_option("--block-timestamp", BlockTimestamp,
+                          "Block timestamp for EVM block context");
+    CLIParser->add_option("--block-gas-limit", BlockGasLimit,
+                          "Block gas limit for EVM block context");
+    CLIParser->add_option("--base-fee", BaseFeeHex,
+                          "Base fee as uint256 hex for EVM block context");
+    CLIParser->add_option("--prev-randao", PrevRandaoHex,
+                          "PrevRandao as bytes32 hex for EVM block context");
+    CLIParser->add_option("--blob-base-fee", BlobBaseFeeHex,
+                          "Blob base fee as uint256 hex for EVM block context");
     CLIParser->add_option("--num-extra-compilations", NumExtraCompilations,
                           "The number of extra compilations");
     CLIParser->add_option("--num-extra-executions", NumExtraExecutions,
@@ -364,6 +399,25 @@ int main(int argc, char *argv[]) {
       return exitMain(EXIT_FAILURE);
     }
     auto MockedEVMHost = std::make_unique<zen::evm::ZenMockedEVMHost>();
+    if (TxOriginAddress.empty()) {
+      TxOriginAddress = SenderAddress;
+    }
+    MockedEVMHost->tx_context.tx_origin =
+        zen::utils::parseAddress(TxOriginAddress);
+    MockedEVMHost->tx_context.tx_gas_price =
+        zen::utils::parseUint256(TxGasPriceHex);
+    MockedEVMHost->tx_context.chain_id = zen::utils::parseUint256(ChainIdHex);
+    MockedEVMHost->tx_context.block_coinbase =
+        zen::utils::parseAddress(CoinbaseAddress);
+    MockedEVMHost->tx_context.block_number = BlockNumber;
+    MockedEVMHost->tx_context.block_timestamp = BlockTimestamp;
+    MockedEVMHost->tx_context.block_gas_limit = BlockGasLimit;
+    MockedEVMHost->tx_context.block_prev_randao =
+        zen::utils::parseBytes32(PrevRandaoHex);
+    MockedEVMHost->tx_context.block_base_fee =
+        zen::utils::parseUint256(BaseFeeHex);
+    MockedEVMHost->tx_context.blob_base_fee =
+        zen::utils::parseUint256(BlobBaseFeeHex);
     // Load state if specified
     if (!LoadStateFile.empty() &&
         !zen::utils::loadState(*MockedEVMHost, LoadStateFile)) {
@@ -438,7 +492,8 @@ int main(int argc, char *argv[]) {
                                .Calldata = CalldataBytes,
                                .SenderAddress = SenderAddress,
                                .ContractAddress = ContractAddress,
-                               .Create2Salt = Create2Salt};
+                               .Create2Salt = Create2Salt,
+                               .Value = zen::utils::parseUint256(ValueHex)};
     evmc_message Msg = createEvmMessage(MockedHost, MsgConfig, Bytecode);
     RT->callEVMMain(*Inst, Msg, ExeResult);
 

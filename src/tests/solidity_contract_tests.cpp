@@ -5,6 +5,7 @@
 #include <CLI/CLI.hpp>
 #include <filesystem>
 #include <gtest/gtest.h>
+#include <limits>
 
 using namespace zen::utils;
 using namespace zen::evm_test_utils;
@@ -164,7 +165,8 @@ public:
 };
 
 RuntimeConfig SolidityContractTest::GlobalConfig;
-uint64_t SolidityContractTest::GlobalGasLimit = 0xFFFF'FFFF'FFFF;
+uint64_t SolidityContractTest::GlobalGasLimit =
+    zen::utils::defaultEvmGasLimit();
 
 std::vector<SolidityTestPair>
 EnumerateSolidityTests(const std::string &TestCategory) {
@@ -311,6 +313,12 @@ TEST(SolidityDeployLifecycle,
             "0000000000000000000000000000000000000000000000000000000000000000");
 }
 
+TEST(EVMRunnerDefaults, DefaultGasLimitIsSafeForInt64BackedExecution) {
+  const uint64_t DefaultGasLimit = zen::utils::defaultEvmGasLimit();
+  EXPECT_EQ(DefaultGasLimit,
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+}
+
 INSTANTIATE_TEST_SUITE_P(
     SolidityTests, SolidityContractTest,
     testing::ValuesIn(EnumerateSolidityTests("")),
@@ -430,7 +438,7 @@ GTEST_API_ int main(int argc, char **argv) {
   std::string TestCategory;
 
   // same as evm.codes: 0xFFFF'FFFF'FFFF (281,474,976,710,655)
-  uint64_t GasLimit = 0xFFFF'FFFF'FFFF;
+  uint64_t GasLimit = zen::utils::defaultEvmGasLimit();
   LoggerLevel LogLevel = LoggerLevel::Info;
   RuntimeConfig Config;
 
