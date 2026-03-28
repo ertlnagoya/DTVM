@@ -51,6 +51,17 @@ PY
     fi
 }
 
+ensure_apt_package() {
+    local package_name="$1"
+    if dpkg -s "$package_name" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y "$package_name"
+}
+
 # Convert INPUT_FORMAT to lowercase for case-insensitive comparison
 INPUT_FORMAT=${INPUT_FORMAT,,}
 
@@ -111,6 +122,10 @@ case $TestSuite in
         CMAKE_OPTIONS="$CMAKE_OPTIONS -DZEN_ENABLE_EVM=ON -DZEN_ENABLE_LIBEVM=ON"
         ;;
 esac
+
+if [[ $TestSuite == evm* ]]; then
+    ensure_apt_package libssl-dev
+fi
 
 case $CPU_EXCEPTION_TYPE in
     "cpu")
