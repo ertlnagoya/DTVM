@@ -29,6 +29,10 @@ inline bool isIdentityPrecompile(const evmc::address &Addr) noexcept {
   return isCanonicalPrecompileAddress(Addr, 0x04);
 }
 
+inline bool isSha256Precompile(const evmc::address &Addr) noexcept {
+  return isCanonicalPrecompileAddress(Addr, 0x02);
+}
+
 inline bool isModExpPrecompile(const evmc::address &Addr,
                                evmc_revision Revision) noexcept {
   if (Revision < EVMC_BYZANTIUM) {
@@ -68,6 +72,123 @@ inline evmc::Result executeIdentity(const evmc_message &Msg,
   }
 
   ReturnData.assign(Input, Input + InputSize);
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
+}
+
+inline uint32_t rotr32(uint32_t Value, unsigned Shift) noexcept {
+  return (Value >> Shift) | (Value << (32 - Shift));
+}
+
+inline std::array<uint8_t, 32>
+sha256Digest(const uint8_t *Data, size_t Size) noexcept {
+  static constexpr std::array<uint32_t, 64> K = {
+      0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU,
+      0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U, 0xd807aa98U, 0x12835b01U,
+      0x243185beU, 0x550c7dc3U, 0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U,
+      0xc19bf174U, 0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU,
+      0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU, 0x983e5152U,
+      0xa831c66dU, 0xb00327c8U, 0xbf597fc7U, 0xc6e00bf3U, 0xd5a79147U,
+      0x06ca6351U, 0x14292967U, 0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU,
+      0x53380d13U, 0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+      0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U, 0xd192e819U,
+      0xd6990624U, 0xf40e3585U, 0x106aa070U, 0x19a4c116U, 0x1e376c08U,
+      0x2748774cU, 0x34b0bcb5U, 0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU,
+      0x682e6ff3U, 0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
+      0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U};
+
+  std::array<uint32_t, 8> H = {0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U,
+                               0xa54ff53aU, 0x510e527fU, 0x9b05688cU,
+                               0x1f83d9abU, 0x5be0cd19U};
+
+  std::vector<uint8_t> Msg;
+  if (Data != nullptr && Size != 0) {
+    Msg.assign(Data, Data + Size);
+  }
+  Msg.push_back(0x80);
+  while ((Msg.size() % 64) != 56) {
+    Msg.push_back(0);
+  }
+  const uint64_t BitLen = static_cast<uint64_t>(Size) * 8;
+  for (int I = 7; I >= 0; --I) {
+    Msg.push_back(static_cast<uint8_t>((BitLen >> (I * 8)) & 0xff));
+  }
+
+  std::array<uint32_t, 64> W = {};
+  for (size_t Offset = 0; Offset < Msg.size(); Offset += 64) {
+    for (size_t I = 0; I < 16; ++I) {
+      const size_t Base = Offset + I * 4;
+      W[I] = (static_cast<uint32_t>(Msg[Base]) << 24) |
+             (static_cast<uint32_t>(Msg[Base + 1]) << 16) |
+             (static_cast<uint32_t>(Msg[Base + 2]) << 8) |
+             static_cast<uint32_t>(Msg[Base + 3]);
+    }
+    for (size_t I = 16; I < 64; ++I) {
+      const uint32_t S0 =
+          rotr32(W[I - 15], 7) ^ rotr32(W[I - 15], 18) ^ (W[I - 15] >> 3);
+      const uint32_t S1 =
+          rotr32(W[I - 2], 17) ^ rotr32(W[I - 2], 19) ^ (W[I - 2] >> 10);
+      W[I] = W[I - 16] + S0 + W[I - 7] + S1;
+    }
+
+    uint32_t A = H[0], B = H[1], C = H[2], D = H[3];
+    uint32_t E = H[4], F = H[5], G = H[6], HH = H[7];
+    for (size_t I = 0; I < 64; ++I) {
+      const uint32_t S1 = rotr32(E, 6) ^ rotr32(E, 11) ^ rotr32(E, 25);
+      const uint32_t Ch = (E & F) ^ ((~E) & G);
+      const uint32_t Temp1 = HH + S1 + Ch + K[I] + W[I];
+      const uint32_t S0 = rotr32(A, 2) ^ rotr32(A, 13) ^ rotr32(A, 22);
+      const uint32_t Maj = (A & B) ^ (A & C) ^ (B & C);
+      const uint32_t Temp2 = S0 + Maj;
+
+      HH = G;
+      G = F;
+      F = E;
+      E = D + Temp1;
+      D = C;
+      C = B;
+      B = A;
+      A = Temp1 + Temp2;
+    }
+
+    H[0] += A;
+    H[1] += B;
+    H[2] += C;
+    H[3] += D;
+    H[4] += E;
+    H[5] += F;
+    H[6] += G;
+    H[7] += HH;
+  }
+
+  std::array<uint8_t, 32> Digest = {};
+  for (size_t I = 0; I < H.size(); ++I) {
+    Digest[I * 4] = static_cast<uint8_t>(H[I] >> 24);
+    Digest[I * 4 + 1] = static_cast<uint8_t>(H[I] >> 16);
+    Digest[I * 4 + 2] = static_cast<uint8_t>(H[I] >> 8);
+    Digest[I * 4 + 3] = static_cast<uint8_t>(H[I]);
+  }
+  return Digest;
+}
+
+inline evmc::Result executeSha256(const evmc_message &Msg,
+                                  std::vector<uint8_t> &ReturnData) {
+  constexpr uint64_t BaseGas = 60;
+  constexpr uint64_t GasPerWord = 12;
+  const uint64_t InputSize = Msg.input_size;
+  const uint64_t WordCount = (InputSize + 31) / 32;
+  const uint64_t GasCost = BaseGas + WordCount * GasPerWord;
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (GasCost > MsgGas) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_OUT_OF_GAS, 0, 0, nullptr, 0);
+  }
+
+  const uint8_t *Input = InputSize == 0
+                             ? nullptr
+                             : static_cast<const uint8_t *>(Msg.input_data);
+  const auto Digest = sha256Digest(Input, InputSize);
+  ReturnData.assign(Digest.begin(), Digest.end());
   return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
                       ReturnData.data(), ReturnData.size());
 }

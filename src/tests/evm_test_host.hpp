@@ -389,6 +389,9 @@ public:
         (Msg.kind == EVMC_CALLCODE || Msg.kind == EVMC_DELEGATECALL)
             ? Msg.code_address
             : Msg.recipient;
+    if (precompile::isSha256Precompile(PrecompileAddr)) {
+      return precompile::executeSha256(Msg, ReturnData);
+    }
     if (precompile::isIdentityPrecompile(PrecompileAddr)) {
       return precompile::executeIdentity(Msg, ReturnData);
     }

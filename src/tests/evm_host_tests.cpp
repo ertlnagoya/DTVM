@@ -946,6 +946,28 @@ TEST(EVMPrecompiles, IdentityReturnsInputAndChargesWordGas) {
             zen::utils::toHex(Input.data(), Input.size()));
 }
 
+TEST(EVMPrecompiles, Sha256ReturnsDigestAndChargesWordGas) {
+  const evmc::address Sha256 = parseAddress(
+      "0x0000000000000000000000000000000000000002");
+  const std::array<uint8_t, 3> Input = {'a', 'b', 'c'};
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 100;
+  Msg.recipient = Sha256;
+  Msg.code_address = Sha256;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_FRONTIER);
+  ASSERT_EQ(Result.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(Result.gas_left, 28);
+  EXPECT_EQ(Result.output_size, 32U);
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(Result.output_data, Result.output_size),
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+}
+
 TEST(EVMPrecompiles, ModExpAvailabilityDependsOnFork) {
   const evmc::address ModExp = parseAddress(
       "0x0000000000000000000000000000000000000005");
