@@ -399,11 +399,10 @@ int main(int argc, char *argv[]) {
       return exitMain(EXIT_FAILURE);
     }
     auto MockedEVMHost = std::make_unique<zen::evm::ZenMockedEVMHost>();
-    if (TxOriginAddress.empty()) {
-      TxOriginAddress = SenderAddress;
+    if (!TxOriginAddress.empty()) {
+      MockedEVMHost->tx_context.tx_origin =
+          zen::utils::parseAddress(TxOriginAddress);
     }
-    MockedEVMHost->tx_context.tx_origin =
-        zen::utils::parseAddress(TxOriginAddress);
     MockedEVMHost->tx_context.tx_gas_price =
         zen::utils::parseUint256(TxGasPriceHex);
     MockedEVMHost->tx_context.chain_id = zen::utils::parseUint256(ChainIdHex);
