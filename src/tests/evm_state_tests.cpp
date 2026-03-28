@@ -670,7 +670,8 @@ TEST(EVMStateFocused, ReentrancySelfdestructRevertDelegatecallCancun) {
 TEST(EVMStateFocused, WarmCoinbaseCallSufficientGasShanghai) {
   const evmc_revision TargetRevision = getTargetRevision();
   if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_SHANGHAI) {
-    GTEST_SKIP() << "Focused Shanghai regression skipped for requested revision";
+    GTEST_SKIP()
+        << "Focused Shanghai regression skipped for requested revision";
   }
 
   const std::string FixturePath =
@@ -690,7 +691,8 @@ TEST(EVMStateFocused, WarmCoinbaseCallSufficientGasShanghai) {
 TEST(EVMStateFocused, WarmCoinbaseDelegatecallSufficientGasShanghai) {
   const evmc_revision TargetRevision = getTargetRevision();
   if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_SHANGHAI) {
-    GTEST_SKIP() << "Focused Shanghai regression skipped for requested revision";
+    GTEST_SKIP()
+        << "Focused Shanghai regression skipped for requested revision";
   }
 
   const std::string FixturePath =
@@ -710,7 +712,8 @@ TEST(EVMStateFocused, WarmCoinbaseDelegatecallSufficientGasShanghai) {
 TEST(EVMStateFocused, WarmCoinbaseStaticcallSufficientGasShanghai) {
   const evmc_revision TargetRevision = getTargetRevision();
   if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_SHANGHAI) {
-    GTEST_SKIP() << "Focused Shanghai regression skipped for requested revision";
+    GTEST_SKIP()
+        << "Focused Shanghai regression skipped for requested revision";
   }
 
   const std::string FixturePath =

@@ -281,11 +281,12 @@ TEST(SolidityStatePersistence,
       executeContractCall(InitialEnv, Contract, SetCalldata, GasLimit);
   ASSERT_EQ(SetResult.status_code, EVMC_SUCCESS);
 
-  auto &DeployerAccount = InitialEnv.MockedHost->accounts[InitialEnv.DeployerAddr];
+  auto &DeployerAccount =
+      InitialEnv.MockedHost->accounts[InitialEnv.DeployerAddr];
   DeployerAccount.set_balance(777UL);
 
-  const evmc::address AuxiliaryAddress =
-      evmc::literals::operator""_address("2000000000000000000000000000000000000002");
+  const evmc::address AuxiliaryAddress = evmc::literals::operator""_address(
+      "2000000000000000000000000000000000000002");
   auto &AuxiliaryAccount = InitialEnv.MockedHost->accounts[AuxiliaryAddress];
   AuxiliaryAccount.set_balance(123456UL);
   AuxiliaryAccount.nonce = 9;
@@ -322,15 +323,18 @@ TEST(SolidityStatePersistence,
   const auto ContractIt = LoadedEnv.MockedHost->accounts.find(Contract.Address);
   ASSERT_NE(ContractIt, LoadedEnv.MockedHost->accounts.end());
   EXPECT_EQ(ContractIt->second.nonce, 1U);
-  EXPECT_EQ(ContractIt->second.code, InitialEnv.MockedHost->accounts[Contract.Address].code);
+  EXPECT_EQ(ContractIt->second.code,
+            InitialEnv.MockedHost->accounts[Contract.Address].code);
   EXPECT_EQ(ContractIt->second.codehash,
             InitialEnv.MockedHost->accounts[Contract.Address].codehash);
-  const auto ContractStorageIt = ContractIt->second.storage.find(zen::utils::parseBytes32("0x00"));
+  const auto ContractStorageIt =
+      ContractIt->second.storage.find(zen::utils::parseBytes32("0x00"));
   ASSERT_NE(ContractStorageIt, ContractIt->second.storage.end());
   EXPECT_EQ(ContractStorageIt->second.current,
             zen::utils::parseBytes32("0x2a"));
 
-  const auto AuxiliaryIt = LoadedEnv.MockedHost->accounts.find(AuxiliaryAddress);
+  const auto AuxiliaryIt =
+      LoadedEnv.MockedHost->accounts.find(AuxiliaryAddress);
   ASSERT_NE(AuxiliaryIt, LoadedEnv.MockedHost->accounts.end());
   EXPECT_EQ(zen::utils::toHex(AuxiliaryIt->second.balance.bytes,
                               sizeof(AuxiliaryIt->second.balance.bytes)),
