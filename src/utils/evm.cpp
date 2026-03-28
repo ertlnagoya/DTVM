@@ -8,6 +8,7 @@
 #include "utils/rlp_encoding.h"
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <rapidjson/document.h>
 #include <rapidjson/istreamwrapper.h>
 
@@ -15,13 +16,28 @@ namespace zen::utils {
 
 using zen::common::ErrorCode;
 
+namespace {
+std::string normalizeHexForParsing(std::string_view HexStr) {
+  std::string Normalized(HexStr);
+  if (Normalized.size() >= 2 && Normalized[0] == '0' &&
+      (Normalized[1] == 'x' || Normalized[1] == 'X')) {
+    Normalized.erase(0, 2);
+  }
+  if (!Normalized.empty() && (Normalized.size() % 2) != 0) {
+    Normalized.insert(Normalized.begin(), '0');
+  }
+  return Normalized;
+}
+} // namespace
+
 void trimString(std::string &Str) {
   Str.erase(0, Str.find_first_not_of(" \n\r\t"));
   Str.erase(Str.find_last_not_of(" \n\r\t") + 1);
 }
 
 std::optional<std::vector<uint8_t>> fromHex(std::string_view HexStr) {
-  if (auto Data = evmc::from_hex(HexStr)) {
+  const std::string Normalized = normalizeHexForParsing(HexStr);
+  if (auto Data = evmc::from_hex(Normalized)) {
     return std::vector<uint8_t>(Data->begin(), Data->end());
   } else {
     return std::nullopt;
@@ -60,7 +76,7 @@ evmc::address parseAddress(const std::string &HexAddr) {
     return Addr;
   }
 
-  if (auto Data = evmc::from_hex(HexAddr)) {
+  if (auto Data = evmc::from_hex(normalizeHexForParsing(HexAddr))) {
     if (Data->size() == 20) {
       std::memcpy(Addr.bytes, Data->data(), 20);
       return Addr;
@@ -73,7 +89,7 @@ evmc::address parseAddress(const std::string &HexAddr) {
 
 evmc::bytes32 parseBytes32(const std::string &HexStr) {
   evmc::bytes32 Result{};
-  if (auto Data = evmc::from_hex(HexStr)) {
+  if (auto Data = evmc::from_hex(normalizeHexForParsing(HexStr))) {
     if (Data->size() <= 32) {
       std::memcpy(Result.bytes + (32 - Data->size()), Data->data(),
                   Data->size());
@@ -87,7 +103,7 @@ evmc::bytes32 parseBytes32(const std::string &HexStr) {
 
 evmc::uint256be parseUint256(const std::string &HexStr) {
   evmc::uint256be Result{};
-  if (auto Data = evmc::from_hex(HexStr)) {
+  if (auto Data = evmc::from_hex(normalizeHexForParsing(HexStr))) {
     if (Data->size() <= 32) {
       std::memcpy(Result.bytes + (32 - Data->size()), Data->data(),
                   Data->size());
@@ -133,6 +149,10 @@ std::vector<uint8_t> uint256beToBytes(const evmc::uint256be &Value) {
   std::vector<uint8_t> Result(32);
   intx::be::unsafe::store(Result.data(), Val);
   return std::vector<uint8_t>(Result.end() - NumBytes, Result.end());
+}
+
+uint64_t defaultEvmGasLimit() {
+  return static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
 }
 
 evmc::address computeCreateAddress(const evmc::address &Sender,
@@ -274,9 +294,17 @@ bool saveState(const evmc::MockedHost &Host, const std::string &FilePath) {
 
   // Serialize tx_context
   File << "  \"tx_context\": {\n";
+  File << "    \"tx_origin\": ";
+  writeJsonString(File, toHex(Host.tx_context.tx_origin.bytes,
+                              sizeof(Host.tx_context.tx_origin.bytes)));
+  File << ",\n";
   File << "    \"gas_price\": ";
   writeJsonString(File, toHex(Host.tx_context.tx_gas_price.bytes,
                               sizeof(Host.tx_context.tx_gas_price.bytes)));
+  File << ",\n";
+  File << "    \"chain_id\": ";
+  writeJsonString(File, toHex(Host.tx_context.chain_id.bytes,
+                              sizeof(Host.tx_context.chain_id.bytes)));
   File << ",\n";
   File << "    \"block_number\": " << Host.tx_context.block_number << ",\n";
   File << "    \"block_timestamp\": " << Host.tx_context.block_timestamp
@@ -294,6 +322,10 @@ bool saveState(const evmc::MockedHost &Host, const std::string &FilePath) {
   File << "    \"block_base_fee\": ";
   writeJsonString(File, toHex(Host.tx_context.block_base_fee.bytes,
                               sizeof(Host.tx_context.block_base_fee.bytes)));
+  File << ",\n";
+  File << "    \"blob_base_fee\": ";
+  writeJsonString(File, toHex(Host.tx_context.blob_base_fee.bytes,
+                              sizeof(Host.tx_context.blob_base_fee.bytes)));
   File << "\n";
   File << "  }\n";
 
@@ -418,9 +450,19 @@ bool loadState(evmc::MockedHost &Host, const std::string &FilePath) {
   if (Doc.HasMember("tx_context") && Doc["tx_context"].IsObject()) {
     const rapidjson::Value &TxContext = Doc["tx_context"];
 
+    if (TxContext.HasMember("tx_origin") && TxContext["tx_origin"].IsString()) {
+      Host.tx_context.tx_origin =
+          zen::utils::parseAddress(TxContext["tx_origin"].GetString());
+    }
+
     if (TxContext.HasMember("gas_price") && TxContext["gas_price"].IsString()) {
       Host.tx_context.tx_gas_price =
           zen::utils::parseUint256(TxContext["gas_price"].GetString());
+    }
+
+    if (TxContext.HasMember("chain_id") && TxContext["chain_id"].IsString()) {
+      Host.tx_context.chain_id =
+          zen::utils::parseUint256(TxContext["chain_id"].GetString());
     }
 
     if (TxContext.HasMember("block_number") &&
@@ -456,6 +498,12 @@ bool loadState(evmc::MockedHost &Host, const std::string &FilePath) {
         TxContext["block_base_fee"].IsString()) {
       Host.tx_context.block_base_fee =
           zen::utils::parseUint256(TxContext["block_base_fee"].GetString());
+    }
+
+    if (TxContext.HasMember("blob_base_fee") &&
+        TxContext["blob_base_fee"].IsString()) {
+      Host.tx_context.blob_base_fee =
+          zen::utils::parseUint256(TxContext["blob_base_fee"].GetString());
     }
   }
 

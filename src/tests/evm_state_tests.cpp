@@ -527,20 +527,10 @@ std::string sanitizeTestName(const std::string &Name) {
 
 class EVMStateTest : public testing::TestWithParam<StateTestCaseParam> {};
 
-TEST(EVMStateFocused, Blake2PrecompileDelegatecallBerlin) {
-  const evmc_revision TargetRevision = getTargetRevision();
-  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_BERLIN) {
-    GTEST_SKIP() << "Focused Berlin regression skipped for requested revision";
-  }
-
-  const std::string FixturePath =
-      DEFAULT_TEST_DIR +
-      "/istanbul/eip152_blake2/test_blake2_precompile_delegatecall.json";
-  const std::string FixtureName =
-      "tests/istanbul/eip152_blake2/test_blake2_delegatecall.py::"
-      "test_blake2_precompile_delegatecall[fork_Berlin-state_test]";
-  const std::string ForkName = "Berlin";
-
+void assertFocusedFixturePasses(const std::string &FixturePath,
+                                const std::string &FixtureName,
+                                const std::string &ForkName,
+                                const std::string &FailureLabel) {
   auto Fixtures = parseStateTestFile(FixturePath);
   auto FixtureIt = std::find_if(Fixtures.begin(), Fixtures.end(),
                                 [&](const StateTestFixture &Fixture) {
@@ -568,7 +558,7 @@ TEST(EVMStateFocused, Blake2PrecompileDelegatecallBerlin) {
     std::string CombinedErrors = "\n";
     CombinedErrors += "=================================================\n";
     CombinedErrors +=
-        "Focused Berlin blake2 delegatecall regression failed with " +
+        FailureLabel + " failed with " +
         std::to_string(Result.ErrorMessages.size()) +
         (Result.ErrorMessages.size() == 1 ? " error:" : " errors:") + "\n";
     CombinedErrors += "=================================================\n";
@@ -580,6 +570,24 @@ TEST(EVMStateFocused, Blake2PrecompileDelegatecallBerlin) {
     CombinedErrors += "=================================================\n";
     FAIL() << CombinedErrors;
   }
+}
+
+TEST(EVMStateFocused, Blake2PrecompileDelegatecallBerlin) {
+  const evmc_revision TargetRevision = getTargetRevision();
+  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_BERLIN) {
+    GTEST_SKIP() << "Focused Berlin regression skipped for requested revision";
+  }
+
+  const std::string FixturePath =
+      DEFAULT_TEST_DIR +
+      "/istanbul/eip152_blake2/test_blake2_precompile_delegatecall.json";
+  const std::string FixtureName =
+      "tests/istanbul/eip152_blake2/test_blake2_delegatecall.py::"
+      "test_blake2_precompile_delegatecall[fork_Berlin-state_test]";
+  const std::string ForkName = "Berlin";
+
+  assertFocusedFixturePasses(FixturePath, FixtureName, ForkName,
+                             "Focused Berlin blake2 delegatecall regression");
 }
 
 TEST(EVMStateFocused, ChainIdTypedTransaction4Prague) {
@@ -595,45 +603,9 @@ TEST(EVMStateFocused, ChainIdTypedTransaction4Prague) {
       "test_chainid[fork_Prague-typed_transaction_4-state_test]";
   const std::string ForkName = "Prague";
 
-  auto Fixtures = parseStateTestFile(FixturePath);
-  auto FixtureIt = std::find_if(Fixtures.begin(), Fixtures.end(),
-                                [&](const StateTestFixture &Fixture) {
-                                  return Fixture.TestName == FixtureName;
-                                });
-
-  ASSERT_NE(FixtureIt, Fixtures.end())
-      << "Focused fixture not found in " << FixturePath;
-  ASSERT_NE(FixtureIt->Post, nullptr)
-      << "Focused fixture is missing post state";
-
-  const auto ForkIt = FixtureIt->Post->FindMember(ForkName.c_str());
-  ASSERT_NE(ForkIt, FixtureIt->Post->MemberEnd())
-      << "Fork " << ForkName << " not found in focused fixture";
-  ASSERT_TRUE(ForkIt->value.IsArray())
-      << "Fork " << ForkName << " does not contain a result array";
-  ASSERT_GT(ForkIt->value.Size(), 0u)
-      << "Fork " << ForkName << " result array is empty";
-
-  ForkPostResult ExpectedResult = parseForkPostResult(ForkIt->value[0]);
-  ExecutionResult Result =
-      executeStateTest(*FixtureIt, ForkName, ExpectedResult);
-
-  if (!Result.Passed) {
-    std::string CombinedErrors = "\n";
-    CombinedErrors += "=================================================\n";
-    CombinedErrors +=
-        "Focused Prague CHAINID typed_transaction_4 regression failed with " +
-        std::to_string(Result.ErrorMessages.size()) +
-        (Result.ErrorMessages.size() == 1 ? " error:" : " errors:") + "\n";
-    CombinedErrors += "=================================================\n";
-    for (size_t I = 0; I < Result.ErrorMessages.size(); ++I) {
-      CombinedErrors += "\n[Error " + std::to_string(I + 1) + "]\n";
-      CombinedErrors += Result.ErrorMessages[I];
-      CombinedErrors += "\n";
-    }
-    CombinedErrors += "=================================================\n";
-    FAIL() << CombinedErrors;
-  }
+  assertFocusedFixturePasses(
+      FixturePath, FixtureName, ForkName,
+      "Focused Prague CHAINID typed_transaction_4 regression");
 }
 
 TEST(EVMStateFocused, ContractCreatingTxMaxSizeOnesPrague) {
@@ -650,46 +622,49 @@ TEST(EVMStateFocused, ContractCreatingTxMaxSizeOnesPrague) {
       "test_contract_creating_tx[fork_Prague-state_test-max_size_ones]";
   const std::string ForkName = "Prague";
 
-  auto Fixtures = parseStateTestFile(FixturePath);
-  auto FixtureIt = std::find_if(Fixtures.begin(), Fixtures.end(),
-                                [&](const StateTestFixture &Fixture) {
-                                  return Fixture.TestName == FixtureName;
-                                });
+  assertFocusedFixturePasses(
+      FixturePath, FixtureName, ForkName,
+      "Focused Prague max_size_ones contract-creation regression");
+}
 
-  ASSERT_NE(FixtureIt, Fixtures.end())
-      << "Focused fixture not found in " << FixturePath;
-  ASSERT_NE(FixtureIt->Post, nullptr)
-      << "Focused fixture is missing post state";
-
-  const auto ForkIt = FixtureIt->Post->FindMember(ForkName.c_str());
-  ASSERT_NE(ForkIt, FixtureIt->Post->MemberEnd())
-      << "Fork " << ForkName << " not found in focused fixture";
-  ASSERT_TRUE(ForkIt->value.IsArray())
-      << "Fork " << ForkName << " does not contain a result array";
-  ASSERT_GT(ForkIt->value.Size(), 0u)
-      << "Fork " << ForkName << " result array is empty";
-
-  ForkPostResult ExpectedResult = parseForkPostResult(ForkIt->value[0]);
-  ExecutionResult Result =
-      executeStateTest(*FixtureIt, ForkName, ExpectedResult);
-
-  if (!Result.Passed) {
-    std::string CombinedErrors = "\n";
-    CombinedErrors += "=================================================\n";
-    CombinedErrors +=
-        "Focused Prague max_size_ones contract-creation regression failed "
-        "with " +
-        std::to_string(Result.ErrorMessages.size()) +
-        (Result.ErrorMessages.size() == 1 ? " error:" : " errors:") + "\n";
-    CombinedErrors += "=================================================\n";
-    for (size_t I = 0; I < Result.ErrorMessages.size(); ++I) {
-      CombinedErrors += "\n[Error " + std::to_string(I + 1) + "]\n";
-      CombinedErrors += Result.ErrorMessages[I];
-      CombinedErrors += "\n";
-    }
-    CombinedErrors += "=================================================\n";
-    FAIL() << CombinedErrors;
+TEST(EVMStateFocused, ReentrancySelfdestructRevertCallCancun) {
+  const evmc_revision TargetRevision = getTargetRevision();
+  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_CANCUN) {
+    GTEST_SKIP() << "Focused Cancun regression skipped for requested revision";
   }
+
+  const std::string FixturePath =
+      DEFAULT_TEST_DIR +
+      "/cancun/eip6780_selfdestruct/test_reentrancy_selfdestruct_revert.json";
+  const std::string FixtureName =
+      "tests/cancun/eip6780_selfdestruct/test_reentrancy_selfdestruct_revert."
+      "py::test_reentrancy_selfdestruct_revert[fork_Cancun-state_test-"
+      "second_suicide_CALL-first_suicide_CALL]";
+  const std::string ForkName = "Cancun";
+
+  assertFocusedFixturePasses(
+      FixturePath, FixtureName, ForkName,
+      "Focused Cancun reentrancy selfdestruct revert CALL regression");
+}
+
+TEST(EVMStateFocused, ReentrancySelfdestructRevertDelegatecallCancun) {
+  const evmc_revision TargetRevision = getTargetRevision();
+  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_CANCUN) {
+    GTEST_SKIP() << "Focused Cancun regression skipped for requested revision";
+  }
+
+  const std::string FixturePath =
+      DEFAULT_TEST_DIR +
+      "/cancun/eip6780_selfdestruct/test_reentrancy_selfdestruct_revert.json";
+  const std::string FixtureName =
+      "tests/cancun/eip6780_selfdestruct/test_reentrancy_selfdestruct_revert."
+      "py::test_reentrancy_selfdestruct_revert[fork_Cancun-state_test-"
+      "second_suicide_DELEGATECALL-first_suicide_DELEGATECALL]";
+  const std::string ForkName = "Cancun";
+
+  assertFocusedFixturePasses(
+      FixturePath, FixtureName, ForkName,
+      "Focused Cancun reentrancy selfdestruct revert DELEGATECALL regression");
 }
 
 TEST_P(EVMStateTest, ExecutesStateTest) {
