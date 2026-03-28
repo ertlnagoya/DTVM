@@ -217,7 +217,8 @@ int main(int argc, char *argv[]) {
 #ifdef ZEN_ENABLE_EVM
   uint64_t GasLimit = zen::utils::defaultEvmGasLimit();
 #else
-  uint64_t GasLimit = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+  uint64_t GasLimit =
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
 #endif
   LoggerLevel LogLevel = LoggerLevel::Info;
   uint32_t NumExtraCompilations = 0;
