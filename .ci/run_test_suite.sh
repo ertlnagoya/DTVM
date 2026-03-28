@@ -21,6 +21,36 @@
 
 set -e
 
+remove_build_dir() {
+    local retries=0
+    while [ -d build ] && [ $retries -lt 5 ]; do
+        rm -rf build || true
+        if [ ! -d build ]; then
+            return 0
+        fi
+        retries=$((retries + 1))
+        sleep 1
+    done
+
+    if [ -d build ]; then
+        python3 - <<'PY'
+import pathlib
+import shutil
+import time
+
+path = pathlib.Path("build")
+for _ in range(5):
+    if not path.exists():
+        raise SystemExit(0)
+    shutil.rmtree(path, ignore_errors=True)
+    if not path.exists():
+        raise SystemExit(0)
+    time.sleep(1)
+raise SystemExit(1)
+PY
+    fi
+}
+
 # Convert INPUT_FORMAT to lowercase for case-insensitive comparison
 INPUT_FORMAT=${INPUT_FORMAT,,}
 
@@ -109,7 +139,7 @@ if [[ ${INPUT_FORMAT} == "evm" && ${TestSuite} != "evmfocusedregressions" && ${T
 fi
 
 for STACK_TYPE in ${STACK_TYPES[@]}; do
-    rm -rf build
+    remove_build_dir
     cmake -S . -B build $CMAKE_OPTIONS_ORIGIN $STACK_TYPE
     cmake --build build -j 16
 
