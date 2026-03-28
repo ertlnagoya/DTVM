@@ -74,6 +74,18 @@ if(ZEN_ENABLE_SPEC_TEST)
                     evm_test_fixtures.cpp evm_test_helpers.cpp
     )
     add_executable(mptCompareCpp mpt_compare_cpp.cpp)
+    target_compile_definitions(
+      evmHostTests
+      PRIVATE ZEN_C_KZG_TRUSTED_SETUP_PATH="${ZEN_C_KZG_TRUSTED_SETUP_PATH}"
+    )
+    target_compile_definitions(
+      solidityContractTests
+      PRIVATE ZEN_C_KZG_TRUSTED_SETUP_PATH="${ZEN_C_KZG_TRUSTED_SETUP_PATH}"
+    )
+    target_compile_definitions(
+      evmStateTests
+      PRIVATE ZEN_C_KZG_TRUSTED_SETUP_PATH="${ZEN_C_KZG_TRUSTED_SETUP_PATH}"
+    )
   else()
     add_executable(
       specUnitTests spec_unit_tests.cpp spectest.cpp test_utils.cpp
@@ -127,6 +139,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   gtest_main
                   OpenSSL::Crypto
                   mcl::mclbn256
+                  c_kzg_4844
                   -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
@@ -138,6 +151,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   gtest_main
                   OpenSSL::Crypto
                   mcl::mclbn256
+                  c_kzg_4844
                   -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
@@ -149,6 +163,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   gtest_main
                   OpenSSL::Crypto
                   mcl::mclbn256
+                  c_kzg_4844
                   -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
@@ -187,6 +202,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   gtest_main
                   OpenSSL::Crypto
                   mcl::mclbn256
+                  c_kzg_4844
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -200,6 +216,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   CLI11::CLI11
                   OpenSSL::Crypto
                   mcl::mclbn256
+                  c_kzg_4844
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -212,6 +229,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   gtest_main
                   OpenSSL::Crypto
                   mcl::mclbn256
+                  c_kzg_4844
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -248,6 +266,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                 gtest_main
                 OpenSSL::Crypto
                 mcl::mclbn256
+                c_kzg_4844
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(
@@ -259,6 +278,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                 CLI11::CLI11
                 OpenSSL::Crypto
                 mcl::mclbn256
+                c_kzg_4844
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(
@@ -269,6 +289,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                 gtest_main
                 OpenSSL::Crypto
                 mcl::mclbn256
+                c_kzg_4844
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(mptCompareCpp PRIVATE dtvmcore rapidjson mpt)

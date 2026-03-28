@@ -407,6 +407,9 @@ public:
     if (precompile::isBn256PairingPrecompile(PrecompileAddr, Revision)) {
       return precompile::executeBn256Pairing(Msg, Revision, ReturnData);
     }
+    if (precompile::isKzgPointEvaluationPrecompile(PrecompileAddr, Revision)) {
+      return precompile::executeKzgPointEvaluation(Msg, ReturnData);
+    }
     if (precompile::isIdentityPrecompile(PrecompileAddr)) {
       return precompile::executeIdentity(Msg, ReturnData);
     }

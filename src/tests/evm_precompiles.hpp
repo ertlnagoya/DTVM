@@ -11,6 +11,7 @@
 #ifndef MCLBN_FR_UNIT_SIZE
 #define MCLBN_FR_UNIT_SIZE 4
 #endif
+#include <ckzg.h>
 #include <mcl/bn.h>
 #ifndef MCLBN_IO_SERIALIZE
 #define MCLBN_IO_SERIALIZE 512
@@ -23,6 +24,7 @@
 #include <boost/multiprecision/cpp_int.hpp>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -84,6 +86,14 @@ inline bool isBn256PairingPrecompile(const evmc::address &Addr,
     return false;
   }
   return isCanonicalPrecompileAddress(Addr, 0x08);
+}
+
+inline bool isKzgPointEvaluationPrecompile(const evmc::address &Addr,
+                                           evmc_revision Revision) noexcept {
+  if (Revision < EVMC_CANCUN) {
+    return false;
+  }
+  return isCanonicalPrecompileAddress(Addr, 0x0A);
 }
 
 inline bool isModExpPrecompile(const evmc::address &Addr,
@@ -534,6 +544,108 @@ inline bool bn254SerializePairingResult(uint8_t *Buf, bool Success) noexcept {
     Buf[31] = 1;
   }
   return true;
+}
+
+inline KZGSettings *getKzgSettings() noexcept {
+#ifdef ZEN_C_KZG_TRUSTED_SETUP_PATH
+  static KZGSettings Settings{};
+  static const bool Initialized = []() {
+    FILE *SetupFile = std::fopen(ZEN_C_KZG_TRUSTED_SETUP_PATH, "r");
+    if (SetupFile == nullptr) {
+      return false;
+    }
+    const C_KZG_RET Ret = load_trusted_setup_file(&Settings, SetupFile, 0);
+    std::fclose(SetupFile);
+    return Ret == C_KZG_OK;
+  }();
+  return Initialized ? &Settings : nullptr;
+#else
+  return nullptr;
+#endif
+}
+
+inline void kzgToVersionedHash(uint8_t *Out,
+                               const Bytes48 &Commitment) noexcept {
+  uint8_t Digest[SHA256_DIGEST_LENGTH];
+  SHA256(Commitment.bytes, sizeof(Commitment.bytes), Digest);
+  Out[0] = 0x01;
+  std::memcpy(Out + 1, Digest + 1, 31);
+}
+
+inline void storeUint256BE(uint8_t *Out,
+                           const boost::multiprecision::cpp_int &Value) {
+  boost::multiprecision::cpp_int Tmp = Value;
+  for (int I = 31; I >= 0; --I) {
+    Out[I] = static_cast<uint8_t>(Tmp & 0xff);
+    Tmp >>= 8;
+  }
+}
+
+inline evmc::Result
+executeKzgPointEvaluation(const evmc_message &Msg,
+                          std::vector<uint8_t> &ReturnData) {
+  constexpr uint64_t GasCost = 50000;
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (GasCost > MsgGas) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_OUT_OF_GAS, 0, 0, nullptr, 0);
+  }
+  if (Msg.input_size != 192 || Msg.input_data == nullptr) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  KZGSettings *Settings = getKzgSettings();
+  if (Settings == nullptr) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  const uint8_t *Input = static_cast<const uint8_t *>(Msg.input_data);
+  Bytes32 VersionedHash{};
+  Bytes32 Z{};
+  Bytes32 Y{};
+  Bytes48 Commitment{};
+  Bytes48 Proof{};
+  std::memcpy(VersionedHash.bytes, Input, sizeof(VersionedHash.bytes));
+  std::memcpy(Z.bytes, Input + 32, sizeof(Z.bytes));
+  std::memcpy(Y.bytes, Input + 64, sizeof(Y.bytes));
+  std::memcpy(Commitment.bytes, Input + 96, sizeof(Commitment.bytes));
+  std::memcpy(Proof.bytes, Input + 144, sizeof(Proof.bytes));
+
+  Bytes32 ExpectedVersionedHash{};
+  kzgToVersionedHash(ExpectedVersionedHash.bytes, Commitment);
+  if (std::memcmp(ExpectedVersionedHash.bytes, VersionedHash.bytes,
+                  sizeof(VersionedHash.bytes)) != 0) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  fr_t ZField{};
+  fr_t YField{};
+  if (bytes_to_bls_field(&ZField, &Z) != C_KZG_OK ||
+      bytes_to_bls_field(&YField, &Y) != C_KZG_OK) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  bool Ok = false;
+  if (verify_kzg_proof(&Ok, &Commitment, &Z, &Y, &Proof, Settings) !=
+          C_KZG_OK ||
+      !Ok) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  ReturnData.assign(64, 0);
+  ReturnData[30] = 0x10;
+  ReturnData[31] = 0x00;
+  static const boost::multiprecision::cpp_int BlsModulus(
+      "524358751751261904794477405081859658376905525005276378226036586999385811"
+      "84513");
+  storeUint256BE(ReturnData.data() + 32, BlsModulus);
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
 }
 
 inline evmc::Result executeRipemd160(const evmc_message &Msg,
