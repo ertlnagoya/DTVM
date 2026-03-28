@@ -8,12 +8,14 @@
 #include "zetaengine.h"
 #include <CLI/CLI.hpp>
 #ifdef ZEN_ENABLE_EVM
+#include "evm/storage_diff.h"
 #include "host/evm/crypto.h"
 #include "tests/evm_test_host.hpp"
 #include "utils/evm.h"
 #endif // ZEN_ENABLE_EVM
 #include <fstream>
 #include <limits>
+#include <sstream>
 #include <unistd.h>
 
 #ifdef ZEN_ENABLE_BUILTIN_WASI
@@ -189,6 +191,122 @@ static bool runEVMBenchmark(const std::string &Filename,
 
   return true;
 }
+
+static std::string bytesToHexString(const uint8_t *Data, size_t Size) {
+  if (!Data || Size == 0) {
+    return "0x";
+  }
+  return "0x" + zen::utils::toHex(Data, Size);
+}
+
+static std::string bytes32ToHexString(const evmc::bytes32 &Value) {
+  return bytesToHexString(Value.bytes, sizeof(Value.bytes));
+}
+
+static std::string
+optionalBytes32ToHexString(const std::optional<evmc::bytes32> &Value) {
+  if (!Value.has_value()) {
+    return "null";
+  }
+  return "\"" + bytes32ToHexString(*Value) + "\"";
+}
+
+static std::string jsonEscape(const std::string &Input) {
+  std::ostringstream OS;
+  for (char C : Input) {
+    switch (C) {
+    case '\\':
+      OS << "\\\\";
+      break;
+    case '"':
+      OS << "\\\"";
+      break;
+    case '\n':
+      OS << "\\n";
+      break;
+    case '\r':
+      OS << "\\r";
+      break;
+    case '\t':
+      OS << "\\t";
+      break;
+    default:
+      OS << C;
+      break;
+    }
+  }
+  return OS.str();
+}
+
+static std::string buildLogJson(const evmc::MockedHost::log_record &Log) {
+  std::ostringstream OS;
+  OS << "{\"address\":\"" << zen::utils::addressToHex(Log.creator) << "\"";
+  OS << ",\"data\":\"" << bytesToHexString(Log.data.data(), Log.data.size())
+     << "\"";
+  OS << ",\"topics\":[";
+  for (size_t I = 0; I < Log.topics.size(); ++I) {
+    if (I != 0) {
+      OS << ",";
+    }
+    OS << "\"" << bytes32ToHexString(Log.topics[I]) << "\"";
+  }
+  OS << "]}";
+  return OS.str();
+}
+
+static std::string buildStorageDiffJson(const zen::evm::StorageDiff &Diff) {
+  std::ostringstream OS;
+  OS << "{\"address\":\"" << zen::utils::addressToHex(Diff.address) << "\"";
+  OS << ",\"key\":\"" << bytes32ToHexString(Diff.key) << "\"";
+  OS << ",\"old_value\":" << optionalBytes32ToHexString(Diff.old_value);
+  OS << ",\"new_value\":\"" << bytes32ToHexString(Diff.new_value) << "\"}";
+  return OS.str();
+}
+
+class CLIStorageDiffSink final : public zen::evm::StorageDiffSink {
+public:
+  void on_sstore(const zen::evm::StorageDiff &Diff) override {
+    Diffs.push_back(Diff);
+  }
+
+  const zen::evm::ExecutionDiffLog &getDiffs() const { return Diffs; }
+
+private:
+  zen::evm::ExecutionDiffLog Diffs;
+};
+
+static void printExecutionReceipt(const evmc::Result &ExeResult,
+                                  uint64_t GasLimit, bool IsDeployMode,
+                                  const std::string &ContractAddressHex,
+                                  const evmc::MockedHost &Host,
+                                  const zen::evm::ExecutionDiffLog &Diffs) {
+  const int64_t GasLeftSigned = ExeResult.gas_left;
+  const uint64_t GasLeft =
+      GasLeftSigned > 0 ? static_cast<uint64_t>(GasLeftSigned) : 0;
+  const uint64_t GasUsed = GasLimit > GasLeft ? GasLimit - GasLeft : 0;
+  std::ostringstream OS;
+  OS << "{";
+  OS << "\"status_code\":" << static_cast<int>(ExeResult.status_code);
+  OS << ",\"status\":\"" << jsonEscape(evmc::to_string(ExeResult.status_code))
+     << "\"";
+  OS << ",\"gas_limit\":" << GasLimit;
+  OS << ",\"gas_used\":" << GasUsed;
+  OS << ",\"gas_left\":" << GasLeft;
+  OS << ",\"gas_refund\":"
+     << static_cast<uint64_t>(std::max<int64_t>(0, ExeResult.gas_refund));
+  if (IsDeployMode) {
+    OS << ",\"contract_address\":\"" << ContractAddressHex << "\"";
+  }
+  if (ExeResult.output_data && ExeResult.output_size > 0) {
+    OS << ",\"output\":\""
+       << bytesToHexString(ExeResult.output_data, ExeResult.output_size)
+       << "\"";
+  }
+  OS << ",\"log_count\":" << Host.recorded_logs.size();
+  OS << ",\"storage_diff_count\":" << Diffs.size();
+  OS << "}";
+  printf("receipt: %s\n", OS.str().c_str());
+}
 #endif // ZEN_ENABLE_EVM
 
 int main(int argc, char *argv[]) {
@@ -239,6 +357,9 @@ int main(int argc, char *argv[]) {
   std::string PrevRandaoHex = "0x0";
   std::string BaseFeeHex = "0x0";
   std::string BlobBaseFeeHex = "0x0";
+  bool PrintReceipt = false;
+  bool PrintLogs = false;
+  bool PrintStorageDiff = false;
   int64_t BlockNumber = 0;
   int64_t BlockTimestamp = 0;
   int64_t BlockGasLimit = 0;
@@ -320,6 +441,12 @@ int main(int argc, char *argv[]) {
                           "PrevRandao as bytes32 hex for EVM block context");
     CLIParser->add_option("--blob-base-fee", BlobBaseFeeHex,
                           "Blob base fee as uint256 hex for EVM block context");
+    CLIParser->add_flag("--print-receipt", PrintReceipt,
+                        "Print receipt-like EVM execution summary as JSON");
+    CLIParser->add_flag("--print-logs", PrintLogs,
+                        "Print emitted EVM logs as JSON lines");
+    CLIParser->add_flag("--print-storage-diff", PrintStorageDiff,
+                        "Print observed SSTORE diffs as JSON lines");
     CLIParser->add_option("--num-extra-compilations", NumExtraCompilations,
                           "The number of extra compilations");
     CLIParser->add_option("--num-extra-executions", NumExtraExecutions,
@@ -468,6 +595,10 @@ int main(int argc, char *argv[]) {
       return exitMain(EXIT_FAILURE, RT.get());
     }
     EVMInstance *Inst = *InstRet;
+    CLIStorageDiffSink StorageDiffSink;
+    if (PrintStorageDiff || PrintReceipt) {
+      Inst->setStorageDiffSink(&StorageDiffSink);
+    }
     evmc_call_kind MsgKind = EVMC_CALL;
     if (DeployMode) {
       MsgKind = Create2Salt.empty() ? EVMC_CREATE : EVMC_CREATE2;
@@ -534,9 +665,12 @@ int main(int argc, char *argv[]) {
     printf("status code: %d\n", ExitCode);
     printf("status: %s\n", evmc::to_string(ExeResult.status_code));
     printf("gas left: %lld\n", static_cast<long long>(ExeResult.gas_left));
+    const bool IsDeployResult =
+        EVMC_CREATE == MsgKind || EVMC_CREATE2 == MsgKind;
+    std::string ContractAddressHex;
     if (EVMC_CREATE == MsgKind || EVMC_CREATE2 == MsgKind) {
-      printf("contract address: %s\n",
-             zen::utils::addressToHex(ExeResult.create_address).c_str());
+      ContractAddressHex = zen::utils::addressToHex(ExeResult.create_address);
+      printf("contract address: %s\n", ContractAddressHex.c_str());
       if (ExeResult.status_code == EVMC_SUCCESS &&
           !ContractAddressOutFile.empty()) {
         std::ofstream OutFile(ContractAddressOutFile);
@@ -545,7 +679,7 @@ int main(int argc, char *argv[]) {
                         ContractAddressOutFile.c_str());
           return exitMain(EXIT_FAILURE, RT.get());
         }
-        OutFile << zen::utils::addressToHex(ExeResult.create_address) << '\n';
+        OutFile << ContractAddressHex << '\n';
       }
     }
     if (ExeResult.output_data && ExeResult.output_size > 0) {
@@ -555,6 +689,26 @@ int main(int argc, char *argv[]) {
         printf("revert data: 0x%s\n", output.c_str());
       } else {
         printf("output: 0x%s\n", output.c_str());
+      }
+    }
+    if (PrintReceipt) {
+      printExecutionReceipt(ExeResult, GasLimit, IsDeployResult,
+                            ContractAddressHex,
+                            *static_cast<evmc::MockedHost *>(Host.get()),
+                            StorageDiffSink.getDiffs());
+    }
+    if (PrintLogs) {
+      auto *MockedHostPtr = static_cast<evmc::MockedHost *>(Host.get());
+      for (size_t I = 0; I < MockedHostPtr->recorded_logs.size(); ++I) {
+        printf("log[%zu]: %s\n", I,
+               buildLogJson(MockedHostPtr->recorded_logs[I]).c_str());
+      }
+    }
+    if (PrintStorageDiff) {
+      const auto &Diffs = StorageDiffSink.getDiffs();
+      for (size_t I = 0; I < Diffs.size(); ++I) {
+        printf("storage_diff[%zu]: %s\n", I,
+               buildStorageDiffJson(Diffs[I]).c_str());
       }
     }
 
