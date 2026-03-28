@@ -389,10 +389,13 @@ public:
         (Msg.kind == EVMC_CALLCODE || Msg.kind == EVMC_DELEGATECALL)
             ? Msg.code_address
             : Msg.recipient;
+    if (precompile::isIdentityPrecompile(PrecompileAddr)) {
+      return precompile::executeIdentity(Msg, ReturnData);
+    }
     if (precompile::isBlake2bPrecompile(PrecompileAddr, Revision)) {
       return precompile::executeBlake2b(Msg, ReturnData);
     }
-    if (precompile::isModExpPrecompile(PrecompileAddr)) {
+    if (precompile::isModExpPrecompile(PrecompileAddr, Revision)) {
       return precompile::executeModExp(Msg, Revision, ReturnData);
     }
 

@@ -15,13 +15,26 @@
 
 namespace zen::evm::precompile {
 
-inline bool isModExpPrecompile(const evmc::address &Addr) noexcept {
+inline bool isCanonicalPrecompileAddress(const evmc::address &Addr,
+                                         uint8_t Suffix) noexcept {
   for (size_t I = 0; I + 1 < sizeof(Addr.bytes); ++I) {
     if (Addr.bytes[I] != 0) {
       return false;
     }
   }
-  return Addr.bytes[sizeof(Addr.bytes) - 1] == 0x05;
+  return Addr.bytes[sizeof(Addr.bytes) - 1] == Suffix;
+}
+
+inline bool isIdentityPrecompile(const evmc::address &Addr) noexcept {
+  return isCanonicalPrecompileAddress(Addr, 0x04);
+}
+
+inline bool isModExpPrecompile(const evmc::address &Addr,
+                               evmc_revision Revision) noexcept {
+  if (Revision < EVMC_BYZANTIUM) {
+    return false;
+  }
+  return isCanonicalPrecompileAddress(Addr, 0x05);
 }
 
 inline bool isBlake2bPrecompile(const evmc::address &Addr,
@@ -29,12 +42,34 @@ inline bool isBlake2bPrecompile(const evmc::address &Addr,
   if (Revision < EVMC_ISTANBUL) {
     return false;
   }
-  for (size_t I = 0; I + 1 < sizeof(Addr.bytes); ++I) {
-    if (Addr.bytes[I] != 0) {
-      return false;
-    }
+  return isCanonicalPrecompileAddress(Addr, 0x09);
+}
+
+inline evmc::Result executeIdentity(const evmc_message &Msg,
+                                    std::vector<uint8_t> &ReturnData) {
+  constexpr uint64_t BaseGas = 15;
+  constexpr uint64_t GasPerWord = 3;
+  const uint64_t InputSize = Msg.input_size;
+  const uint64_t WordCount = (InputSize + 31) / 32;
+  const uint64_t GasCost = BaseGas + WordCount * GasPerWord;
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (GasCost > MsgGas) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_OUT_OF_GAS, 0, 0, nullptr, 0);
   }
-  return Addr.bytes[sizeof(Addr.bytes) - 1] == 0x09;
+
+  const uint8_t *Input = InputSize == 0
+                             ? nullptr
+                             : static_cast<const uint8_t *>(Msg.input_data);
+  if (Input == nullptr || InputSize == 0) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  ReturnData.assign(Input, Input + InputSize);
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
 }
 
 inline intx::uint256 loadUint256Padded(const uint8_t *Data, size_t Size,

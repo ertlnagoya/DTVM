@@ -6,6 +6,7 @@
 #include "host/evm/crypto.h"
 #include "utils/evm.h"
 
+#include <array>
 #include <filesystem>
 #include <gtest/gtest.h>
 #include <intx/intx.hpp>
@@ -55,6 +56,26 @@ bool hexEqualsIgnoreCase(const std::string &Hex1, const std::string &Hex2) {
     return Value;
   };
   return Normalize(Hex1) == Normalize(Hex2);
+}
+
+evmc::Result runDirectPrecompileCall(const evmc_message &Msg,
+                                     evmc_revision Revision) {
+  RuntimeConfig Config;
+  Config.Mode = common::RunMode::InterpMode;
+  Config.EnableEvmGasMetering = true;
+
+  auto Host = std::make_unique<ZenMockedEVMHost>();
+  auto RT = Runtime::newEVMRuntime(Config, Host.get());
+  EXPECT_TRUE(RT != nullptr);
+  if (!RT) {
+    return {};
+  }
+  Host->setRuntime(RT.get());
+  Host->setRevision(Revision);
+
+  evmc_tx_context TxContext{};
+  Host->loadInitialState(TxContext, {}, true);
+  return Host->call(Msg);
 }
 
 evmc::Result runContextOpcodeScenario(
@@ -898,4 +919,79 @@ TEST(EVMCallSemantics, CallForwardsUsableGasAndReturnsReturndata) {
       zen::utils::toHex(Observation.Result.output_data,
                         Observation.Result.output_size),
       "0000000000000000000000000000000000000000000000000000000000000000"));
+}
+
+TEST(EVMPrecompiles, IdentityReturnsInputAndChargesWordGas) {
+  const evmc::address Identity = parseAddress(
+      "0x0000000000000000000000000000000000000004");
+  const std::array<uint8_t, 40> Input = {
+      0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+      0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
+      0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+      0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27};
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 100;
+  Msg.recipient = Identity;
+  Msg.code_address = Identity;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_FRONTIER);
+  ASSERT_EQ(Result.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(Result.gas_left, 79);
+  EXPECT_EQ(Result.output_size, Input.size());
+  EXPECT_EQ(zen::utils::toHex(Result.output_data, Result.output_size),
+            zen::utils::toHex(Input.data(), Input.size()));
+}
+
+TEST(EVMPrecompiles, ModExpAvailabilityDependsOnFork) {
+  const evmc::address ModExp = parseAddress(
+      "0x0000000000000000000000000000000000000005");
+  const std::array<uint8_t, 96> ZeroInput = {};
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 1000;
+  Msg.recipient = ModExp;
+  Msg.code_address = ModExp;
+  Msg.input_data = ZeroInput.data();
+  Msg.input_size = ZeroInput.size();
+
+  auto HomesteadResult = runDirectPrecompileCall(Msg, EVMC_HOMESTEAD);
+  ASSERT_EQ(HomesteadResult.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(HomesteadResult.output_size, 0U);
+  EXPECT_EQ(HomesteadResult.gas_left, Msg.gas);
+
+  auto ByzantiumResult = runDirectPrecompileCall(Msg, EVMC_BYZANTIUM);
+  ASSERT_EQ(ByzantiumResult.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(ByzantiumResult.output_size, 0U);
+  EXPECT_EQ(ByzantiumResult.gas_left, 400);
+}
+
+TEST(EVMPrecompiles, Blake2AvailabilityDependsOnFork) {
+  const evmc::address Blake2f = parseAddress(
+      "0x0000000000000000000000000000000000000009");
+  std::array<uint8_t, 213> Input = {};
+  Input[3] = 0x0c;
+  Input[212] = 1;
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 100;
+  Msg.recipient = Blake2f;
+  Msg.code_address = Blake2f;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto ByzantiumResult = runDirectPrecompileCall(Msg, EVMC_BYZANTIUM);
+  ASSERT_EQ(ByzantiumResult.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(ByzantiumResult.output_size, 0U);
+  EXPECT_EQ(ByzantiumResult.gas_left, Msg.gas);
+
+  auto IstanbulResult = runDirectPrecompileCall(Msg, EVMC_ISTANBUL);
+  ASSERT_EQ(IstanbulResult.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(IstanbulResult.output_size, 64U);
+  EXPECT_EQ(IstanbulResult.gas_left, 88);
 }
