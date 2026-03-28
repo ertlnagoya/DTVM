@@ -4,6 +4,7 @@
 #define ZEN_TESTS_EVM_PRECOMPILES_HPP
 
 #include "evm/evm.h"
+#include "host/evm/crypto.h"
 #include <algorithm>
 #include <array>
 #include <boost/multiprecision/cpp_int.hpp>
@@ -11,7 +12,13 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <openssl/bn.h>
+#include <openssl/ec.h>
+#include <openssl/ecdsa.h>
+#include <openssl/obj_mac.h>
 #include <openssl/ripemd.h>
+#include <openssl/sha.h>
 #include <vector>
 
 namespace zen::evm::precompile {
@@ -32,6 +39,10 @@ inline bool isIdentityPrecompile(const evmc::address &Addr) noexcept {
 
 inline bool isSha256Precompile(const evmc::address &Addr) noexcept {
   return isCanonicalPrecompileAddress(Addr, 0x02);
+}
+
+inline bool isEcRecoverPrecompile(const evmc::address &Addr) noexcept {
+  return isCanonicalPrecompileAddress(Addr, 0x01);
 }
 
 inline bool isRipemd160Precompile(const evmc::address &Addr) noexcept {
@@ -67,9 +78,8 @@ inline evmc::Result executeIdentity(const evmc_message &Msg,
     return evmc::Result(EVMC_OUT_OF_GAS, 0, 0, nullptr, 0);
   }
 
-  const uint8_t *Input = InputSize == 0
-                             ? nullptr
-                             : static_cast<const uint8_t *>(Msg.input_data);
+  const uint8_t *Input =
+      InputSize == 0 ? nullptr : static_cast<const uint8_t *>(Msg.input_data);
   if (Input == nullptr || InputSize == 0) {
     ReturnData.clear();
     return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
@@ -85,8 +95,8 @@ inline uint32_t rotr32(uint32_t Value, unsigned Shift) noexcept {
   return (Value >> Shift) | (Value << (32 - Shift));
 }
 
-inline std::array<uint8_t, 32>
-sha256Digest(const uint8_t *Data, size_t Size) noexcept {
+inline std::array<uint8_t, 32> sha256Digest(const uint8_t *Data,
+                                            size_t Size) noexcept {
   static constexpr std::array<uint32_t, 64> K = {
       0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU,
       0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U, 0xd807aa98U, 0x12835b01U,
@@ -189,11 +199,184 @@ inline evmc::Result executeSha256(const evmc_message &Msg,
     return evmc::Result(EVMC_OUT_OF_GAS, 0, 0, nullptr, 0);
   }
 
-  const uint8_t *Input = InputSize == 0
-                             ? nullptr
-                             : static_cast<const uint8_t *>(Msg.input_data);
+  const uint8_t *Input =
+      InputSize == 0 ? nullptr : static_cast<const uint8_t *>(Msg.input_data);
   const auto Digest = sha256Digest(Input, InputSize);
   ReturnData.assign(Digest.begin(), Digest.end());
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
+}
+
+inline evmc::Result executeEcRecover(const evmc_message &Msg,
+                                     std::vector<uint8_t> &ReturnData) {
+  constexpr uint64_t GasCost = 3000;
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (GasCost > MsgGas) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_OUT_OF_GAS, 0, 0, nullptr, 0);
+  }
+
+  ReturnData.clear();
+
+  uint8_t Input[128] = {0};
+  if (Msg.input_data != nullptr && Msg.input_size != 0) {
+    const auto CopyLen = std::min<size_t>(sizeof(Input), Msg.input_size);
+    std::memcpy(Input, Msg.input_data, CopyLen);
+  }
+
+  if (!std::all_of(Input + 32, Input + 63,
+                   [](uint8_t Byte) { return Byte == 0; })) {
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  int RecoveryId = -1;
+  if (Input[63] == 27 || Input[63] == 28) {
+    RecoveryId = static_cast<int>(Input[63] - 27);
+  } else if (Input[63] == 0 || Input[63] == 1) {
+    RecoveryId = static_cast<int>(Input[63]);
+  } else {
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  using BNPtr = std::unique_ptr<BIGNUM, decltype(&BN_free)>;
+  using BNCTXPtr = std::unique_ptr<BN_CTX, decltype(&BN_CTX_free)>;
+  using ECGroupPtr = std::unique_ptr<EC_GROUP, decltype(&EC_GROUP_free)>;
+  using ECPointPtr = std::unique_ptr<EC_POINT, decltype(&EC_POINT_free)>;
+  using ECKeyPtr = std::unique_ptr<EC_KEY, decltype(&EC_KEY_free)>;
+  using ECDSASigPtr = std::unique_ptr<ECDSA_SIG, decltype(&ECDSA_SIG_free)>;
+
+  BNCTXPtr Ctx(BN_CTX_new(), &BN_CTX_free);
+  ECGroupPtr Group(EC_GROUP_new_by_curve_name(NID_secp256k1), &EC_GROUP_free);
+  if (!Ctx || !Group) {
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  BN_CTX_start(Ctx.get());
+  BIGNUM *Field = BN_CTX_get(Ctx.get());
+  BIGNUM *A = BN_CTX_get(Ctx.get());
+  BIGNUM *B = BN_CTX_get(Ctx.get());
+  BIGNUM *OrderRaw = BN_CTX_get(Ctx.get());
+  BIGNUM *Zero = BN_CTX_get(Ctx.get());
+  if (!Field || !A || !B || !OrderRaw || !Zero) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+  BN_zero(Zero);
+
+  if (EC_GROUP_get_curve(Group.get(), Field, A, B, Ctx.get()) != 1 ||
+      EC_GROUP_get_order(Group.get(), OrderRaw, Ctx.get()) != 1) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  BNPtr R(BN_bin2bn(Input + 64, 32, nullptr), &BN_free);
+  BNPtr S(BN_bin2bn(Input + 96, 32, nullptr), &BN_free);
+  BNPtr Hash(BN_bin2bn(Input, 32, nullptr), &BN_free);
+  if (!R || !S || !Hash) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+  if (BN_is_zero(R.get()) || BN_is_zero(S.get()) ||
+      BN_cmp(R.get(), OrderRaw) >= 0 || BN_cmp(S.get(), OrderRaw) >= 0) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  BNPtr X(BN_dup(R.get()), &BN_free);
+  if (!X || BN_cmp(X.get(), Field) >= 0) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  std::array<uint8_t, 33> Compressed = {};
+  Compressed[0] = static_cast<uint8_t>(0x02 + RecoveryId);
+  if (BN_bn2binpad(X.get(), Compressed.data() + 1, 32) != 32) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  ECPointPtr RecoverPoint(EC_POINT_new(Group.get()), &EC_POINT_free);
+  ECPointPtr OrderCheck(EC_POINT_new(Group.get()), &EC_POINT_free);
+  ECPointPtr SR(EC_POINT_new(Group.get()), &EC_POINT_free);
+  ECPointPtr MinusEG(EC_POINT_new(Group.get()), &EC_POINT_free);
+  ECPointPtr Sum(EC_POINT_new(Group.get()), &EC_POINT_free);
+  ECPointPtr PubKey(EC_POINT_new(Group.get()), &EC_POINT_free);
+  if (!RecoverPoint || !OrderCheck || !SR || !MinusEG || !Sum || !PubKey) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  if (EC_POINT_oct2point(Group.get(), RecoverPoint.get(), Compressed.data(),
+                         Compressed.size(), Ctx.get()) != 1 ||
+      EC_POINT_mul(Group.get(), OrderCheck.get(), nullptr, RecoverPoint.get(),
+                   OrderRaw, Ctx.get()) != 1 ||
+      EC_POINT_is_at_infinity(Group.get(), OrderCheck.get()) != 1) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  BNPtr MinusHash(BN_new(), &BN_free);
+  BNPtr RInv(BN_mod_inverse(nullptr, R.get(), OrderRaw, Ctx.get()), &BN_free);
+  if (!MinusHash || !RInv ||
+      BN_mod_sub(MinusHash.get(), Zero, Hash.get(), OrderRaw, Ctx.get()) != 1 ||
+      EC_POINT_mul(Group.get(), SR.get(), nullptr, RecoverPoint.get(), S.get(),
+                   Ctx.get()) != 1 ||
+      EC_POINT_mul(Group.get(), MinusEG.get(), MinusHash.get(), nullptr,
+                   nullptr, Ctx.get()) != 1 ||
+      EC_POINT_add(Group.get(), Sum.get(), SR.get(), MinusEG.get(),
+                   Ctx.get()) != 1 ||
+      EC_POINT_mul(Group.get(), PubKey.get(), nullptr, Sum.get(), RInv.get(),
+                   Ctx.get()) != 1) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  ECKeyPtr Key(EC_KEY_new_by_curve_name(NID_secp256k1), &EC_KEY_free);
+  ECDSASigPtr Sig(ECDSA_SIG_new(), &ECDSA_SIG_free);
+  if (!Key || !Sig) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+  BNPtr SigR(BN_dup(R.get()), &BN_free);
+  BNPtr SigS(BN_dup(S.get()), &BN_free);
+  if (!SigR || !SigS ||
+      ECDSA_SIG_set0(Sig.get(), SigR.release(), SigS.release()) != 1 ||
+      EC_KEY_set_public_key(Key.get(), PubKey.get()) != 1 ||
+      ECDSA_do_verify(Input, 32, Sig.get(), Key.get()) != 1) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  std::array<uint8_t, 65> EncodedPubKey = {};
+  if (EC_POINT_point2oct(Group.get(), PubKey.get(),
+                         POINT_CONVERSION_UNCOMPRESSED, EncodedPubKey.data(),
+                         EncodedPubKey.size(),
+                         Ctx.get()) != EncodedPubKey.size()) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+  BN_CTX_end(Ctx.get());
+
+  std::vector<uint8_t> PubKeyBytes(EncodedPubKey.begin() + 1,
+                                   EncodedPubKey.end());
+  const auto HashBytes = zen::host::evm::crypto::keccak256(PubKeyBytes);
+  ReturnData.assign(32, 0);
+  std::memcpy(ReturnData.data() + 12, HashBytes.data() + 12, 20);
   return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
                       ReturnData.data(), ReturnData.size());
 }
@@ -211,9 +394,8 @@ inline evmc::Result executeRipemd160(const evmc_message &Msg,
     return evmc::Result(EVMC_OUT_OF_GAS, 0, 0, nullptr, 0);
   }
 
-  const uint8_t *Input = InputSize == 0
-                             ? nullptr
-                             : static_cast<const uint8_t *>(Msg.input_data);
+  const uint8_t *Input =
+      InputSize == 0 ? nullptr : static_cast<const uint8_t *>(Msg.input_data);
   unsigned char Digest[RIPEMD160_DIGEST_LENGTH];
   RIPEMD160(Input, InputSize, Digest);
   ReturnData.assign(32, 0);
@@ -324,8 +506,7 @@ inline std::vector<uint8_t> readSegment(const uint8_t *Data, size_t Size,
 inline uint32_t loadUint32BE(const uint8_t *Data) noexcept {
   return (static_cast<uint32_t>(Data[0]) << 24) |
          (static_cast<uint32_t>(Data[1]) << 16) |
-         (static_cast<uint32_t>(Data[2]) << 8) |
-         static_cast<uint32_t>(Data[3]);
+         (static_cast<uint32_t>(Data[2]) << 8) | static_cast<uint32_t>(Data[3]);
 }
 
 inline uint64_t loadUint64LE(const uint8_t *Data) noexcept {
@@ -362,9 +543,8 @@ inline void blake2bCompress(uint64_t H[8], const uint64_t M[16], uint64_t T0,
                             uint64_t T1, bool FinalBlock,
                             uint32_t Rounds) noexcept {
   static constexpr std::array<uint64_t, 8> IV = {
-      0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
-      0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
-      0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+      0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL, 0x3c6ef372fe94f82bULL,
+      0xa54ff53a5f1d36f1ULL, 0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
       0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL};
   static constexpr uint8_t Sigma[10][16] = {
       {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
