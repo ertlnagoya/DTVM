@@ -11,7 +11,9 @@
 #ifndef MCLBN_FR_UNIT_SIZE
 #define MCLBN_FR_UNIT_SIZE 4
 #endif
+#ifdef ZEN_HAS_C_KZG
 #include <ckzg.h>
+#endif
 #include <mcl/bn.h>
 #ifndef MCLBN_IO_SERIALIZE
 #define MCLBN_IO_SERIALIZE 512
@@ -546,6 +548,16 @@ inline bool bn254SerializePairingResult(uint8_t *Buf, bool Success) noexcept {
   return true;
 }
 
+inline void kzgToVersionedHash(uint8_t *Out,
+                               const uint8_t *CommitmentBytes) noexcept {
+  uint8_t Digest[SHA256_DIGEST_LENGTH];
+  SHA256(CommitmentBytes, 48, Digest);
+  Out[0] = 0x01;
+  std::memcpy(Out + 1, Digest + 1, 31);
+}
+
+#ifdef ZEN_HAS_C_KZG
+
 inline KZGSettings *getKzgSettings() noexcept {
 #ifdef ZEN_C_KZG_TRUSTED_SETUP_PATH
   static KZGSettings Settings{};
@@ -562,14 +574,6 @@ inline KZGSettings *getKzgSettings() noexcept {
 #else
   return nullptr;
 #endif
-}
-
-inline void kzgToVersionedHash(uint8_t *Out,
-                               const Bytes48 &Commitment) noexcept {
-  uint8_t Digest[SHA256_DIGEST_LENGTH];
-  SHA256(Commitment.bytes, sizeof(Commitment.bytes), Digest);
-  Out[0] = 0x01;
-  std::memcpy(Out + 1, Digest + 1, 31);
 }
 
 inline void storeUint256BE(uint8_t *Out,
@@ -647,6 +651,20 @@ executeKzgPointEvaluation(const evmc_message &Msg,
   return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
                       ReturnData.data(), ReturnData.size());
 }
+
+#else
+
+inline void *getKzgSettings() noexcept { return nullptr; }
+
+inline evmc::Result
+executeKzgPointEvaluation(const evmc_message &Msg,
+                          std::vector<uint8_t> &ReturnData) {
+  (void)Msg;
+  ReturnData.clear();
+  return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+}
+
+#endif
 
 inline evmc::Result executeRipemd160(const evmc_message &Msg,
                                      std::vector<uint8_t> &ReturnData) {

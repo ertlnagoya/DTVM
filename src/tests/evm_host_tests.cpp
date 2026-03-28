@@ -202,6 +202,9 @@ Bn254Fixture buildBn254Fixture() {
 
 KzgPointEvaluationFixture buildKzgPointEvaluationFixture() {
   KzgPointEvaluationFixture Fixture;
+#ifndef ZEN_HAS_C_KZG
+  return Fixture;
+#else
   KZGSettings *Settings = zen::evm::precompile::getKzgSettings();
   if (Settings == nullptr) {
     return Fixture;
@@ -238,6 +241,7 @@ KzgPointEvaluationFixture buildKzgPointEvaluationFixture() {
               BlsModulus.size());
   Fixture.Valid = true;
   return Fixture;
+#endif
 }
 
 evmc::Result runDirectPrecompileCall(const evmc_message &Msg,
@@ -1303,6 +1307,9 @@ TEST(EVMPrecompiles, Bn256PairingRejectsInvalidLength) {
 
 TEST(EVMPrecompiles, KzgPointEvaluationReturnsBlobMetadataOnValidProof) {
   const auto Fixture = buildKzgPointEvaluationFixture();
+#ifndef ZEN_HAS_C_KZG
+  GTEST_SKIP() << "KZG backend is not available in this build";
+#endif
   ASSERT_TRUE(Fixture.Valid);
 
   const evmc::address Addr = evmc::literals::operator""_address(
@@ -1327,6 +1334,9 @@ TEST(EVMPrecompiles, KzgPointEvaluationReturnsBlobMetadataOnValidProof) {
 
 TEST(EVMPrecompiles, KzgPointEvaluationRejectsWrongVersionedHash) {
   auto Fixture = buildKzgPointEvaluationFixture();
+#ifndef ZEN_HAS_C_KZG
+  GTEST_SKIP() << "KZG backend is not available in this build";
+#endif
   ASSERT_TRUE(Fixture.Valid);
   Fixture.Input[0] ^= 0x01;
 
@@ -1347,6 +1357,9 @@ TEST(EVMPrecompiles, KzgPointEvaluationRejectsWrongVersionedHash) {
 
 TEST(EVMPrecompiles, KzgPointEvaluationRejectsNonCanonicalFieldElement) {
   auto Fixture = buildKzgPointEvaluationFixture();
+#ifndef ZEN_HAS_C_KZG
+  GTEST_SKIP() << "KZG backend is not available in this build";
+#endif
   ASSERT_TRUE(Fixture.Valid);
   static constexpr std::array<uint8_t, 32> BlsModulus = {
       0x73, 0xed, 0xa7, 0x53, 0x29, 0x9d, 0x7d, 0x48, 0x33, 0x39, 0xd8,
