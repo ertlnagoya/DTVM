@@ -13,14 +13,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
+        run: |
+          git init .
+          git remote add origin "https://github.com/${{ github.repository }}.git"
+          git fetch origin
+          git fetch origin "${{ github.sha }}"
+          git checkout --detach FETCH_HEAD
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: '16'
+      - name: Verify Node.js toolchain
+        run: |
+          node --version
+          npm --version
 
       - name: Install dependencies
         run: |

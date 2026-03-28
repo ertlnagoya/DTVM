@@ -24,9 +24,14 @@ jobs:
       image: dtvmdev1/dtvm-dev-x64:main
     steps:
       - name: Check out code
-        uses: actions/checkout@v3
-        with:
-          submodules: "true"
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
+          git init .
+          git remote add origin "https://github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --detach FETCH_HEAD
+          git submodule update --init --recursive
       - name: Code Format Check
         run: |
           ./tools/format.sh check
@@ -66,9 +71,14 @@ jobs:
       image: dtvmdev1/dtvm-dev-x64:main
     steps:
       - name: Check out code
-        uses: actions/checkout@v3
-        with:
-          submodules: "true"
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
+          git init .
+          git remote add origin "https://github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --detach FETCH_HEAD
+          git submodule update --init --recursive
       - name: Code Format Check
         run: |
           ./tools/format.sh check
@@ -108,9 +118,14 @@ jobs:
       image: dtvmdev1/dtvm-dev-x64:main
     steps:
       - name: Check out code
-        uses: actions/checkout@v3
-        with:
-          submodules: "true"
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
+          git init .
+          git remote add origin "https://github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --detach FETCH_HEAD
+          git submodule update --init --recursive
       - name: Code Format Check
         run: |
           ./tools/format.sh check
@@ -150,9 +165,14 @@ jobs:
       image: dtvmdev1/dtvm-dev-x64:main
     steps:
       - name: Check out code
-        uses: actions/checkout@v3
-        with:
-          submodules: "true"
+        run: |
+          git config --global --add safe.directory "$PWD"
+          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
+          git init .
+          git remote add origin "https://github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --detach FETCH_HEAD
+          git submodule update --init --recursive
       - name: Code Format Check
         run: |
           ./tools/format.sh check
