@@ -121,4 +121,42 @@ if(ZEN_ENABLE_SPEC_TEST)
   set(YAML_CPP_BUILD_CONTRIB OFF)
   set(YAML_CPP_INSTALL OFF)
   FetchContent_MakeAvailable(yaml-cpp)
+
+  if(ZEN_ENABLE_EVM)
+    FetchContent_Declare(
+      mcl
+      GIT_REPOSITORY https://github.com/herumi/mcl.git
+      GIT_TAG v1.99
+      GIT_SHALLOW TRUE
+    )
+    set(MCL_BUILD_TESTING
+        OFF
+        CACHE BOOL "" FORCE
+    )
+    set(MCL_BUILD_SAMPLE
+        OFF
+        CACHE BOOL "" FORCE
+    )
+    set(MCL_USE_GMP
+        OFF
+        CACHE BOOL "" FORCE
+    )
+    set(MCL_TEST_WITH_GMP
+        OFF
+        CACHE BOOL "" FORCE
+    )
+    set(MCL_USE_LLVM
+        OFF
+        CACHE BOOL "" FORCE
+    )
+    set(MCL_FP_BIT
+        256
+        CACHE STRING "" FORCE
+    )
+    set(MCL_FR_BIT
+        256
+        CACHE STRING "" FORCE
+    )
+    FetchContent_MakeAvailable(mcl)
+  endif()
 endif()

@@ -126,6 +126,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   yaml-cpp
                   gtest_main
                   OpenSSL::Crypto
+                  mcl::mclbn256
                   -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
@@ -136,6 +137,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   mpt
                   gtest_main
                   OpenSSL::Crypto
+                  mcl::mclbn256
                   -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
@@ -146,6 +148,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   mpt
                   gtest_main
                   OpenSSL::Crypto
+                  mcl::mclbn256
                   -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
@@ -183,6 +186,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   yaml-cpp
                   gtest_main
                   OpenSSL::Crypto
+                  mcl::mclbn256
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -195,6 +199,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   gtest_main
                   CLI11::CLI11
                   OpenSSL::Crypto
+                  mcl::mclbn256
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -206,6 +211,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   mpt
                   gtest_main
                   OpenSSL::Crypto
+                  mcl::mclbn256
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -236,17 +242,33 @@ if(ZEN_ENABLE_SPEC_TEST)
       )
       target_link_libraries(
         evmHostTests
-        PRIVATE dtvmcore rapidjson yaml-cpp gtest_main OpenSSL::Crypto
+        PRIVATE dtvmcore
+                rapidjson
+                yaml-cpp
+                gtest_main
+                OpenSSL::Crypto
+                mcl::mclbn256
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(
         solidityContractTests
-        PRIVATE dtvmcore rapidjson mpt gtest_main CLI11::CLI11 OpenSSL::Crypto
+        PRIVATE dtvmcore
+                rapidjson
+                mpt
+                gtest_main
+                CLI11::CLI11
+                OpenSSL::Crypto
+                mcl::mclbn256
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(
         evmStateTests
-        PRIVATE dtvmcore rapidjson mpt gtest_main OpenSSL::Crypto
+        PRIVATE dtvmcore
+                rapidjson
+                mpt
+                gtest_main
+                OpenSSL::Crypto
+                mcl::mclbn256
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(mptCompareCpp PRIVATE dtvmcore rapidjson mpt)

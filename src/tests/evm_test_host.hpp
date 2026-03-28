@@ -398,6 +398,15 @@ public:
     if (precompile::isRipemd160Precompile(PrecompileAddr)) {
       return precompile::executeRipemd160(Msg, ReturnData);
     }
+    if (precompile::isBn256AddPrecompile(PrecompileAddr, Revision)) {
+      return precompile::executeBn256Add(Msg, Revision, ReturnData);
+    }
+    if (precompile::isBn256MulPrecompile(PrecompileAddr, Revision)) {
+      return precompile::executeBn256Mul(Msg, Revision, ReturnData);
+    }
+    if (precompile::isBn256PairingPrecompile(PrecompileAddr, Revision)) {
+      return precompile::executeBn256Pairing(Msg, Revision, ReturnData);
+    }
     if (precompile::isIdentityPrecompile(PrecompileAddr)) {
       return precompile::executeIdentity(Msg, ReturnData);
     }

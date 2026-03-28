@@ -5,6 +5,19 @@
 
 #include "evm/evm.h"
 #include "host/evm/crypto.h"
+#ifndef MCLBN_FP_UNIT_SIZE
+#define MCLBN_FP_UNIT_SIZE 4
+#endif
+#ifndef MCLBN_FR_UNIT_SIZE
+#define MCLBN_FR_UNIT_SIZE 4
+#endif
+#include <mcl/bn.h>
+#ifndef MCLBN_IO_SERIALIZE
+#define MCLBN_IO_SERIALIZE 512
+#endif
+#ifndef MCLBN_IO_BIG_ENDIAN
+#define MCLBN_IO_BIG_ENDIAN 8192
+#endif
 #include <algorithm>
 #include <array>
 #include <boost/multiprecision/cpp_int.hpp>
@@ -47,6 +60,30 @@ inline bool isEcRecoverPrecompile(const evmc::address &Addr) noexcept {
 
 inline bool isRipemd160Precompile(const evmc::address &Addr) noexcept {
   return isCanonicalPrecompileAddress(Addr, 0x03);
+}
+
+inline bool isBn256AddPrecompile(const evmc::address &Addr,
+                                 evmc_revision Revision) noexcept {
+  if (Revision < EVMC_BYZANTIUM) {
+    return false;
+  }
+  return isCanonicalPrecompileAddress(Addr, 0x06);
+}
+
+inline bool isBn256MulPrecompile(const evmc::address &Addr,
+                                 evmc_revision Revision) noexcept {
+  if (Revision < EVMC_BYZANTIUM) {
+    return false;
+  }
+  return isCanonicalPrecompileAddress(Addr, 0x07);
+}
+
+inline bool isBn256PairingPrecompile(const evmc::address &Addr,
+                                     evmc_revision Revision) noexcept {
+  if (Revision < EVMC_BYZANTIUM) {
+    return false;
+  }
+  return isCanonicalPrecompileAddress(Addr, 0x08);
 }
 
 inline bool isModExpPrecompile(const evmc::address &Addr,
@@ -381,6 +418,124 @@ inline evmc::Result executeEcRecover(const evmc_message &Msg,
                       ReturnData.data(), ReturnData.size());
 }
 
+inline bool ensureBn254Initialized() noexcept {
+  static const bool Initialized = []() {
+    const int Ret = mclBn_init(MCL_BN_SNARK1, MCLBN_COMPILED_TIME_VAR);
+    if (Ret != 0) {
+      return false;
+    }
+    mclBn_verifyOrderG1(0);
+    mclBn_verifyOrderG2(1);
+    return true;
+  }();
+  return Initialized;
+}
+
+inline uint64_t bn256AddGasCost(evmc_revision Revision) noexcept {
+  return Revision >= EVMC_ISTANBUL ? 150 : 500;
+}
+
+inline uint64_t bn256MulGasCost(evmc_revision Revision) noexcept {
+  return Revision >= EVMC_ISTANBUL ? 6000 : 40000;
+}
+
+inline uint64_t bn256PairingBaseGas(evmc_revision Revision) noexcept {
+  return Revision >= EVMC_ISTANBUL ? 45000 : 100000;
+}
+
+inline uint64_t bn256PairingPerPairGas(evmc_revision Revision) noexcept {
+  return Revision >= EVMC_ISTANBUL ? 34000 : 80000;
+}
+
+inline bool isAllZero(const uint8_t *Data, size_t Size) noexcept {
+  for (size_t I = 0; I < Size; ++I) {
+    if (Data[I] != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline void copyPaddedInput(std::vector<uint8_t> &Dst, const evmc_message &Msg,
+                            size_t Size) {
+  Dst.assign(Size, 0);
+  if (Msg.input_data == nullptr || Msg.input_size == 0) {
+    return;
+  }
+  const size_t CopyLen = std::min<size_t>(Size, Msg.input_size);
+  std::memcpy(Dst.data(), Msg.input_data, CopyLen);
+}
+
+inline bool bn254DeserializeFp(mclBnFp *X, const uint8_t *Buf) noexcept {
+  return mclBnFp_setStr(X, reinterpret_cast<const char *>(Buf), 32,
+                        MCLBN_IO_SERIALIZE | MCLBN_IO_BIG_ENDIAN) == 0;
+}
+
+inline bool bn254SerializeFp(uint8_t *Buf, const mclBnFp *X) noexcept {
+  return mclBnFp_getStr(reinterpret_cast<char *>(Buf), 32, X,
+                        MCLBN_IO_SERIALIZE | MCLBN_IO_BIG_ENDIAN) == 32;
+}
+
+inline bool bn254DeserializeG1(mclBnG1 *P, const uint8_t *Buf) noexcept {
+  if (isAllZero(Buf, 64)) {
+    mclBnG1_clear(P);
+    return true;
+  }
+  if (!bn254DeserializeFp(&P->x, Buf) || !bn254DeserializeFp(&P->y, Buf + 32)) {
+    return false;
+  }
+  mclBnFp_setInt32(&P->z, 1);
+  return mclBnG1_isValid(P) == 1;
+}
+
+inline bool bn254SerializeG1(uint8_t *Buf, mclBnG1 *P) noexcept {
+  if (mclBnG1_isZero(P)) {
+    std::memset(Buf, 0, 64);
+    return true;
+  }
+  mclBnG1_normalize(P, P);
+  return bn254SerializeFp(Buf, &P->x) && bn254SerializeFp(Buf + 32, &P->y);
+}
+
+inline bool bn254DeserializeFp2(mclBnFp2 *X, const uint8_t *Buf) noexcept {
+  return bn254DeserializeFp(&X->d[1], Buf) &&
+         bn254DeserializeFp(&X->d[0], Buf + 32);
+}
+
+inline bool bn254DeserializeG2(mclBnG2 *P, const uint8_t *Buf) noexcept {
+  if (isAllZero(Buf, 128)) {
+    mclBnG2_clear(P);
+    return true;
+  }
+  if (!bn254DeserializeFp2(&P->x, Buf) ||
+      !bn254DeserializeFp2(&P->y, Buf + 64)) {
+    return false;
+  }
+  mclBnFp_setInt32(&P->z.d[0], 1);
+  mclBnFp_clear(&P->z.d[1]);
+  return mclBnG2_isValid(P) == 1;
+}
+
+inline bool bn254SerializeG2(uint8_t *Buf, mclBnG2 *P) noexcept {
+  if (mclBnG2_isZero(P)) {
+    std::memset(Buf, 0, 128);
+    return true;
+  }
+  mclBnG2_normalize(P, P);
+  return bn254SerializeFp(Buf, &P->x.d[1]) &&
+         bn254SerializeFp(Buf + 32, &P->x.d[0]) &&
+         bn254SerializeFp(Buf + 64, &P->y.d[1]) &&
+         bn254SerializeFp(Buf + 96, &P->y.d[0]);
+}
+
+inline bool bn254SerializePairingResult(uint8_t *Buf, bool Success) noexcept {
+  std::memset(Buf, 0, 32);
+  if (Success) {
+    Buf[31] = 1;
+  }
+  return true;
+}
+
 inline evmc::Result executeRipemd160(const evmc_message &Msg,
                                      std::vector<uint8_t> &ReturnData) {
   constexpr uint64_t BaseGas = 600;
@@ -400,6 +555,112 @@ inline evmc::Result executeRipemd160(const evmc_message &Msg,
   RIPEMD160(Input, InputSize, Digest);
   ReturnData.assign(32, 0);
   std::memcpy(ReturnData.data() + 12, Digest, RIPEMD160_DIGEST_LENGTH);
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
+}
+
+inline evmc::Result executeBn256Add(const evmc_message &Msg,
+                                    evmc_revision Revision,
+                                    std::vector<uint8_t> &ReturnData) {
+  const uint64_t GasCost = bn256AddGasCost(Revision);
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (GasCost > MsgGas || !ensureBn254Initialized()) {
+    ReturnData.clear();
+    return evmc::Result(GasCost > MsgGas ? EVMC_OUT_OF_GAS : EVMC_FAILURE, 0, 0,
+                        nullptr, 0);
+  }
+
+  std::vector<uint8_t> Input;
+  copyPaddedInput(Input, Msg, 128);
+
+  mclBnG1 P1, P2, Sum;
+  if (!bn254DeserializeG1(&P1, Input.data()) ||
+      !bn254DeserializeG1(&P2, Input.data() + 64)) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  mclBnG1_add(&Sum, &P1, &P2);
+  ReturnData.assign(64, 0);
+  if (!bn254SerializeG1(ReturnData.data(), &Sum)) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
+}
+
+inline evmc::Result executeBn256Mul(const evmc_message &Msg,
+                                    evmc_revision Revision,
+                                    std::vector<uint8_t> &ReturnData) {
+  const uint64_t GasCost = bn256MulGasCost(Revision);
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (GasCost > MsgGas || !ensureBn254Initialized()) {
+    ReturnData.clear();
+    return evmc::Result(GasCost > MsgGas ? EVMC_OUT_OF_GAS : EVMC_FAILURE, 0, 0,
+                        nullptr, 0);
+  }
+
+  std::vector<uint8_t> Input;
+  copyPaddedInput(Input, Msg, 96);
+
+  mclBnG1 Point, Product;
+  mclBnFr Scalar;
+  if (!bn254DeserializeG1(&Point, Input.data()) ||
+      mclBnFr_setBigEndianMod(&Scalar, Input.data() + 64, 32) != 0) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  mclBnG1_mul(&Product, &Point, &Scalar);
+  ReturnData.assign(64, 0);
+  if (!bn254SerializeG1(ReturnData.data(), &Product)) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
+}
+
+inline evmc::Result executeBn256Pairing(const evmc_message &Msg,
+                                        evmc_revision Revision,
+                                        std::vector<uint8_t> &ReturnData) {
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (!ensureBn254Initialized()) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+  if ((Msg.input_size % 192) != 0) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  const uint64_t PairCount = Msg.input_size / 192;
+  const uint64_t GasCost = bn256PairingBaseGas(Revision) +
+                           PairCount * bn256PairingPerPairGas(Revision);
+  if (GasCost > MsgGas) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_OUT_OF_GAS, 0, 0, nullptr, 0);
+  }
+
+  mclBnGT Acc;
+  mclBnGT_setInt32(&Acc, 1);
+  const uint8_t *Input = static_cast<const uint8_t *>(Msg.input_data);
+  for (uint64_t I = 0; I < PairCount; ++I) {
+    const uint8_t *Chunk = Input + I * 192;
+    mclBnG1 P;
+    mclBnG2 Q;
+    if (!bn254DeserializeG1(&P, Chunk) || !bn254DeserializeG2(&Q, Chunk + 64)) {
+      ReturnData.clear();
+      return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+    }
+    mclBnGT Pairing;
+    mclBn_pairing(&Pairing, &P, &Q);
+    mclBnGT_mul(&Acc, &Acc, &Pairing);
+  }
+
+  ReturnData.assign(32, 0);
+  bn254SerializePairingResult(ReturnData.data(), mclBnGT_isOne(&Acc) == 1);
   return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
                       ReturnData.data(), ReturnData.size());
 }

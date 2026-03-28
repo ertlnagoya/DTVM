@@ -71,6 +71,12 @@ struct EcRecoverFixture {
   bool Valid = false;
 };
 
+struct Bn254Fixture {
+  std::array<uint8_t, 64> G1 = {};
+  std::array<uint8_t, 128> G2 = {};
+  bool Valid = false;
+};
+
 EcRecoverFixture buildEcRecoverFixture() {
   EcRecoverFixture Fixture;
 
@@ -155,6 +161,36 @@ EcRecoverFixture buildEcRecoverFixture() {
     }
   }
 
+  return Fixture;
+}
+
+Bn254Fixture buildBn254Fixture() {
+  Bn254Fixture Fixture;
+  if (!zen::evm::precompile::ensureBn254Initialized()) {
+    return Fixture;
+  }
+
+  mclBnG1 P1;
+  mclBnG2 P2;
+  const char *P1Str = "1 1 2";
+  const char *P2Str = "1 "
+                      "10857046999023057135944570762232829481370756359578518086"
+                      "990519993285655852781 "
+                      "11559732032986387107991004021392285783925812861821192530"
+                      "917403151452391805634 "
+                      "84956539231234314176049732474892724384181905872636001487"
+                      "70280649306958101930 "
+                      "40823678758634336813322034031454355683168513275934012081"
+                      "05741076214120093531";
+  if (mclBnG1_setStr(&P1, P1Str, std::strlen(P1Str), 0) != 0 ||
+      mclBnG2_setStr(&P2, P2Str, std::strlen(P2Str), 0) != 0) {
+    return Fixture;
+  }
+  if (!zen::evm::precompile::bn254SerializeG1(Fixture.G1.data(), &P1) ||
+      !zen::evm::precompile::bn254SerializeG2(Fixture.G2.data(), &P2)) {
+    return Fixture;
+  }
+  Fixture.Valid = true;
   return Fixture;
 }
 
@@ -1094,6 +1130,129 @@ TEST(EVMPrecompiles, EcRecoverRejectsInvalidRecoveryId) {
   EXPECT_EQ(Result.status_code, EVMC_SUCCESS);
   EXPECT_EQ(Result.gas_left, 2000);
   EXPECT_EQ(Result.output_size, 0);
+}
+
+TEST(EVMPrecompiles, Bn256AddReturnsExpectedPointAndChargesForkGas) {
+  const auto Fixture = buildBn254Fixture();
+  ASSERT_TRUE(Fixture.Valid);
+
+  std::array<uint8_t, 128> Input = {};
+  std::memcpy(Input.data(), Fixture.G1.data(), Fixture.G1.size());
+  std::memcpy(Input.data() + 64, Fixture.G1.data(), Fixture.G1.size());
+
+  const evmc::address Addr = evmc::literals::operator""_address(
+      "0000000000000000000000000000000000000006");
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 1000;
+  Msg.recipient = Addr;
+  Msg.code_address = Addr;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_BYZANTIUM);
+  EXPECT_EQ(Result.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(Result.gas_left, 500);
+  ASSERT_EQ(Result.output_size, 64);
+
+  mclBnG1 P1;
+  mclBnG1 Sum;
+  ASSERT_TRUE(zen::evm::precompile::bn254DeserializeG1(&P1, Fixture.G1.data()));
+  mclBnG1_add(&Sum, &P1, &P1);
+  std::array<uint8_t, 64> Expected = {};
+  ASSERT_TRUE(zen::evm::precompile::bn254SerializeG1(Expected.data(), &Sum));
+  EXPECT_EQ(std::memcmp(Result.output_data, Expected.data(), Expected.size()),
+            0);
+}
+
+TEST(EVMPrecompiles, Bn256MulReturnsExpectedPointAndChargesIstanbulGas) {
+  const auto Fixture = buildBn254Fixture();
+  ASSERT_TRUE(Fixture.Valid);
+
+  std::array<uint8_t, 96> Input = {};
+  std::memcpy(Input.data(), Fixture.G1.data(), Fixture.G1.size());
+  Input[95] = 2;
+
+  const evmc::address Addr = evmc::literals::operator""_address(
+      "0000000000000000000000000000000000000007");
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 7000;
+  Msg.recipient = Addr;
+  Msg.code_address = Addr;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_ISTANBUL);
+  EXPECT_EQ(Result.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(Result.gas_left, 1000);
+  ASSERT_EQ(Result.output_size, 64);
+
+  mclBnG1 P1;
+  mclBnG1 Product;
+  mclBnFr Scalar;
+  ASSERT_TRUE(zen::evm::precompile::bn254DeserializeG1(&P1, Fixture.G1.data()));
+  mclBnFr_setInt32(&Scalar, 2);
+  mclBnG1_mul(&Product, &P1, &Scalar);
+  std::array<uint8_t, 64> Expected = {};
+  ASSERT_TRUE(
+      zen::evm::precompile::bn254SerializeG1(Expected.data(), &Product));
+  EXPECT_EQ(std::memcmp(Result.output_data, Expected.data(), Expected.size()),
+            0);
+}
+
+TEST(EVMPrecompiles, Bn256PairingChecksProductEqualsOne) {
+  const auto Fixture = buildBn254Fixture();
+  ASSERT_TRUE(Fixture.Valid);
+
+  std::array<uint8_t, 384> Input = {};
+  std::memcpy(Input.data(), Fixture.G1.data(), Fixture.G1.size());
+  std::memcpy(Input.data() + 64, Fixture.G2.data(), Fixture.G2.size());
+
+  mclBnG1 P1;
+  mclBnG1 NegP1;
+  ASSERT_TRUE(zen::evm::precompile::bn254DeserializeG1(&P1, Fixture.G1.data()));
+  mclBnG1_neg(&NegP1, &P1);
+  std::array<uint8_t, 64> NegG1 = {};
+  ASSERT_TRUE(zen::evm::precompile::bn254SerializeG1(NegG1.data(), &NegP1));
+  std::memcpy(Input.data() + 192, NegG1.data(), NegG1.size());
+  std::memcpy(Input.data() + 256, Fixture.G2.data(), Fixture.G2.size());
+
+  const evmc::address Addr = evmc::literals::operator""_address(
+      "0000000000000000000000000000000000000008");
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 250000;
+  Msg.recipient = Addr;
+  Msg.code_address = Addr;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_ISTANBUL);
+  EXPECT_EQ(Result.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(Result.gas_left, 137000);
+  ASSERT_EQ(Result.output_size, 32);
+  EXPECT_EQ(static_cast<const uint8_t *>(Result.output_data)[31], 1);
+}
+
+TEST(EVMPrecompiles, Bn256PairingRejectsInvalidLength) {
+  const evmc::address Addr = evmc::literals::operator""_address(
+      "0000000000000000000000000000000000000008");
+  const std::array<uint8_t, 1> Input = {0};
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 100000;
+  Msg.recipient = Addr;
+  Msg.code_address = Addr;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_CANCUN);
+  EXPECT_EQ(Result.status_code, EVMC_FAILURE);
 }
 
 TEST(EVMPrecompiles, Sha256ReturnsDigestAndChargesWordGas) {
