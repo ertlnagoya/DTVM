@@ -488,8 +488,7 @@ inline bool bn254DeserializeFp(mclBnFp *X, const uint8_t *Buf) noexcept {
 }
 
 inline bool bn254SerializeFp(uint8_t *Buf, const mclBnFp *X) noexcept {
-  return mclBnFp_getStr(reinterpret_cast<char *>(Buf), 32, X,
-                        MCLBN_IO_SERIALIZE | MCLBN_IO_BIG_ENDIAN) == 32;
+  return mclBnFp_serialize(Buf, 32, X) == 32;
 }
 
 inline bool bn254DeserializeG1(mclBnG1 *P, const uint8_t *Buf) noexcept {
