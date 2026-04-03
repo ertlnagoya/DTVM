@@ -80,7 +80,6 @@ if(ZEN_ENABLE_SPEC_TEST)
       target_compile_definitions(evmHostTests PRIVATE ZEN_HAS_C_KZG=1)
       target_compile_definitions(solidityContractTests PRIVATE ZEN_HAS_C_KZG=1)
       target_compile_definitions(evmStateTests PRIVATE ZEN_HAS_C_KZG=1)
-      target_compile_definitions(evmInterpTests PRIVATE ZEN_HAS_C_KZG=1)
     endif()
     target_compile_definitions(
       evmHostTests
