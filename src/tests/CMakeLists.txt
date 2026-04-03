@@ -75,6 +75,12 @@ if(ZEN_ENABLE_SPEC_TEST)
     )
     add_executable(mptCompareCpp mpt_compare_cpp.cpp)
     set(ZEN_EVM_TEST_OPTIONAL_LIBS)
+    if(TARGET mcl::mclbn256)
+      list(APPEND ZEN_EVM_TEST_OPTIONAL_LIBS mcl::mclbn256)
+      target_compile_definitions(evmHostTests PRIVATE ZEN_HAS_BN254=1)
+      target_compile_definitions(solidityContractTests PRIVATE ZEN_HAS_BN254=1)
+      target_compile_definitions(evmStateTests PRIVATE ZEN_HAS_BN254=1)
+    endif()
     if(TARGET c_kzg_4844)
       list(APPEND ZEN_EVM_TEST_OPTIONAL_LIBS c_kzg_4844)
       target_compile_definitions(evmHostTests PRIVATE ZEN_HAS_C_KZG=1)
@@ -135,7 +141,12 @@ if(ZEN_ENABLE_SPEC_TEST)
       if(ZEN_ENABLE_EVM)
         target_link_libraries(
           evmInterpTests
-          PRIVATE dtvmcore rapidjson yaml-cpp gtest_main -fsanitize=address
+          PRIVATE dtvmcore
+                  rapidjson
+                  yaml-cpp
+                  gtest_main
+                  OpenSSL::Crypto
+                  -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
         target_link_libraries(
@@ -145,7 +156,6 @@ if(ZEN_ENABLE_SPEC_TEST)
                   yaml-cpp
                   gtest_main
                   OpenSSL::Crypto
-                  mcl::mclbn256
                   ${ZEN_EVM_TEST_OPTIONAL_LIBS}
                   -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -157,7 +167,6 @@ if(ZEN_ENABLE_SPEC_TEST)
                   mpt
                   gtest_main
                   OpenSSL::Crypto
-                  mcl::mclbn256
                   ${ZEN_EVM_TEST_OPTIONAL_LIBS}
                   -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -169,7 +178,6 @@ if(ZEN_ENABLE_SPEC_TEST)
                   mpt
                   gtest_main
                   OpenSSL::Crypto
-                  mcl::mclbn256
                   ${ZEN_EVM_TEST_OPTIONAL_LIBS}
                   -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -197,6 +205,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   rapidjson
                   yaml-cpp
                   gtest_main
+                  OpenSSL::Crypto
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -208,7 +217,6 @@ if(ZEN_ENABLE_SPEC_TEST)
                   yaml-cpp
                   gtest_main
                   OpenSSL::Crypto
-                  mcl::mclbn256
                   ${ZEN_EVM_TEST_OPTIONAL_LIBS}
                   -fsanitize=address
                   -static-libasan
@@ -222,7 +230,6 @@ if(ZEN_ENABLE_SPEC_TEST)
                   gtest_main
                   CLI11::CLI11
                   OpenSSL::Crypto
-                  mcl::mclbn256
                   ${ZEN_EVM_TEST_OPTIONAL_LIBS}
                   -fsanitize=address
                   -static-libasan
@@ -235,7 +242,6 @@ if(ZEN_ENABLE_SPEC_TEST)
                   mpt
                   gtest_main
                   OpenSSL::Crypto
-                  mcl::mclbn256
                   ${ZEN_EVM_TEST_OPTIONAL_LIBS}
                   -fsanitize=address
                   -static-libasan
@@ -262,7 +268,7 @@ if(ZEN_ENABLE_SPEC_TEST)
     if(ZEN_ENABLE_EVM)
       target_link_libraries(
         evmInterpTests
-        PRIVATE dtvmcore rapidjson yaml-cpp gtest_main
+        PRIVATE dtvmcore rapidjson yaml-cpp gtest_main OpenSSL::Crypto
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(
@@ -272,7 +278,6 @@ if(ZEN_ENABLE_SPEC_TEST)
                 yaml-cpp
                 gtest_main
                 OpenSSL::Crypto
-                mcl::mclbn256
                 ${ZEN_EVM_TEST_OPTIONAL_LIBS}
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
@@ -284,7 +289,6 @@ if(ZEN_ENABLE_SPEC_TEST)
                 gtest_main
                 CLI11::CLI11
                 OpenSSL::Crypto
-                mcl::mclbn256
                 ${ZEN_EVM_TEST_OPTIONAL_LIBS}
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
@@ -295,7 +299,6 @@ if(ZEN_ENABLE_SPEC_TEST)
                 mpt
                 gtest_main
                 OpenSSL::Crypto
-                mcl::mclbn256
                 ${ZEN_EVM_TEST_OPTIONAL_LIBS}
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )

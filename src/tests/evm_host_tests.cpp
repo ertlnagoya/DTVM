@@ -172,6 +172,9 @@ EcRecoverFixture buildEcRecoverFixture() {
 
 Bn254Fixture buildBn254Fixture() {
   Bn254Fixture Fixture;
+#ifndef ZEN_HAS_BN254
+  return Fixture;
+#else
   if (!zen::evm::precompile::ensureBn254Initialized()) {
     return Fixture;
   }
@@ -198,6 +201,7 @@ Bn254Fixture buildBn254Fixture() {
   }
   Fixture.Valid = true;
   return Fixture;
+#endif
 }
 
 KzgPointEvaluationFixture buildKzgPointEvaluationFixture() {
@@ -224,7 +228,8 @@ KzgPointEvaluationFixture buildKzgPointEvaluationFixture() {
     return Fixture;
   }
 
-  zen::evm::precompile::kzgToVersionedHash(Fixture.Input.data(), Commitment);
+  zen::evm::precompile::kzgToVersionedHash(Fixture.Input.data(),
+                                           Commitment.bytes);
   std::memcpy(Fixture.Input.data() + 32, Z.bytes, sizeof(Z.bytes));
   std::memcpy(Fixture.Input.data() + 64, Y.bytes, sizeof(Y.bytes));
   std::memcpy(Fixture.Input.data() + 96, Commitment.bytes,
@@ -1183,6 +1188,9 @@ TEST(EVMPrecompiles, EcRecoverRejectsInvalidRecoveryId) {
 }
 
 TEST(EVMPrecompiles, Bn256AddReturnsExpectedPointAndChargesForkGas) {
+#ifndef ZEN_HAS_BN254
+  GTEST_SKIP() << "BN254 backend is not available in this build";
+#endif
   const auto Fixture = buildBn254Fixture();
   ASSERT_TRUE(Fixture.Valid);
 
@@ -1217,6 +1225,9 @@ TEST(EVMPrecompiles, Bn256AddReturnsExpectedPointAndChargesForkGas) {
 }
 
 TEST(EVMPrecompiles, Bn256MulReturnsExpectedPointAndChargesIstanbulGas) {
+#ifndef ZEN_HAS_BN254
+  GTEST_SKIP() << "BN254 backend is not available in this build";
+#endif
   const auto Fixture = buildBn254Fixture();
   ASSERT_TRUE(Fixture.Valid);
 
@@ -1254,6 +1265,9 @@ TEST(EVMPrecompiles, Bn256MulReturnsExpectedPointAndChargesIstanbulGas) {
 }
 
 TEST(EVMPrecompiles, Bn256PairingChecksProductEqualsOne) {
+#ifndef ZEN_HAS_BN254
+  GTEST_SKIP() << "BN254 backend is not available in this build";
+#endif
   const auto Fixture = buildBn254Fixture();
   ASSERT_TRUE(Fixture.Valid);
 
@@ -1289,6 +1303,9 @@ TEST(EVMPrecompiles, Bn256PairingChecksProductEqualsOne) {
 }
 
 TEST(EVMPrecompiles, Bn256PairingRejectsInvalidLength) {
+#ifndef ZEN_HAS_BN254
+  GTEST_SKIP() << "BN254 backend is not available in this build";
+#endif
   const evmc::address Addr = evmc::literals::operator""_address(
       "0000000000000000000000000000000000000008");
   const std::array<uint8_t, 1> Input = {0};

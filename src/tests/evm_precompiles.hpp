@@ -14,7 +14,9 @@
 #ifdef ZEN_HAS_C_KZG
 #include <ckzg.h>
 #endif
+#ifdef ZEN_HAS_BN254
 #include <mcl/bn.h>
+#endif
 #ifndef MCLBN_IO_SERIALIZE
 #define MCLBN_IO_SERIALIZE 512
 #endif
@@ -430,6 +432,8 @@ inline evmc::Result executeEcRecover(const evmc_message &Msg,
                       ReturnData.data(), ReturnData.size());
 }
 
+#ifdef ZEN_HAS_BN254
+
 inline bool ensureBn254Initialized() noexcept {
   static const bool Initialized = []() {
     const int Ret = mclBn_init(MCL_BN_SNARK1, MCLBN_COMPILED_TIME_VAR);
@@ -548,6 +552,12 @@ inline bool bn254SerializePairingResult(uint8_t *Buf, bool Success) noexcept {
   return true;
 }
 
+#else
+
+inline bool ensureBn254Initialized() noexcept { return false; }
+
+#endif
+
 inline void kzgToVersionedHash(uint8_t *Out,
                                const uint8_t *CommitmentBytes) noexcept {
   uint8_t Digest[SHA256_DIGEST_LENGTH];
@@ -618,7 +628,7 @@ executeKzgPointEvaluation(const evmc_message &Msg,
   std::memcpy(Proof.bytes, Input + 144, sizeof(Proof.bytes));
 
   Bytes32 ExpectedVersionedHash{};
-  kzgToVersionedHash(ExpectedVersionedHash.bytes, Commitment);
+  kzgToVersionedHash(ExpectedVersionedHash.bytes, Commitment.bytes);
   if (std::memcmp(ExpectedVersionedHash.bytes, VersionedHash.bytes,
                   sizeof(VersionedHash.bytes)) != 0) {
     ReturnData.clear();
@@ -692,6 +702,12 @@ inline evmc::Result executeRipemd160(const evmc_message &Msg,
 inline evmc::Result executeBn256Add(const evmc_message &Msg,
                                     evmc_revision Revision,
                                     std::vector<uint8_t> &ReturnData) {
+#ifndef ZEN_HAS_BN254
+  (void)Msg;
+  (void)Revision;
+  ReturnData.clear();
+  return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+#else
   const uint64_t GasCost = bn256AddGasCost(Revision);
   const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
   if (GasCost > MsgGas || !ensureBn254Initialized()) {
@@ -718,11 +734,18 @@ inline evmc::Result executeBn256Add(const evmc_message &Msg,
   }
   return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
                       ReturnData.data(), ReturnData.size());
+#endif
 }
 
 inline evmc::Result executeBn256Mul(const evmc_message &Msg,
                                     evmc_revision Revision,
                                     std::vector<uint8_t> &ReturnData) {
+#ifndef ZEN_HAS_BN254
+  (void)Msg;
+  (void)Revision;
+  ReturnData.clear();
+  return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+#else
   const uint64_t GasCost = bn256MulGasCost(Revision);
   const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
   if (GasCost > MsgGas || !ensureBn254Initialized()) {
@@ -750,11 +773,18 @@ inline evmc::Result executeBn256Mul(const evmc_message &Msg,
   }
   return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
                       ReturnData.data(), ReturnData.size());
+#endif
 }
 
 inline evmc::Result executeBn256Pairing(const evmc_message &Msg,
                                         evmc_revision Revision,
                                         std::vector<uint8_t> &ReturnData) {
+#ifndef ZEN_HAS_BN254
+  (void)Msg;
+  (void)Revision;
+  ReturnData.clear();
+  return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+#else
   const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
   if (!ensureBn254Initialized()) {
     ReturnData.clear();
@@ -793,6 +823,7 @@ inline evmc::Result executeBn256Pairing(const evmc_message &Msg,
   bn254SerializePairingResult(ReturnData.data(), mclBnGT_isOne(&Acc) == 1);
   return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
                       ReturnData.data(), ReturnData.size());
+#endif
 }
 
 inline intx::uint256 loadUint256Padded(const uint8_t *Data, size_t Size,
