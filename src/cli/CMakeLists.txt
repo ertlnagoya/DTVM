@@ -10,7 +10,9 @@ target_link_libraries(dtvm PRIVATE dtvmcore CLI11::CLI11)
 
 if(ZEN_ENABLE_EVM)
   target_link_libraries(
-    dtvm PRIVATE OpenSSL::Crypto PUBLIC evmc::evmc evmc::instructions
+    dtvm
+    PRIVATE OpenSSL::Crypto
+    PUBLIC evmc::evmc evmc::instructions
   )
   if(TARGET mcl::mclbn256)
     target_link_libraries(dtvm PRIVATE mcl::mclbn256)
