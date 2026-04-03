@@ -483,8 +483,7 @@ inline void copyPaddedInput(std::vector<uint8_t> &Dst, const evmc_message &Msg,
 }
 
 inline bool bn254DeserializeFp(mclBnFp *X, const uint8_t *Buf) noexcept {
-  return mclBnFp_setStr(X, reinterpret_cast<const char *>(Buf), 32,
-                        MCLBN_IO_SERIALIZE | MCLBN_IO_BIG_ENDIAN) == 0;
+  return mclBnFp_deserialize(X, Buf, 32) == 32;
 }
 
 inline bool bn254SerializeFp(uint8_t *Buf, const mclBnFp *X) noexcept {
