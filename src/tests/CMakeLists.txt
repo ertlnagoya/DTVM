@@ -1,6 +1,10 @@
 # Copyright (C) 2021-2025 the DTVM authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+if(ZEN_ENABLE_EVM)
+  find_package(OpenSSL REQUIRED)
+endif()
+
 function(PROCESS_SPEC_FILES SPEC_CATEGORY_DIR)
   get_filename_component(CATEGORY ${SPEC_CATEGORY_DIR} NAME)
   file(GLOB SPEC_FILE_PATHS "${SPEC_CATEGORY_DIR}/*.wast")
@@ -70,6 +74,31 @@ if(ZEN_ENABLE_SPEC_TEST)
                     evm_test_fixtures.cpp evm_test_helpers.cpp
     )
     add_executable(mptCompareCpp mpt_compare_cpp.cpp)
+    set(ZEN_EVM_TEST_OPTIONAL_LIBS)
+    if(TARGET mcl::mclbn256)
+      list(APPEND ZEN_EVM_TEST_OPTIONAL_LIBS mcl::mclbn256)
+      target_compile_definitions(evmHostTests PRIVATE ZEN_HAS_BN254=1)
+      target_compile_definitions(solidityContractTests PRIVATE ZEN_HAS_BN254=1)
+      target_compile_definitions(evmStateTests PRIVATE ZEN_HAS_BN254=1)
+    endif()
+    if(TARGET c_kzg_4844)
+      list(APPEND ZEN_EVM_TEST_OPTIONAL_LIBS c_kzg_4844)
+      target_compile_definitions(evmHostTests PRIVATE ZEN_HAS_C_KZG=1)
+      target_compile_definitions(solidityContractTests PRIVATE ZEN_HAS_C_KZG=1)
+      target_compile_definitions(evmStateTests PRIVATE ZEN_HAS_C_KZG=1)
+    endif()
+    target_compile_definitions(
+      evmHostTests
+      PRIVATE ZEN_C_KZG_TRUSTED_SETUP_PATH="${ZEN_C_KZG_TRUSTED_SETUP_PATH}"
+    )
+    target_compile_definitions(
+      solidityContractTests
+      PRIVATE ZEN_C_KZG_TRUSTED_SETUP_PATH="${ZEN_C_KZG_TRUSTED_SETUP_PATH}"
+    )
+    target_compile_definitions(
+      evmStateTests
+      PRIVATE ZEN_C_KZG_TRUSTED_SETUP_PATH="${ZEN_C_KZG_TRUSTED_SETUP_PATH}"
+    )
   else()
     add_executable(
       specUnitTests spec_unit_tests.cpp spectest.cpp test_utils.cpp
@@ -112,22 +141,45 @@ if(ZEN_ENABLE_SPEC_TEST)
       if(ZEN_ENABLE_EVM)
         target_link_libraries(
           evmInterpTests
-          PRIVATE dtvmcore rapidjson yaml-cpp gtest_main -fsanitize=address
+          PRIVATE dtvmcore
+                  rapidjson
+                  yaml-cpp
+                  gtest_main
+                  OpenSSL::Crypto
+                  -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
         target_link_libraries(
           evmHostTests
-          PRIVATE dtvmcore rapidjson yaml-cpp gtest_main -fsanitize=address
+          PRIVATE dtvmcore
+                  rapidjson
+                  yaml-cpp
+                  gtest_main
+                  OpenSSL::Crypto
+                  ${ZEN_EVM_TEST_OPTIONAL_LIBS}
+                  -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
         target_link_libraries(
           solidityContractTests
-          PRIVATE dtvmcore rapidjson mpt gtest_main -fsanitize=address
+          PRIVATE dtvmcore
+                  rapidjson
+                  mpt
+                  gtest_main
+                  OpenSSL::Crypto
+                  ${ZEN_EVM_TEST_OPTIONAL_LIBS}
+                  -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
         target_link_libraries(
           evmStateTests
-          PRIVATE dtvmcore rapidjson mpt gtest_main -fsanitize=address
+          PRIVATE dtvmcore
+                  rapidjson
+                  mpt
+                  gtest_main
+                  OpenSSL::Crypto
+                  ${ZEN_EVM_TEST_OPTIONAL_LIBS}
+                  -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
         target_link_libraries(
@@ -153,6 +205,7 @@ if(ZEN_ENABLE_SPEC_TEST)
                   rapidjson
                   yaml-cpp
                   gtest_main
+                  OpenSSL::Crypto
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -163,6 +216,8 @@ if(ZEN_ENABLE_SPEC_TEST)
                   rapidjson
                   yaml-cpp
                   gtest_main
+                  OpenSSL::Crypto
+                  ${ZEN_EVM_TEST_OPTIONAL_LIBS}
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -174,6 +229,8 @@ if(ZEN_ENABLE_SPEC_TEST)
                   mpt
                   gtest_main
                   CLI11::CLI11
+                  OpenSSL::Crypto
+                  ${ZEN_EVM_TEST_OPTIONAL_LIBS}
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -184,6 +241,8 @@ if(ZEN_ENABLE_SPEC_TEST)
                   rapidjson
                   mpt
                   gtest_main
+                  OpenSSL::Crypto
+                  ${ZEN_EVM_TEST_OPTIONAL_LIBS}
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -209,22 +268,38 @@ if(ZEN_ENABLE_SPEC_TEST)
     if(ZEN_ENABLE_EVM)
       target_link_libraries(
         evmInterpTests
-        PRIVATE dtvmcore rapidjson yaml-cpp gtest_main
+        PRIVATE dtvmcore rapidjson yaml-cpp gtest_main OpenSSL::Crypto
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(
         evmHostTests
-        PRIVATE dtvmcore rapidjson yaml-cpp gtest_main
+        PRIVATE dtvmcore
+                rapidjson
+                yaml-cpp
+                gtest_main
+                OpenSSL::Crypto
+                ${ZEN_EVM_TEST_OPTIONAL_LIBS}
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(
         solidityContractTests
-        PRIVATE dtvmcore rapidjson mpt gtest_main CLI11::CLI11
+        PRIVATE dtvmcore
+                rapidjson
+                mpt
+                gtest_main
+                CLI11::CLI11
+                OpenSSL::Crypto
+                ${ZEN_EVM_TEST_OPTIONAL_LIBS}
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(
         evmStateTests
-        PRIVATE dtvmcore rapidjson mpt gtest_main
+        PRIVATE dtvmcore
+                rapidjson
+                mpt
+                gtest_main
+                OpenSSL::Crypto
+                ${ZEN_EVM_TEST_OPTIONAL_LIBS}
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(mptCompareCpp PRIVATE dtvmcore rapidjson mpt)

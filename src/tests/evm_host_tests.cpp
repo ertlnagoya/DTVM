@@ -6,10 +6,15 @@
 #include "host/evm/crypto.h"
 #include "utils/evm.h"
 
+#include <array>
 #include <filesystem>
 #include <gtest/gtest.h>
 #include <intx/intx.hpp>
 #include <limits>
+#include <openssl/bn.h>
+#include <openssl/ec.h>
+#include <openssl/ecdsa.h>
+#include <openssl/obj_mac.h>
 #include <optional>
 
 using namespace zen;
@@ -43,6 +48,9 @@ struct RuntimeExecutionObservation {
   AccountMap Accounts;
 };
 
+evmc::Result runDirectPrecompileCall(const evmc_message &Msg,
+                                     evmc_revision Revision);
+
 std::string returnSingleContextOpcode(uint8_t Opcode) {
   return zen::utils::toHex(&Opcode, 1) + "60005260206000f3";
 }
@@ -55,6 +63,210 @@ bool hexEqualsIgnoreCase(const std::string &Hex1, const std::string &Hex2) {
     return Value;
   };
   return Normalize(Hex1) == Normalize(Hex2);
+}
+
+struct EcRecoverFixture {
+  std::array<uint8_t, 128> Input = {};
+  std::string ExpectedHex;
+  bool Valid = false;
+};
+
+struct Bn254Fixture {
+  std::array<uint8_t, 64> G1 = {};
+  std::array<uint8_t, 128> G2 = {};
+  bool Valid = false;
+};
+
+struct KzgPointEvaluationFixture {
+  std::array<uint8_t, 192> Input = {};
+  std::array<uint8_t, 64> ExpectedOutput = {};
+  bool Valid = false;
+};
+
+EcRecoverFixture buildEcRecoverFixture() {
+  EcRecoverFixture Fixture;
+
+  using BNPtr = std::unique_ptr<BIGNUM, decltype(&BN_free)>;
+  using ECKeyPtr = std::unique_ptr<EC_KEY, decltype(&EC_KEY_free)>;
+  using ECPointPtr = std::unique_ptr<EC_POINT, decltype(&EC_POINT_free)>;
+  using ECDSASigPtr = std::unique_ptr<ECDSA_SIG, decltype(&ECDSA_SIG_free)>;
+
+  ECKeyPtr Key(EC_KEY_new_by_curve_name(NID_secp256k1), &EC_KEY_free);
+  if (!Key) {
+    return Fixture;
+  }
+  const EC_GROUP *Group = EC_KEY_get0_group(Key.get());
+  if (!Group) {
+    return Fixture;
+  }
+
+  BNPtr PrivKey(BN_new(), &BN_free);
+  ECPointPtr PubKey(EC_POINT_new(Group), &EC_POINT_free);
+  if (!PrivKey || !PubKey || BN_set_word(PrivKey.get(), 1) != 1 ||
+      EC_POINT_mul(Group, PubKey.get(), PrivKey.get(), nullptr, nullptr,
+                   nullptr) != 1 ||
+      EC_KEY_set_private_key(Key.get(), PrivKey.get()) != 1 ||
+      EC_KEY_set_public_key(Key.get(), PubKey.get()) != 1) {
+    return Fixture;
+  }
+
+  std::array<uint8_t, 32> MsgHash = {};
+  for (size_t I = 0; I < MsgHash.size(); ++I) {
+    MsgHash[I] = static_cast<uint8_t>(I + 1);
+  }
+
+  ECDSASigPtr Sig(ECDSA_do_sign(MsgHash.data(), MsgHash.size(), Key.get()),
+                  &ECDSA_SIG_free);
+  if (!Sig) {
+    return Fixture;
+  }
+  const BIGNUM *R = nullptr;
+  const BIGNUM *S = nullptr;
+  ECDSA_SIG_get0(Sig.get(), &R, &S);
+  if (!R || !S || BN_bn2binpad(R, Fixture.Input.data() + 64, 32) != 32 ||
+      BN_bn2binpad(S, Fixture.Input.data() + 96, 32) != 32) {
+    return Fixture;
+  }
+  std::memcpy(Fixture.Input.data(), MsgHash.data(), MsgHash.size());
+
+  std::array<uint8_t, 65> EncodedPubKey = {};
+  if (EC_POINT_point2oct(Group, PubKey.get(), POINT_CONVERSION_UNCOMPRESSED,
+                         EncodedPubKey.data(), EncodedPubKey.size(),
+                         nullptr) != EncodedPubKey.size()) {
+    return Fixture;
+  }
+  std::vector<uint8_t> PubKeyBytes(EncodedPubKey.begin() + 1,
+                                   EncodedPubKey.end());
+  const auto AddressHash = zen::host::evm::crypto::keccak256(PubKeyBytes);
+  std::array<uint8_t, 32> ExpectedOutput = {};
+  std::memcpy(ExpectedOutput.data() + 12, AddressHash.data() + 12, 20);
+  Fixture.ExpectedHex =
+      "0x" + zen::utils::toHex(ExpectedOutput.data(), ExpectedOutput.size());
+
+  const evmc::address EcRecoverAddr = evmc::literals::operator""_address(
+      "0000000000000000000000000000000000000001");
+  for (uint8_t V : {uint8_t(27), uint8_t(28)}) {
+    Fixture.Input[63] = V;
+    evmc_message Msg{};
+    Msg.kind = EVMC_CALL;
+    Msg.gas = 5000;
+    Msg.recipient = EcRecoverAddr;
+    Msg.code_address = EcRecoverAddr;
+    Msg.input_data = Fixture.Input.data();
+    Msg.input_size = Fixture.Input.size();
+
+    auto Result = runDirectPrecompileCall(Msg, EVMC_CANCUN);
+    if (Result.status_code == EVMC_SUCCESS && Result.output_size == 32 &&
+        hexEqualsIgnoreCase(
+            "0x" + zen::utils::toHex(
+                       static_cast<const uint8_t *>(Result.output_data),
+                       Result.output_size),
+            Fixture.ExpectedHex)) {
+      Fixture.Valid = true;
+      return Fixture;
+    }
+  }
+
+  return Fixture;
+}
+
+Bn254Fixture buildBn254Fixture() {
+  Bn254Fixture Fixture;
+#ifndef ZEN_HAS_BN254
+  return Fixture;
+#else
+  if (!zen::evm::precompile::ensureBn254Initialized()) {
+    return Fixture;
+  }
+
+  mclBnG1 P1;
+  mclBnG2 P2;
+  const char *P1Str = "1 1 2";
+  const char *P2Str = "1 "
+                      "10857046999023057135944570762232829481370756359578518086"
+                      "990519993285655852781 "
+                      "11559732032986387107991004021392285783925812861821192530"
+                      "917403151452391805634 "
+                      "84956539231234314176049732474892724384181905872636001487"
+                      "70280649306958101930 "
+                      "40823678758634336813322034031454355683168513275934012081"
+                      "05741076214120093531";
+  if (mclBnG1_setStr(&P1, P1Str, std::strlen(P1Str), 0) != 0 ||
+      mclBnG2_setStr(&P2, P2Str, std::strlen(P2Str), 0) != 0) {
+    return Fixture;
+  }
+  if (!zen::evm::precompile::bn254SerializeG1(Fixture.G1.data(), &P1) ||
+      !zen::evm::precompile::bn254SerializeG2(Fixture.G2.data(), &P2)) {
+    return Fixture;
+  }
+  Fixture.Valid = true;
+  return Fixture;
+#endif
+}
+
+KzgPointEvaluationFixture buildKzgPointEvaluationFixture() {
+  KzgPointEvaluationFixture Fixture;
+#ifndef ZEN_HAS_C_KZG
+  return Fixture;
+#else
+  KZGSettings *Settings = zen::evm::precompile::getKzgSettings();
+  if (Settings == nullptr) {
+    return Fixture;
+  }
+
+  Blob BlobValue{};
+  BlobValue.bytes[31] = 5;
+  BlobValue.bytes[63] = 9;
+
+  Bytes32 Z{};
+  Z.bytes[31] = 7;
+  Bytes32 Y{};
+  KZGCommitment Commitment{};
+  KZGProof Proof{};
+  if (blob_to_kzg_commitment(&Commitment, &BlobValue, Settings) != C_KZG_OK ||
+      compute_kzg_proof(&Proof, &Y, &BlobValue, &Z, Settings) != C_KZG_OK) {
+    return Fixture;
+  }
+
+  zen::evm::precompile::kzgToVersionedHash(Fixture.Input.data(),
+                                           Commitment.bytes);
+  std::memcpy(Fixture.Input.data() + 32, Z.bytes, sizeof(Z.bytes));
+  std::memcpy(Fixture.Input.data() + 64, Y.bytes, sizeof(Y.bytes));
+  std::memcpy(Fixture.Input.data() + 96, Commitment.bytes,
+              sizeof(Commitment.bytes));
+  std::memcpy(Fixture.Input.data() + 144, Proof.bytes, sizeof(Proof.bytes));
+
+  Fixture.ExpectedOutput[30] = 0x10;
+  Fixture.ExpectedOutput[31] = 0x00;
+  static constexpr std::array<uint8_t, 32> BlsModulus = {
+      0x73, 0xed, 0xa7, 0x53, 0x29, 0x9d, 0x7d, 0x48, 0x33, 0x39, 0xd8,
+      0x08, 0x09, 0xa1, 0xd8, 0x05, 0x53, 0xbd, 0xa4, 0x02, 0xff, 0xfe,
+      0x5b, 0xfe, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01};
+  std::memcpy(Fixture.ExpectedOutput.data() + 32, BlsModulus.data(),
+              BlsModulus.size());
+  Fixture.Valid = true;
+  return Fixture;
+#endif
+}
+
+evmc::Result runDirectPrecompileCall(const evmc_message &Msg,
+                                     evmc_revision Revision) {
+  RuntimeConfig Config;
+  Config.Mode = common::RunMode::InterpMode;
+  Config.EnableEvmGasMetering = true;
+
+  auto Host = std::make_unique<ZenMockedEVMHost>();
+  auto RT = Runtime::newEVMRuntime(Config, Host.get());
+  EXPECT_TRUE(RT != nullptr);
+  if (!RT) {
+    return {};
+  }
+  Host->setRuntime(RT.get());
+  Host->setRevision(Revision);
+
+  evmc_tx_context TxContext{};
+  Host->loadInitialState(TxContext, {}, true);
+  return Host->call(Msg);
 }
 
 evmc::Result runContextOpcodeScenario(
@@ -898,4 +1110,385 @@ TEST(EVMCallSemantics, CallForwardsUsableGasAndReturnsReturndata) {
       zen::utils::toHex(Observation.Result.output_data,
                         Observation.Result.output_size),
       "0000000000000000000000000000000000000000000000000000000000000000"));
+}
+
+TEST(EVMPrecompiles, IdentityReturnsInputAndChargesWordGas) {
+  const evmc::address Identity =
+      parseAddress("0x0000000000000000000000000000000000000004");
+  const std::array<uint8_t, 40> Input = {
+      0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+      0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
+      0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+      0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27};
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 100;
+  Msg.recipient = Identity;
+  Msg.code_address = Identity;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_FRONTIER);
+  ASSERT_EQ(Result.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(Result.gas_left, 79);
+  EXPECT_EQ(Result.output_size, Input.size());
+  EXPECT_EQ(zen::utils::toHex(Result.output_data, Result.output_size),
+            zen::utils::toHex(Input.data(), Input.size()));
+}
+
+TEST(EVMPrecompiles, EcRecoverReturnsRecoveredAddressAndChargesFixedGas) {
+  const auto Fixture = buildEcRecoverFixture();
+  ASSERT_TRUE(Fixture.Valid);
+
+  const evmc::address EcRecoverAddr = evmc::literals::operator""_address(
+      "0000000000000000000000000000000000000001");
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 5000;
+  Msg.recipient = EcRecoverAddr;
+  Msg.code_address = EcRecoverAddr;
+  Msg.input_data = Fixture.Input.data();
+  Msg.input_size = Fixture.Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_CANCUN);
+  EXPECT_EQ(Result.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(Result.gas_left, 2000);
+  ASSERT_EQ(Result.output_size, 32);
+
+  const auto Output =
+      "0x" + zen::utils::toHex(static_cast<const uint8_t *>(Result.output_data),
+                               Result.output_size);
+  EXPECT_TRUE(hexEqualsIgnoreCase(Output, Fixture.ExpectedHex));
+}
+
+TEST(EVMPrecompiles, EcRecoverRejectsInvalidRecoveryId) {
+  const auto Fixture = buildEcRecoverFixture();
+  ASSERT_TRUE(Fixture.Valid);
+
+  const evmc::address EcRecoverAddr = evmc::literals::operator""_address(
+      "0000000000000000000000000000000000000001");
+
+  auto InvalidInput = Fixture.Input;
+  InvalidInput[63] = 29;
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 5000;
+  Msg.recipient = EcRecoverAddr;
+  Msg.code_address = EcRecoverAddr;
+  Msg.input_data = InvalidInput.data();
+  Msg.input_size = InvalidInput.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_CANCUN);
+  EXPECT_EQ(Result.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(Result.gas_left, 2000);
+  EXPECT_EQ(Result.output_size, 0);
+}
+
+TEST(EVMPrecompiles, Bn256AddReturnsExpectedPointAndChargesForkGas) {
+#ifndef ZEN_HAS_BN254
+  GTEST_SKIP() << "BN254 backend is not available in this build";
+#endif
+  const auto Fixture = buildBn254Fixture();
+  ASSERT_TRUE(Fixture.Valid);
+
+  std::array<uint8_t, 128> Input = {};
+  std::memcpy(Input.data(), Fixture.G1.data(), Fixture.G1.size());
+  std::memcpy(Input.data() + 64, Fixture.G1.data(), Fixture.G1.size());
+
+  const evmc::address Addr = evmc::literals::operator""_address(
+      "0000000000000000000000000000000000000006");
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 1000;
+  Msg.recipient = Addr;
+  Msg.code_address = Addr;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_BYZANTIUM);
+  EXPECT_EQ(Result.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(Result.gas_left, 500);
+  ASSERT_EQ(Result.output_size, 64);
+
+  mclBnG1 P1;
+  mclBnG1 Sum;
+  ASSERT_TRUE(zen::evm::precompile::bn254DeserializeG1(&P1, Fixture.G1.data()));
+  mclBnG1_add(&Sum, &P1, &P1);
+  std::array<uint8_t, 64> Expected = {};
+  ASSERT_TRUE(zen::evm::precompile::bn254SerializeG1(Expected.data(), &Sum));
+  EXPECT_EQ(std::memcmp(Result.output_data, Expected.data(), Expected.size()),
+            0);
+}
+
+TEST(EVMPrecompiles, Bn256MulReturnsExpectedPointAndChargesIstanbulGas) {
+#ifndef ZEN_HAS_BN254
+  GTEST_SKIP() << "BN254 backend is not available in this build";
+#endif
+  const auto Fixture = buildBn254Fixture();
+  ASSERT_TRUE(Fixture.Valid);
+
+  std::array<uint8_t, 96> Input = {};
+  std::memcpy(Input.data(), Fixture.G1.data(), Fixture.G1.size());
+  Input[95] = 2;
+
+  const evmc::address Addr = evmc::literals::operator""_address(
+      "0000000000000000000000000000000000000007");
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 7000;
+  Msg.recipient = Addr;
+  Msg.code_address = Addr;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_ISTANBUL);
+  EXPECT_EQ(Result.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(Result.gas_left, 1000);
+  ASSERT_EQ(Result.output_size, 64);
+
+  mclBnG1 P1;
+  mclBnG1 Product;
+  mclBnFr Scalar;
+  ASSERT_TRUE(zen::evm::precompile::bn254DeserializeG1(&P1, Fixture.G1.data()));
+  mclBnFr_setInt32(&Scalar, 2);
+  mclBnG1_mul(&Product, &P1, &Scalar);
+  std::array<uint8_t, 64> Expected = {};
+  ASSERT_TRUE(
+      zen::evm::precompile::bn254SerializeG1(Expected.data(), &Product));
+  EXPECT_EQ(std::memcmp(Result.output_data, Expected.data(), Expected.size()),
+            0);
+}
+
+TEST(EVMPrecompiles, Bn256PairingChecksProductEqualsOne) {
+#ifndef ZEN_HAS_BN254
+  GTEST_SKIP() << "BN254 backend is not available in this build";
+#endif
+  const auto Fixture = buildBn254Fixture();
+  ASSERT_TRUE(Fixture.Valid);
+
+  std::array<uint8_t, 384> Input = {};
+  std::memcpy(Input.data(), Fixture.G1.data(), Fixture.G1.size());
+  std::memcpy(Input.data() + 64, Fixture.G2.data(), Fixture.G2.size());
+
+  mclBnG1 P1;
+  mclBnG1 NegP1;
+  ASSERT_TRUE(zen::evm::precompile::bn254DeserializeG1(&P1, Fixture.G1.data()));
+  mclBnG1_neg(&NegP1, &P1);
+  std::array<uint8_t, 64> NegG1 = {};
+  ASSERT_TRUE(zen::evm::precompile::bn254SerializeG1(NegG1.data(), &NegP1));
+  std::memcpy(Input.data() + 192, NegG1.data(), NegG1.size());
+  std::memcpy(Input.data() + 256, Fixture.G2.data(), Fixture.G2.size());
+
+  const evmc::address Addr = evmc::literals::operator""_address(
+      "0000000000000000000000000000000000000008");
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 250000;
+  Msg.recipient = Addr;
+  Msg.code_address = Addr;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_ISTANBUL);
+  EXPECT_EQ(Result.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(Result.gas_left, 137000);
+  ASSERT_EQ(Result.output_size, 32);
+  EXPECT_EQ(static_cast<const uint8_t *>(Result.output_data)[31], 1);
+}
+
+TEST(EVMPrecompiles, Bn256PairingRejectsInvalidLength) {
+#ifndef ZEN_HAS_BN254
+  GTEST_SKIP() << "BN254 backend is not available in this build";
+#endif
+  const evmc::address Addr = evmc::literals::operator""_address(
+      "0000000000000000000000000000000000000008");
+  const std::array<uint8_t, 1> Input = {0};
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 100000;
+  Msg.recipient = Addr;
+  Msg.code_address = Addr;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_CANCUN);
+  EXPECT_EQ(Result.status_code, EVMC_FAILURE);
+}
+
+TEST(EVMPrecompiles, KzgPointEvaluationReturnsBlobMetadataOnValidProof) {
+  const auto Fixture = buildKzgPointEvaluationFixture();
+#ifndef ZEN_HAS_C_KZG
+  GTEST_SKIP() << "KZG backend is not available in this build";
+#endif
+  ASSERT_TRUE(Fixture.Valid);
+
+  const evmc::address Addr = evmc::literals::operator""_address(
+      "000000000000000000000000000000000000000a");
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 60000;
+  Msg.recipient = Addr;
+  Msg.code_address = Addr;
+  Msg.input_data = Fixture.Input.data();
+  Msg.input_size = Fixture.Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_CANCUN);
+  EXPECT_EQ(Result.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(Result.gas_left, 10000);
+  ASSERT_EQ(Result.output_size, Fixture.ExpectedOutput.size());
+  EXPECT_EQ(std::memcmp(Result.output_data, Fixture.ExpectedOutput.data(),
+                        Fixture.ExpectedOutput.size()),
+            0);
+}
+
+TEST(EVMPrecompiles, KzgPointEvaluationRejectsWrongVersionedHash) {
+  auto Fixture = buildKzgPointEvaluationFixture();
+#ifndef ZEN_HAS_C_KZG
+  GTEST_SKIP() << "KZG backend is not available in this build";
+#endif
+  ASSERT_TRUE(Fixture.Valid);
+  Fixture.Input[0] ^= 0x01;
+
+  const evmc::address Addr = evmc::literals::operator""_address(
+      "000000000000000000000000000000000000000a");
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 60000;
+  Msg.recipient = Addr;
+  Msg.code_address = Addr;
+  Msg.input_data = Fixture.Input.data();
+  Msg.input_size = Fixture.Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_CANCUN);
+  EXPECT_EQ(Result.status_code, EVMC_FAILURE);
+}
+
+TEST(EVMPrecompiles, KzgPointEvaluationRejectsNonCanonicalFieldElement) {
+  auto Fixture = buildKzgPointEvaluationFixture();
+#ifndef ZEN_HAS_C_KZG
+  GTEST_SKIP() << "KZG backend is not available in this build";
+#endif
+  ASSERT_TRUE(Fixture.Valid);
+  static constexpr std::array<uint8_t, 32> BlsModulus = {
+      0x73, 0xed, 0xa7, 0x53, 0x29, 0x9d, 0x7d, 0x48, 0x33, 0x39, 0xd8,
+      0x08, 0x09, 0xa1, 0xd8, 0x05, 0x53, 0xbd, 0xa4, 0x02, 0xff, 0xfe,
+      0x5b, 0xfe, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01};
+  std::memcpy(Fixture.Input.data() + 32, BlsModulus.data(), BlsModulus.size());
+
+  const evmc::address Addr = evmc::literals::operator""_address(
+      "000000000000000000000000000000000000000a");
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 60000;
+  Msg.recipient = Addr;
+  Msg.code_address = Addr;
+  Msg.input_data = Fixture.Input.data();
+  Msg.input_size = Fixture.Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_CANCUN);
+  EXPECT_EQ(Result.status_code, EVMC_FAILURE);
+}
+
+TEST(EVMPrecompiles, Sha256ReturnsDigestAndChargesWordGas) {
+  const evmc::address Sha256 =
+      parseAddress("0x0000000000000000000000000000000000000002");
+  const std::array<uint8_t, 3> Input = {'a', 'b', 'c'};
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 100;
+  Msg.recipient = Sha256;
+  Msg.code_address = Sha256;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_FRONTIER);
+  ASSERT_EQ(Result.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(Result.gas_left, 28);
+  EXPECT_EQ(Result.output_size, 32U);
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(Result.output_data, Result.output_size),
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+}
+
+TEST(EVMPrecompiles, Ripemd160ReturnsDigestAndChargesWordGas) {
+  const evmc::address Ripemd160 =
+      parseAddress("0x0000000000000000000000000000000000000003");
+  const std::array<uint8_t, 3> Input = {'a', 'b', 'c'};
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 1000;
+  Msg.recipient = Ripemd160;
+  Msg.code_address = Ripemd160;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto Result = runDirectPrecompileCall(Msg, EVMC_FRONTIER);
+  ASSERT_EQ(Result.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(Result.gas_left, 280);
+  EXPECT_EQ(Result.output_size, 32U);
+  EXPECT_TRUE(hexEqualsIgnoreCase(
+      zen::utils::toHex(Result.output_data, Result.output_size),
+      "0000000000000000000000008eb208f7e05d987a9b044a8e98c6b087f15a0bfc"));
+}
+
+TEST(EVMPrecompiles, ModExpAvailabilityDependsOnFork) {
+  const evmc::address ModExp =
+      parseAddress("0x0000000000000000000000000000000000000005");
+  const std::array<uint8_t, 96> ZeroInput = {};
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 1000;
+  Msg.recipient = ModExp;
+  Msg.code_address = ModExp;
+  Msg.input_data = ZeroInput.data();
+  Msg.input_size = ZeroInput.size();
+
+  auto HomesteadResult = runDirectPrecompileCall(Msg, EVMC_HOMESTEAD);
+  ASSERT_EQ(HomesteadResult.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(HomesteadResult.output_size, 0U);
+  EXPECT_EQ(HomesteadResult.gas_left, Msg.gas);
+
+  auto ByzantiumResult = runDirectPrecompileCall(Msg, EVMC_BYZANTIUM);
+  ASSERT_EQ(ByzantiumResult.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(ByzantiumResult.output_size, 0U);
+  EXPECT_EQ(ByzantiumResult.gas_left, 400);
+}
+
+TEST(EVMPrecompiles, Blake2AvailabilityDependsOnFork) {
+  const evmc::address Blake2f =
+      parseAddress("0x0000000000000000000000000000000000000009");
+  std::array<uint8_t, 213> Input = {};
+  Input[3] = 0x0c;
+  Input[212] = 1;
+
+  evmc_message Msg{};
+  Msg.kind = EVMC_CALL;
+  Msg.gas = 100;
+  Msg.recipient = Blake2f;
+  Msg.code_address = Blake2f;
+  Msg.input_data = Input.data();
+  Msg.input_size = Input.size();
+
+  auto ByzantiumResult = runDirectPrecompileCall(Msg, EVMC_BYZANTIUM);
+  ASSERT_EQ(ByzantiumResult.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(ByzantiumResult.output_size, 0U);
+  EXPECT_EQ(ByzantiumResult.gas_left, Msg.gas);
+
+  auto IstanbulResult = runDirectPrecompileCall(Msg, EVMC_ISTANBUL);
+  ASSERT_EQ(IstanbulResult.status_code, EVMC_SUCCESS);
+  EXPECT_EQ(IstanbulResult.output_size, 64U);
+  EXPECT_EQ(IstanbulResult.gas_left, 88);
 }

@@ -260,6 +260,95 @@ TEST(SolidityStatePersistence, SaveLoadRoundTripPreservesContractState) {
       "000000000000000000000000000000000000000000000000000000000000002a"));
 }
 
+TEST(SolidityStatePersistence,
+     SaveLoadRoundTripPreservesAccountBalancesNoncesCodeAndStorage) {
+  RuntimeConfig Config =
+      makeInterpreterEvmConfig(SolidityContractTest::GetGlobalConfig());
+  const uint64_t GasLimit = 1000000000ULL;
+
+  SolcContractData ContractData{
+      .DeployBytecode = COUNTER_DEPLOY_HEX,
+      .RuntimeBytecode = COUNTER_RUNTIME_HEX,
+  };
+
+  EVMTestEnvironment InitialEnv(Config);
+  DeployedContract Contract =
+      deployContract(InitialEnv, "counter", ContractData, {}, {}, GasLimit);
+
+  const std::string SetCalldata = "9077ce61000000000000000000000000000000000000"
+                                  "000000000000000000000000002a";
+  evmc::Result SetResult =
+      executeContractCall(InitialEnv, Contract, SetCalldata, GasLimit);
+  ASSERT_EQ(SetResult.status_code, EVMC_SUCCESS);
+
+  auto &DeployerAccount =
+      InitialEnv.MockedHost->accounts[InitialEnv.DeployerAddr];
+  DeployerAccount.set_balance(777UL);
+
+  const evmc::address AuxiliaryAddress = evmc::literals::operator""_address(
+      "2000000000000000000000000000000000000002");
+  auto &AuxiliaryAccount = InitialEnv.MockedHost->accounts[AuxiliaryAddress];
+  AuxiliaryAccount.set_balance(123456UL);
+  AuxiliaryAccount.nonce = 9;
+  auto AuxCodeBytes = zen::utils::fromHex("6001600055");
+  ASSERT_TRUE(AuxCodeBytes.has_value());
+  AuxiliaryAccount.code =
+      evmc::bytes(AuxCodeBytes->data(), AuxCodeBytes->size());
+  const std::vector<uint8_t> AuxCodeHashVec =
+      zen::host::evm::crypto::keccak256(*AuxCodeBytes);
+  std::memcpy(AuxiliaryAccount.codehash.bytes, AuxCodeHashVec.data(), 32);
+  const evmc::bytes32 AuxStorageKey = zen::utils::parseBytes32("0x01");
+  auto &AuxStorageValue = AuxiliaryAccount.storage[AuxStorageKey];
+  AuxStorageValue.current = zen::utils::parseBytes32("0x1234");
+  AuxStorageValue.access_status = EVMC_ACCESS_WARM;
+
+  std::filesystem::path StatePath = std::filesystem::temp_directory_path() /
+                                    "dtvm_account_state_roundtrip.json";
+  ASSERT_TRUE(
+      zen::utils::saveState(*InitialEnv.MockedHost, StatePath.string()));
+
+  EVMTestEnvironment LoadedEnv(Config);
+  ASSERT_TRUE(zen::utils::loadState(*LoadedEnv.MockedHost, StatePath.string()));
+  std::filesystem::remove(StatePath);
+
+  const auto DeployerIt =
+      LoadedEnv.MockedHost->accounts.find(InitialEnv.DeployerAddr);
+  ASSERT_NE(DeployerIt, LoadedEnv.MockedHost->accounts.end());
+  EXPECT_EQ(zen::utils::toHex(DeployerIt->second.balance.bytes,
+                              sizeof(DeployerIt->second.balance.bytes)),
+            zen::utils::toHex(DeployerAccount.balance.bytes,
+                              sizeof(DeployerAccount.balance.bytes)));
+  EXPECT_EQ(DeployerIt->second.nonce, DeployerAccount.nonce);
+
+  const auto ContractIt = LoadedEnv.MockedHost->accounts.find(Contract.Address);
+  ASSERT_NE(ContractIt, LoadedEnv.MockedHost->accounts.end());
+  EXPECT_EQ(ContractIt->second.nonce, 1U);
+  EXPECT_EQ(ContractIt->second.code,
+            InitialEnv.MockedHost->accounts[Contract.Address].code);
+  EXPECT_EQ(ContractIt->second.codehash,
+            InitialEnv.MockedHost->accounts[Contract.Address].codehash);
+  const auto ContractStorageIt =
+      ContractIt->second.storage.find(zen::utils::parseBytes32("0x00"));
+  ASSERT_NE(ContractStorageIt, ContractIt->second.storage.end());
+  EXPECT_EQ(ContractStorageIt->second.current,
+            zen::utils::parseBytes32("0x2a"));
+
+  const auto AuxiliaryIt =
+      LoadedEnv.MockedHost->accounts.find(AuxiliaryAddress);
+  ASSERT_NE(AuxiliaryIt, LoadedEnv.MockedHost->accounts.end());
+  EXPECT_EQ(zen::utils::toHex(AuxiliaryIt->second.balance.bytes,
+                              sizeof(AuxiliaryIt->second.balance.bytes)),
+            zen::utils::toHex(AuxiliaryAccount.balance.bytes,
+                              sizeof(AuxiliaryAccount.balance.bytes)));
+  EXPECT_EQ(AuxiliaryIt->second.nonce, AuxiliaryAccount.nonce);
+  EXPECT_EQ(AuxiliaryIt->second.code, AuxiliaryAccount.code);
+  EXPECT_EQ(AuxiliaryIt->second.codehash, AuxiliaryAccount.codehash);
+  const auto AuxStorageIt = AuxiliaryIt->second.storage.find(AuxStorageKey);
+  ASSERT_NE(AuxStorageIt, AuxiliaryIt->second.storage.end());
+  EXPECT_EQ(AuxStorageIt->second.current, AuxStorageValue.current);
+  EXPECT_EQ(AuxStorageIt->second.access_status, EVMC_ACCESS_WARM);
+}
+
 TEST(SolidityDeployLifecycle,
      CreateProducesDeterministicAddressAndCallableCode) {
   RuntimeConfig Config = makeInterpreterEvmConfig();

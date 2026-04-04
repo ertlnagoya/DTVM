@@ -389,10 +389,34 @@ public:
         (Msg.kind == EVMC_CALLCODE || Msg.kind == EVMC_DELEGATECALL)
             ? Msg.code_address
             : Msg.recipient;
+    if (precompile::isEcRecoverPrecompile(PrecompileAddr)) {
+      return precompile::executeEcRecover(Msg, ReturnData);
+    }
+    if (precompile::isSha256Precompile(PrecompileAddr)) {
+      return precompile::executeSha256(Msg, ReturnData);
+    }
+    if (precompile::isRipemd160Precompile(PrecompileAddr)) {
+      return precompile::executeRipemd160(Msg, ReturnData);
+    }
+    if (precompile::isBn256AddPrecompile(PrecompileAddr, Revision)) {
+      return precompile::executeBn256Add(Msg, Revision, ReturnData);
+    }
+    if (precompile::isBn256MulPrecompile(PrecompileAddr, Revision)) {
+      return precompile::executeBn256Mul(Msg, Revision, ReturnData);
+    }
+    if (precompile::isBn256PairingPrecompile(PrecompileAddr, Revision)) {
+      return precompile::executeBn256Pairing(Msg, Revision, ReturnData);
+    }
+    if (precompile::isKzgPointEvaluationPrecompile(PrecompileAddr, Revision)) {
+      return precompile::executeKzgPointEvaluation(Msg, ReturnData);
+    }
+    if (precompile::isIdentityPrecompile(PrecompileAddr)) {
+      return precompile::executeIdentity(Msg, ReturnData);
+    }
     if (precompile::isBlake2bPrecompile(PrecompileAddr, Revision)) {
       return precompile::executeBlake2b(Msg, ReturnData);
     }
-    if (precompile::isModExpPrecompile(PrecompileAddr)) {
+    if (precompile::isModExpPrecompile(PrecompileAddr, Revision)) {
       return precompile::executeModExp(Msg, Revision, ReturnData);
     }
 

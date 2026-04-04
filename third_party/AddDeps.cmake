@@ -121,4 +121,84 @@ if(ZEN_ENABLE_SPEC_TEST)
   set(YAML_CPP_BUILD_CONTRIB OFF)
   set(YAML_CPP_INSTALL OFF)
   FetchContent_MakeAvailable(yaml-cpp)
+
+  if(ZEN_ENABLE_EVM)
+    FetchContent_Declare(
+      mcl
+      GIT_REPOSITORY https://github.com/herumi/mcl.git
+      GIT_TAG v1.99
+      GIT_SHALLOW TRUE
+    )
+    set(MCL_BUILD_TESTING
+        OFF
+        CACHE BOOL "" FORCE
+    )
+    set(MCL_BUILD_SAMPLE
+        OFF
+        CACHE BOOL "" FORCE
+    )
+    set(MCL_USE_GMP
+        OFF
+        CACHE BOOL "" FORCE
+    )
+    set(MCL_TEST_WITH_GMP
+        OFF
+        CACHE BOOL "" FORCE
+    )
+    set(MCL_USE_LLVM
+        OFF
+        CACHE BOOL "" FORCE
+    )
+    set(MCL_FP_BIT
+        256
+        CACHE STRING "" FORCE
+    )
+    set(MCL_FR_BIT
+        256
+        CACHE STRING "" FORCE
+    )
+    FetchContent_MakeAvailable(mcl)
+
+    FetchContent_Declare(
+      c_kzg_4844
+      GIT_REPOSITORY https://github.com/ethereum/c-kzg-4844.git
+      GIT_TAG v2.1.7
+      GIT_SHALLOW TRUE
+      GIT_SUBMODULES_RECURSE TRUE
+    )
+    FetchContent_GetProperties(c_kzg_4844)
+    if(NOT c_kzg_4844_POPULATED)
+      FetchContent_Populate(c_kzg_4844)
+    endif()
+
+    add_custom_command(
+      OUTPUT ${c_kzg_4844_SOURCE_DIR}/blst/libblst.a
+      COMMAND ${CMAKE_COMMAND} -E env CC=${CMAKE_C_COMPILER}
+              ${c_kzg_4844_SOURCE_DIR}/blst/build.sh -D__BLST_PORTABLE__
+      WORKING_DIRECTORY ${c_kzg_4844_SOURCE_DIR}/blst
+      DEPENDS ${c_kzg_4844_SOURCE_DIR}/blst/build.sh
+      VERBATIM
+    )
+    add_custom_target(
+      blst_portable_build DEPENDS ${c_kzg_4844_SOURCE_DIR}/blst/libblst.a
+    )
+    add_library(blst_portable STATIC IMPORTED GLOBAL)
+    set_target_properties(
+      blst_portable PROPERTIES IMPORTED_LOCATION
+                               ${c_kzg_4844_SOURCE_DIR}/blst/libblst.a
+    )
+    add_library(c_kzg_4844 STATIC ${c_kzg_4844_SOURCE_DIR}/src/ckzg.c)
+    target_include_directories(
+      c_kzg_4844
+      PUBLIC ${c_kzg_4844_SOURCE_DIR}/src
+             ${c_kzg_4844_SOURCE_DIR}/blst/bindings
+             ${c_kzg_4844_SOURCE_DIR}/blst/src
+    )
+    target_link_libraries(c_kzg_4844 PUBLIC blst_portable)
+    add_dependencies(c_kzg_4844 blst_portable_build)
+    set(ZEN_C_KZG_TRUSTED_SETUP_PATH
+        "${c_kzg_4844_SOURCE_DIR}/src/trusted_setup.txt"
+        CACHE INTERNAL ""
+    )
+  endif()
 endif()

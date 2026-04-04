@@ -21,6 +21,47 @@
 
 set -e
 
+remove_build_dir() {
+    local retries=0
+    while [ -d build ] && [ $retries -lt 5 ]; do
+        rm -rf build || true
+        if [ ! -d build ]; then
+            return 0
+        fi
+        retries=$((retries + 1))
+        sleep 1
+    done
+
+    if [ -d build ]; then
+        python3 - <<'PY'
+import pathlib
+import shutil
+import time
+
+path = pathlib.Path("build")
+for _ in range(5):
+    if not path.exists():
+        raise SystemExit(0)
+    shutil.rmtree(path, ignore_errors=True)
+    if not path.exists():
+        raise SystemExit(0)
+    time.sleep(1)
+raise SystemExit(1)
+PY
+    fi
+}
+
+ensure_apt_package() {
+    local package_name="$1"
+    if dpkg -s "$package_name" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y "$package_name"
+}
+
 # Convert INPUT_FORMAT to lowercase for case-insensitive comparison
 INPUT_FORMAT=${INPUT_FORMAT,,}
 
@@ -82,6 +123,10 @@ case $TestSuite in
         ;;
 esac
 
+if [[ $TestSuite == evm* ]]; then
+    ensure_apt_package libssl-dev
+fi
+
 case $CPU_EXCEPTION_TYPE in
     "cpu")
         CMAKE_OPTIONS="$CMAKE_OPTIONS -DZEN_ENABLE_CPU_EXCEPTION=ON"
@@ -109,7 +154,7 @@ if [[ ${INPUT_FORMAT} == "evm" && ${TestSuite} != "evmfocusedregressions" && ${T
 fi
 
 for STACK_TYPE in ${STACK_TYPES[@]}; do
-    rm -rf build
+    remove_build_dir
     cmake -S . -B build $CMAKE_OPTIONS_ORIGIN $STACK_TYPE
     cmake --build build -j 16
 

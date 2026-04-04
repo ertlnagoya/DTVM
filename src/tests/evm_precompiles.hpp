@@ -4,24 +4,108 @@
 #define ZEN_TESTS_EVM_PRECOMPILES_HPP
 
 #include "evm/evm.h"
+#include "host/evm/crypto.h"
+#ifndef MCLBN_FP_UNIT_SIZE
+#define MCLBN_FP_UNIT_SIZE 4
+#endif
+#ifndef MCLBN_FR_UNIT_SIZE
+#define MCLBN_FR_UNIT_SIZE 4
+#endif
+#ifdef ZEN_HAS_C_KZG
+#include <ckzg.h>
+#endif
+#ifdef ZEN_HAS_BN254
+#include <mcl/bn.h>
+#endif
+#ifndef MCLBN_IO_SERIALIZE
+#define MCLBN_IO_SERIALIZE 512
+#endif
+#ifndef MCLBN_IO_BIG_ENDIAN
+#define MCLBN_IO_BIG_ENDIAN 8192
+#endif
 #include <algorithm>
 #include <array>
 #include <boost/multiprecision/cpp_int.hpp>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <openssl/bn.h>
+#include <openssl/ec.h>
+#include <openssl/ecdsa.h>
+#include <openssl/obj_mac.h>
+#include <openssl/ripemd.h>
+#include <openssl/sha.h>
 #include <vector>
 
 namespace zen::evm::precompile {
 
-inline bool isModExpPrecompile(const evmc::address &Addr) noexcept {
+inline bool isCanonicalPrecompileAddress(const evmc::address &Addr,
+                                         uint8_t Suffix) noexcept {
   for (size_t I = 0; I + 1 < sizeof(Addr.bytes); ++I) {
     if (Addr.bytes[I] != 0) {
       return false;
     }
   }
-  return Addr.bytes[sizeof(Addr.bytes) - 1] == 0x05;
+  return Addr.bytes[sizeof(Addr.bytes) - 1] == Suffix;
+}
+
+inline bool isIdentityPrecompile(const evmc::address &Addr) noexcept {
+  return isCanonicalPrecompileAddress(Addr, 0x04);
+}
+
+inline bool isSha256Precompile(const evmc::address &Addr) noexcept {
+  return isCanonicalPrecompileAddress(Addr, 0x02);
+}
+
+inline bool isEcRecoverPrecompile(const evmc::address &Addr) noexcept {
+  return isCanonicalPrecompileAddress(Addr, 0x01);
+}
+
+inline bool isRipemd160Precompile(const evmc::address &Addr) noexcept {
+  return isCanonicalPrecompileAddress(Addr, 0x03);
+}
+
+inline bool isBn256AddPrecompile(const evmc::address &Addr,
+                                 evmc_revision Revision) noexcept {
+  if (Revision < EVMC_BYZANTIUM) {
+    return false;
+  }
+  return isCanonicalPrecompileAddress(Addr, 0x06);
+}
+
+inline bool isBn256MulPrecompile(const evmc::address &Addr,
+                                 evmc_revision Revision) noexcept {
+  if (Revision < EVMC_BYZANTIUM) {
+    return false;
+  }
+  return isCanonicalPrecompileAddress(Addr, 0x07);
+}
+
+inline bool isBn256PairingPrecompile(const evmc::address &Addr,
+                                     evmc_revision Revision) noexcept {
+  if (Revision < EVMC_BYZANTIUM) {
+    return false;
+  }
+  return isCanonicalPrecompileAddress(Addr, 0x08);
+}
+
+inline bool isKzgPointEvaluationPrecompile(const evmc::address &Addr,
+                                           evmc_revision Revision) noexcept {
+  if (Revision < EVMC_CANCUN) {
+    return false;
+  }
+  return isCanonicalPrecompileAddress(Addr, 0x0A);
+}
+
+inline bool isModExpPrecompile(const evmc::address &Addr,
+                               evmc_revision Revision) noexcept {
+  if (Revision < EVMC_BYZANTIUM) {
+    return false;
+  }
+  return isCanonicalPrecompileAddress(Addr, 0x05);
 }
 
 inline bool isBlake2bPrecompile(const evmc::address &Addr,
@@ -29,12 +113,715 @@ inline bool isBlake2bPrecompile(const evmc::address &Addr,
   if (Revision < EVMC_ISTANBUL) {
     return false;
   }
-  for (size_t I = 0; I + 1 < sizeof(Addr.bytes); ++I) {
-    if (Addr.bytes[I] != 0) {
+  return isCanonicalPrecompileAddress(Addr, 0x09);
+}
+
+inline evmc::Result executeIdentity(const evmc_message &Msg,
+                                    std::vector<uint8_t> &ReturnData) {
+  constexpr uint64_t BaseGas = 15;
+  constexpr uint64_t GasPerWord = 3;
+  const uint64_t InputSize = Msg.input_size;
+  const uint64_t WordCount = (InputSize + 31) / 32;
+  const uint64_t GasCost = BaseGas + WordCount * GasPerWord;
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (GasCost > MsgGas) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_OUT_OF_GAS, 0, 0, nullptr, 0);
+  }
+
+  const uint8_t *Input =
+      InputSize == 0 ? nullptr : static_cast<const uint8_t *>(Msg.input_data);
+  if (Input == nullptr || InputSize == 0) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  ReturnData.assign(Input, Input + InputSize);
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
+}
+
+inline uint32_t rotr32(uint32_t Value, unsigned Shift) noexcept {
+  return (Value >> Shift) | (Value << (32 - Shift));
+}
+
+inline std::array<uint8_t, 32> sha256Digest(const uint8_t *Data,
+                                            size_t Size) noexcept {
+  static constexpr std::array<uint32_t, 64> K = {
+      0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU,
+      0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U, 0xd807aa98U, 0x12835b01U,
+      0x243185beU, 0x550c7dc3U, 0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U,
+      0xc19bf174U, 0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU,
+      0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU, 0x983e5152U,
+      0xa831c66dU, 0xb00327c8U, 0xbf597fc7U, 0xc6e00bf3U, 0xd5a79147U,
+      0x06ca6351U, 0x14292967U, 0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU,
+      0x53380d13U, 0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+      0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U, 0xd192e819U,
+      0xd6990624U, 0xf40e3585U, 0x106aa070U, 0x19a4c116U, 0x1e376c08U,
+      0x2748774cU, 0x34b0bcb5U, 0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU,
+      0x682e6ff3U, 0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
+      0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U};
+
+  std::array<uint32_t, 8> H = {0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U,
+                               0xa54ff53aU, 0x510e527fU, 0x9b05688cU,
+                               0x1f83d9abU, 0x5be0cd19U};
+
+  std::vector<uint8_t> Msg;
+  if (Data != nullptr && Size != 0) {
+    Msg.assign(Data, Data + Size);
+  }
+  Msg.push_back(0x80);
+  while ((Msg.size() % 64) != 56) {
+    Msg.push_back(0);
+  }
+  const uint64_t BitLen = static_cast<uint64_t>(Size) * 8;
+  for (int I = 7; I >= 0; --I) {
+    Msg.push_back(static_cast<uint8_t>((BitLen >> (I * 8)) & 0xff));
+  }
+
+  std::array<uint32_t, 64> W = {};
+  for (size_t Offset = 0; Offset < Msg.size(); Offset += 64) {
+    for (size_t I = 0; I < 16; ++I) {
+      const size_t Base = Offset + I * 4;
+      W[I] = (static_cast<uint32_t>(Msg[Base]) << 24) |
+             (static_cast<uint32_t>(Msg[Base + 1]) << 16) |
+             (static_cast<uint32_t>(Msg[Base + 2]) << 8) |
+             static_cast<uint32_t>(Msg[Base + 3]);
+    }
+    for (size_t I = 16; I < 64; ++I) {
+      const uint32_t S0 =
+          rotr32(W[I - 15], 7) ^ rotr32(W[I - 15], 18) ^ (W[I - 15] >> 3);
+      const uint32_t S1 =
+          rotr32(W[I - 2], 17) ^ rotr32(W[I - 2], 19) ^ (W[I - 2] >> 10);
+      W[I] = W[I - 16] + S0 + W[I - 7] + S1;
+    }
+
+    uint32_t A = H[0], B = H[1], C = H[2], D = H[3];
+    uint32_t E = H[4], F = H[5], G = H[6], HH = H[7];
+    for (size_t I = 0; I < 64; ++I) {
+      const uint32_t S1 = rotr32(E, 6) ^ rotr32(E, 11) ^ rotr32(E, 25);
+      const uint32_t Ch = (E & F) ^ ((~E) & G);
+      const uint32_t Temp1 = HH + S1 + Ch + K[I] + W[I];
+      const uint32_t S0 = rotr32(A, 2) ^ rotr32(A, 13) ^ rotr32(A, 22);
+      const uint32_t Maj = (A & B) ^ (A & C) ^ (B & C);
+      const uint32_t Temp2 = S0 + Maj;
+
+      HH = G;
+      G = F;
+      F = E;
+      E = D + Temp1;
+      D = C;
+      C = B;
+      B = A;
+      A = Temp1 + Temp2;
+    }
+
+    H[0] += A;
+    H[1] += B;
+    H[2] += C;
+    H[3] += D;
+    H[4] += E;
+    H[5] += F;
+    H[6] += G;
+    H[7] += HH;
+  }
+
+  std::array<uint8_t, 32> Digest = {};
+  for (size_t I = 0; I < H.size(); ++I) {
+    Digest[I * 4] = static_cast<uint8_t>(H[I] >> 24);
+    Digest[I * 4 + 1] = static_cast<uint8_t>(H[I] >> 16);
+    Digest[I * 4 + 2] = static_cast<uint8_t>(H[I] >> 8);
+    Digest[I * 4 + 3] = static_cast<uint8_t>(H[I]);
+  }
+  return Digest;
+}
+
+inline evmc::Result executeSha256(const evmc_message &Msg,
+                                  std::vector<uint8_t> &ReturnData) {
+  constexpr uint64_t BaseGas = 60;
+  constexpr uint64_t GasPerWord = 12;
+  const uint64_t InputSize = Msg.input_size;
+  const uint64_t WordCount = (InputSize + 31) / 32;
+  const uint64_t GasCost = BaseGas + WordCount * GasPerWord;
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (GasCost > MsgGas) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_OUT_OF_GAS, 0, 0, nullptr, 0);
+  }
+
+  const uint8_t *Input =
+      InputSize == 0 ? nullptr : static_cast<const uint8_t *>(Msg.input_data);
+  const auto Digest = sha256Digest(Input, InputSize);
+  ReturnData.assign(Digest.begin(), Digest.end());
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
+}
+
+inline evmc::Result executeEcRecover(const evmc_message &Msg,
+                                     std::vector<uint8_t> &ReturnData) {
+  constexpr uint64_t GasCost = 3000;
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (GasCost > MsgGas) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_OUT_OF_GAS, 0, 0, nullptr, 0);
+  }
+
+  ReturnData.clear();
+
+  uint8_t Input[128] = {0};
+  if (Msg.input_data != nullptr && Msg.input_size != 0) {
+    const auto CopyLen = std::min<size_t>(sizeof(Input), Msg.input_size);
+    std::memcpy(Input, Msg.input_data, CopyLen);
+  }
+
+  if (!std::all_of(Input + 32, Input + 63,
+                   [](uint8_t Byte) { return Byte == 0; })) {
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  int RecoveryId = -1;
+  if (Input[63] == 27 || Input[63] == 28) {
+    RecoveryId = static_cast<int>(Input[63] - 27);
+  } else if (Input[63] == 0 || Input[63] == 1) {
+    RecoveryId = static_cast<int>(Input[63]);
+  } else {
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  using BNPtr = std::unique_ptr<BIGNUM, decltype(&BN_free)>;
+  using BNCTXPtr = std::unique_ptr<BN_CTX, decltype(&BN_CTX_free)>;
+  using ECGroupPtr = std::unique_ptr<EC_GROUP, decltype(&EC_GROUP_free)>;
+  using ECPointPtr = std::unique_ptr<EC_POINT, decltype(&EC_POINT_free)>;
+  using ECKeyPtr = std::unique_ptr<EC_KEY, decltype(&EC_KEY_free)>;
+  using ECDSASigPtr = std::unique_ptr<ECDSA_SIG, decltype(&ECDSA_SIG_free)>;
+
+  BNCTXPtr Ctx(BN_CTX_new(), &BN_CTX_free);
+  ECGroupPtr Group(EC_GROUP_new_by_curve_name(NID_secp256k1), &EC_GROUP_free);
+  if (!Ctx || !Group) {
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  BN_CTX_start(Ctx.get());
+  BIGNUM *Field = BN_CTX_get(Ctx.get());
+  BIGNUM *A = BN_CTX_get(Ctx.get());
+  BIGNUM *B = BN_CTX_get(Ctx.get());
+  BIGNUM *OrderRaw = BN_CTX_get(Ctx.get());
+  BIGNUM *Zero = BN_CTX_get(Ctx.get());
+  if (!Field || !A || !B || !OrderRaw || !Zero) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+  BN_zero(Zero);
+
+  if (EC_GROUP_get_curve(Group.get(), Field, A, B, Ctx.get()) != 1 ||
+      EC_GROUP_get_order(Group.get(), OrderRaw, Ctx.get()) != 1) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  BNPtr R(BN_bin2bn(Input + 64, 32, nullptr), &BN_free);
+  BNPtr S(BN_bin2bn(Input + 96, 32, nullptr), &BN_free);
+  BNPtr Hash(BN_bin2bn(Input, 32, nullptr), &BN_free);
+  if (!R || !S || !Hash) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+  if (BN_is_zero(R.get()) || BN_is_zero(S.get()) ||
+      BN_cmp(R.get(), OrderRaw) >= 0 || BN_cmp(S.get(), OrderRaw) >= 0) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  BNPtr X(BN_dup(R.get()), &BN_free);
+  if (!X || BN_cmp(X.get(), Field) >= 0) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  std::array<uint8_t, 33> Compressed = {};
+  Compressed[0] = static_cast<uint8_t>(0x02 + RecoveryId);
+  if (BN_bn2binpad(X.get(), Compressed.data() + 1, 32) != 32) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  ECPointPtr RecoverPoint(EC_POINT_new(Group.get()), &EC_POINT_free);
+  ECPointPtr OrderCheck(EC_POINT_new(Group.get()), &EC_POINT_free);
+  ECPointPtr SR(EC_POINT_new(Group.get()), &EC_POINT_free);
+  ECPointPtr MinusEG(EC_POINT_new(Group.get()), &EC_POINT_free);
+  ECPointPtr Sum(EC_POINT_new(Group.get()), &EC_POINT_free);
+  ECPointPtr PubKey(EC_POINT_new(Group.get()), &EC_POINT_free);
+  if (!RecoverPoint || !OrderCheck || !SR || !MinusEG || !Sum || !PubKey) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  if (EC_POINT_oct2point(Group.get(), RecoverPoint.get(), Compressed.data(),
+                         Compressed.size(), Ctx.get()) != 1 ||
+      EC_POINT_mul(Group.get(), OrderCheck.get(), nullptr, RecoverPoint.get(),
+                   OrderRaw, Ctx.get()) != 1 ||
+      EC_POINT_is_at_infinity(Group.get(), OrderCheck.get()) != 1) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  BNPtr MinusHash(BN_new(), &BN_free);
+  BNPtr RInv(BN_mod_inverse(nullptr, R.get(), OrderRaw, Ctx.get()), &BN_free);
+  if (!MinusHash || !RInv ||
+      BN_mod_sub(MinusHash.get(), Zero, Hash.get(), OrderRaw, Ctx.get()) != 1 ||
+      EC_POINT_mul(Group.get(), SR.get(), nullptr, RecoverPoint.get(), S.get(),
+                   Ctx.get()) != 1 ||
+      EC_POINT_mul(Group.get(), MinusEG.get(), MinusHash.get(), nullptr,
+                   nullptr, Ctx.get()) != 1 ||
+      EC_POINT_add(Group.get(), Sum.get(), SR.get(), MinusEG.get(),
+                   Ctx.get()) != 1 ||
+      EC_POINT_mul(Group.get(), PubKey.get(), nullptr, Sum.get(), RInv.get(),
+                   Ctx.get()) != 1) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  ECKeyPtr Key(EC_KEY_new_by_curve_name(NID_secp256k1), &EC_KEY_free);
+  ECDSASigPtr Sig(ECDSA_SIG_new(), &ECDSA_SIG_free);
+  if (!Key || !Sig) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+  BNPtr SigR(BN_dup(R.get()), &BN_free);
+  BNPtr SigS(BN_dup(S.get()), &BN_free);
+  if (!SigR || !SigS ||
+      ECDSA_SIG_set0(Sig.get(), SigR.release(), SigS.release()) != 1 ||
+      EC_KEY_set_public_key(Key.get(), PubKey.get()) != 1 ||
+      ECDSA_do_verify(Input, 32, Sig.get(), Key.get()) != 1) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+
+  std::array<uint8_t, 65> EncodedPubKey = {};
+  if (EC_POINT_point2oct(Group.get(), PubKey.get(),
+                         POINT_CONVERSION_UNCOMPRESSED, EncodedPubKey.data(),
+                         EncodedPubKey.size(),
+                         Ctx.get()) != EncodedPubKey.size()) {
+    BN_CTX_end(Ctx.get());
+    return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                        nullptr, 0);
+  }
+  BN_CTX_end(Ctx.get());
+
+  std::vector<uint8_t> PubKeyBytes(EncodedPubKey.begin() + 1,
+                                   EncodedPubKey.end());
+  const auto HashBytes = zen::host::evm::crypto::keccak256(PubKeyBytes);
+  ReturnData.assign(32, 0);
+  std::memcpy(ReturnData.data() + 12, HashBytes.data() + 12, 20);
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
+}
+
+#ifdef ZEN_HAS_BN254
+
+inline bool ensureBn254Initialized() noexcept {
+  static const bool Initialized = []() {
+    const int Ret = mclBn_init(MCL_BN_SNARK1, MCLBN_COMPILED_TIME_VAR);
+    if (Ret != 0) {
+      return false;
+    }
+    mclBn_verifyOrderG1(0);
+    mclBn_verifyOrderG2(1);
+    return true;
+  }();
+  return Initialized;
+}
+
+inline uint64_t bn256AddGasCost(evmc_revision Revision) noexcept {
+  return Revision >= EVMC_ISTANBUL ? 150 : 500;
+}
+
+inline uint64_t bn256MulGasCost(evmc_revision Revision) noexcept {
+  return Revision >= EVMC_ISTANBUL ? 6000 : 40000;
+}
+
+inline uint64_t bn256PairingBaseGas(evmc_revision Revision) noexcept {
+  return Revision >= EVMC_ISTANBUL ? 45000 : 100000;
+}
+
+inline uint64_t bn256PairingPerPairGas(evmc_revision Revision) noexcept {
+  return Revision >= EVMC_ISTANBUL ? 34000 : 80000;
+}
+
+inline bool isAllZero(const uint8_t *Data, size_t Size) noexcept {
+  for (size_t I = 0; I < Size; ++I) {
+    if (Data[I] != 0) {
       return false;
     }
   }
-  return Addr.bytes[sizeof(Addr.bytes) - 1] == 0x09;
+  return true;
+}
+
+inline void copyPaddedInput(std::vector<uint8_t> &Dst, const evmc_message &Msg,
+                            size_t Size) {
+  Dst.assign(Size, 0);
+  if (Msg.input_data == nullptr || Msg.input_size == 0) {
+    return;
+  }
+  const size_t CopyLen = std::min<size_t>(Size, Msg.input_size);
+  std::memcpy(Dst.data(), Msg.input_data, CopyLen);
+}
+
+inline bool bn254DeserializeFp(mclBnFp *X, const uint8_t *Buf) noexcept {
+  return mclBnFp_deserialize(X, Buf, 32) == 32;
+}
+
+inline bool bn254SerializeFp(uint8_t *Buf, const mclBnFp *X) noexcept {
+  return mclBnFp_serialize(Buf, 32, X) == 32;
+}
+
+inline bool bn254DeserializeG1(mclBnG1 *P, const uint8_t *Buf) noexcept {
+  if (isAllZero(Buf, 64)) {
+    mclBnG1_clear(P);
+    return true;
+  }
+  if (!bn254DeserializeFp(&P->x, Buf) || !bn254DeserializeFp(&P->y, Buf + 32)) {
+    return false;
+  }
+  mclBnFp_setInt32(&P->z, 1);
+  return mclBnG1_isValid(P) == 1;
+}
+
+inline bool bn254SerializeG1(uint8_t *Buf, mclBnG1 *P) noexcept {
+  if (mclBnG1_isZero(P)) {
+    std::memset(Buf, 0, 64);
+    return true;
+  }
+  mclBnG1_normalize(P, P);
+  return bn254SerializeFp(Buf, &P->x) && bn254SerializeFp(Buf + 32, &P->y);
+}
+
+inline bool bn254DeserializeFp2(mclBnFp2 *X, const uint8_t *Buf) noexcept {
+  return bn254DeserializeFp(&X->d[1], Buf) &&
+         bn254DeserializeFp(&X->d[0], Buf + 32);
+}
+
+inline bool bn254DeserializeG2(mclBnG2 *P, const uint8_t *Buf) noexcept {
+  if (isAllZero(Buf, 128)) {
+    mclBnG2_clear(P);
+    return true;
+  }
+  if (!bn254DeserializeFp2(&P->x, Buf) ||
+      !bn254DeserializeFp2(&P->y, Buf + 64)) {
+    return false;
+  }
+  mclBnFp_setInt32(&P->z.d[0], 1);
+  mclBnFp_clear(&P->z.d[1]);
+  return mclBnG2_isValid(P) == 1;
+}
+
+inline bool bn254SerializeG2(uint8_t *Buf, mclBnG2 *P) noexcept {
+  if (mclBnG2_isZero(P)) {
+    std::memset(Buf, 0, 128);
+    return true;
+  }
+  mclBnG2_normalize(P, P);
+  return bn254SerializeFp(Buf, &P->x.d[1]) &&
+         bn254SerializeFp(Buf + 32, &P->x.d[0]) &&
+         bn254SerializeFp(Buf + 64, &P->y.d[1]) &&
+         bn254SerializeFp(Buf + 96, &P->y.d[0]);
+}
+
+inline bool bn254SerializePairingResult(uint8_t *Buf, bool Success) noexcept {
+  std::memset(Buf, 0, 32);
+  if (Success) {
+    Buf[31] = 1;
+  }
+  return true;
+}
+
+#else
+
+inline bool ensureBn254Initialized() noexcept { return false; }
+
+#endif
+
+inline void kzgToVersionedHash(uint8_t *Out,
+                               const uint8_t *CommitmentBytes) noexcept {
+  uint8_t Digest[SHA256_DIGEST_LENGTH];
+  SHA256(CommitmentBytes, 48, Digest);
+  Out[0] = 0x01;
+  std::memcpy(Out + 1, Digest + 1, 31);
+}
+
+#ifdef ZEN_HAS_C_KZG
+
+inline KZGSettings *getKzgSettings() noexcept {
+#ifdef ZEN_C_KZG_TRUSTED_SETUP_PATH
+  static KZGSettings Settings{};
+  static const bool Initialized = []() {
+    FILE *SetupFile = std::fopen(ZEN_C_KZG_TRUSTED_SETUP_PATH, "r");
+    if (SetupFile == nullptr) {
+      return false;
+    }
+    const C_KZG_RET Ret = load_trusted_setup_file(&Settings, SetupFile, 0);
+    std::fclose(SetupFile);
+    return Ret == C_KZG_OK;
+  }();
+  return Initialized ? &Settings : nullptr;
+#else
+  return nullptr;
+#endif
+}
+
+inline void storeUint256BE(uint8_t *Out,
+                           const boost::multiprecision::cpp_int &Value) {
+  boost::multiprecision::cpp_int Tmp = Value;
+  for (int I = 31; I >= 0; --I) {
+    Out[I] = static_cast<uint8_t>(Tmp & 0xff);
+    Tmp >>= 8;
+  }
+}
+
+inline evmc::Result
+executeKzgPointEvaluation(const evmc_message &Msg,
+                          std::vector<uint8_t> &ReturnData) {
+  constexpr uint64_t GasCost = 50000;
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (GasCost > MsgGas) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_OUT_OF_GAS, 0, 0, nullptr, 0);
+  }
+  if (Msg.input_size != 192 || Msg.input_data == nullptr) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  KZGSettings *Settings = getKzgSettings();
+  if (Settings == nullptr) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  const uint8_t *Input = static_cast<const uint8_t *>(Msg.input_data);
+  Bytes32 VersionedHash{};
+  Bytes32 Z{};
+  Bytes32 Y{};
+  Bytes48 Commitment{};
+  Bytes48 Proof{};
+  std::memcpy(VersionedHash.bytes, Input, sizeof(VersionedHash.bytes));
+  std::memcpy(Z.bytes, Input + 32, sizeof(Z.bytes));
+  std::memcpy(Y.bytes, Input + 64, sizeof(Y.bytes));
+  std::memcpy(Commitment.bytes, Input + 96, sizeof(Commitment.bytes));
+  std::memcpy(Proof.bytes, Input + 144, sizeof(Proof.bytes));
+
+  Bytes32 ExpectedVersionedHash{};
+  kzgToVersionedHash(ExpectedVersionedHash.bytes, Commitment.bytes);
+  if (std::memcmp(ExpectedVersionedHash.bytes, VersionedHash.bytes,
+                  sizeof(VersionedHash.bytes)) != 0) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  fr_t ZField{};
+  fr_t YField{};
+  if (bytes_to_bls_field(&ZField, &Z) != C_KZG_OK ||
+      bytes_to_bls_field(&YField, &Y) != C_KZG_OK) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  bool Ok = false;
+  if (verify_kzg_proof(&Ok, &Commitment, &Z, &Y, &Proof, Settings) !=
+          C_KZG_OK ||
+      !Ok) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  ReturnData.assign(64, 0);
+  ReturnData[30] = 0x10;
+  ReturnData[31] = 0x00;
+  static const boost::multiprecision::cpp_int BlsModulus(
+      "524358751751261904794477405081859658376905525005276378226036586999385811"
+      "84513");
+  storeUint256BE(ReturnData.data() + 32, BlsModulus);
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
+}
+
+#else
+
+inline void *getKzgSettings() noexcept { return nullptr; }
+
+inline evmc::Result
+executeKzgPointEvaluation(const evmc_message &Msg,
+                          std::vector<uint8_t> &ReturnData) {
+  (void)Msg;
+  ReturnData.clear();
+  return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+}
+
+#endif
+
+inline evmc::Result executeRipemd160(const evmc_message &Msg,
+                                     std::vector<uint8_t> &ReturnData) {
+  constexpr uint64_t BaseGas = 600;
+  constexpr uint64_t GasPerWord = 120;
+  const uint64_t InputSize = Msg.input_size;
+  const uint64_t WordCount = (InputSize + 31) / 32;
+  const uint64_t GasCost = BaseGas + WordCount * GasPerWord;
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (GasCost > MsgGas) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_OUT_OF_GAS, 0, 0, nullptr, 0);
+  }
+
+  const uint8_t *Input =
+      InputSize == 0 ? nullptr : static_cast<const uint8_t *>(Msg.input_data);
+  unsigned char Digest[RIPEMD160_DIGEST_LENGTH];
+  RIPEMD160(Input, InputSize, Digest);
+  ReturnData.assign(32, 0);
+  std::memcpy(ReturnData.data() + 12, Digest, RIPEMD160_DIGEST_LENGTH);
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
+}
+
+inline evmc::Result executeBn256Add(const evmc_message &Msg,
+                                    evmc_revision Revision,
+                                    std::vector<uint8_t> &ReturnData) {
+#ifndef ZEN_HAS_BN254
+  (void)Msg;
+  (void)Revision;
+  ReturnData.clear();
+  return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+#else
+  const uint64_t GasCost = bn256AddGasCost(Revision);
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (GasCost > MsgGas || !ensureBn254Initialized()) {
+    ReturnData.clear();
+    return evmc::Result(GasCost > MsgGas ? EVMC_OUT_OF_GAS : EVMC_FAILURE, 0, 0,
+                        nullptr, 0);
+  }
+
+  std::vector<uint8_t> Input;
+  copyPaddedInput(Input, Msg, 128);
+
+  mclBnG1 P1, P2, Sum;
+  if (!bn254DeserializeG1(&P1, Input.data()) ||
+      !bn254DeserializeG1(&P2, Input.data() + 64)) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  mclBnG1_add(&Sum, &P1, &P2);
+  ReturnData.assign(64, 0);
+  if (!bn254SerializeG1(ReturnData.data(), &Sum)) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
+#endif
+}
+
+inline evmc::Result executeBn256Mul(const evmc_message &Msg,
+                                    evmc_revision Revision,
+                                    std::vector<uint8_t> &ReturnData) {
+#ifndef ZEN_HAS_BN254
+  (void)Msg;
+  (void)Revision;
+  ReturnData.clear();
+  return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+#else
+  const uint64_t GasCost = bn256MulGasCost(Revision);
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (GasCost > MsgGas || !ensureBn254Initialized()) {
+    ReturnData.clear();
+    return evmc::Result(GasCost > MsgGas ? EVMC_OUT_OF_GAS : EVMC_FAILURE, 0, 0,
+                        nullptr, 0);
+  }
+
+  std::vector<uint8_t> Input;
+  copyPaddedInput(Input, Msg, 96);
+
+  mclBnG1 Point, Product;
+  mclBnFr Scalar;
+  if (!bn254DeserializeG1(&Point, Input.data()) ||
+      mclBnFr_setBigEndianMod(&Scalar, Input.data() + 64, 32) != 0) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  mclBnG1_mul(&Product, &Point, &Scalar);
+  ReturnData.assign(64, 0);
+  if (!bn254SerializeG1(ReturnData.data(), &Product)) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
+#endif
+}
+
+inline evmc::Result executeBn256Pairing(const evmc_message &Msg,
+                                        evmc_revision Revision,
+                                        std::vector<uint8_t> &ReturnData) {
+#ifndef ZEN_HAS_BN254
+  (void)Msg;
+  (void)Revision;
+  ReturnData.clear();
+  return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+#else
+  const uint64_t MsgGas = Msg.gas < 0 ? 0 : static_cast<uint64_t>(Msg.gas);
+  if (!ensureBn254Initialized()) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+  if ((Msg.input_size % 192) != 0) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+  }
+
+  const uint64_t PairCount = Msg.input_size / 192;
+  const uint64_t GasCost = bn256PairingBaseGas(Revision) +
+                           PairCount * bn256PairingPerPairGas(Revision);
+  if (GasCost > MsgGas) {
+    ReturnData.clear();
+    return evmc::Result(EVMC_OUT_OF_GAS, 0, 0, nullptr, 0);
+  }
+
+  mclBnGT Acc;
+  mclBnGT_setInt32(&Acc, 1);
+  const uint8_t *Input = static_cast<const uint8_t *>(Msg.input_data);
+  for (uint64_t I = 0; I < PairCount; ++I) {
+    const uint8_t *Chunk = Input + I * 192;
+    mclBnG1 P;
+    mclBnG2 Q;
+    if (!bn254DeserializeG1(&P, Chunk) || !bn254DeserializeG2(&Q, Chunk + 64)) {
+      ReturnData.clear();
+      return evmc::Result(EVMC_FAILURE, 0, 0, nullptr, 0);
+    }
+    mclBnGT Pairing;
+    mclBn_pairing(&Pairing, &P, &Q);
+    mclBnGT_mul(&Acc, &Acc, &Pairing);
+  }
+
+  ReturnData.assign(32, 0);
+  bn254SerializePairingResult(ReturnData.data(), mclBnGT_isOne(&Acc) == 1);
+  return evmc::Result(EVMC_SUCCESS, static_cast<int64_t>(MsgGas - GasCost), 0,
+                      ReturnData.data(), ReturnData.size());
+#endif
 }
 
 inline intx::uint256 loadUint256Padded(const uint8_t *Data, size_t Size,
@@ -139,8 +926,7 @@ inline std::vector<uint8_t> readSegment(const uint8_t *Data, size_t Size,
 inline uint32_t loadUint32BE(const uint8_t *Data) noexcept {
   return (static_cast<uint32_t>(Data[0]) << 24) |
          (static_cast<uint32_t>(Data[1]) << 16) |
-         (static_cast<uint32_t>(Data[2]) << 8) |
-         static_cast<uint32_t>(Data[3]);
+         (static_cast<uint32_t>(Data[2]) << 8) | static_cast<uint32_t>(Data[3]);
 }
 
 inline uint64_t loadUint64LE(const uint8_t *Data) noexcept {
@@ -177,9 +963,8 @@ inline void blake2bCompress(uint64_t H[8], const uint64_t M[16], uint64_t T0,
                             uint64_t T1, bool FinalBlock,
                             uint32_t Rounds) noexcept {
   static constexpr std::array<uint64_t, 8> IV = {
-      0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
-      0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
-      0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+      0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL, 0x3c6ef372fe94f82bULL,
+      0xa54ff53a5f1d36f1ULL, 0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
       0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL};
   static constexpr uint8_t Sigma[10][16] = {
       {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},

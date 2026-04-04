@@ -667,6 +667,69 @@ TEST(EVMStateFocused, ReentrancySelfdestructRevertDelegatecallCancun) {
       "Focused Cancun reentrancy selfdestruct revert DELEGATECALL regression");
 }
 
+TEST(EVMStateFocused, WarmCoinbaseCallSufficientGasShanghai) {
+  const evmc_revision TargetRevision = getTargetRevision();
+  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_SHANGHAI) {
+    GTEST_SKIP()
+        << "Focused Shanghai regression skipped for requested revision";
+  }
+
+  const std::string FixturePath =
+      DEFAULT_TEST_DIR +
+      "/shanghai/eip3651_warm_coinbase/test_warm_coinbase_call_out_of_gas.json";
+  const std::string FixtureName =
+      "tests/shanghai/eip3651_warm_coinbase/test_warm_coinbase.py::"
+      "test_warm_coinbase_call_out_of_gas[fork_Shanghai-state_test-CALL-"
+      "sufficient_gas]";
+  const std::string ForkName = "Shanghai";
+
+  assertFocusedFixturePasses(
+      FixturePath, FixtureName, ForkName,
+      "Focused Shanghai warm coinbase CALL sufficient-gas regression");
+}
+
+TEST(EVMStateFocused, WarmCoinbaseDelegatecallSufficientGasShanghai) {
+  const evmc_revision TargetRevision = getTargetRevision();
+  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_SHANGHAI) {
+    GTEST_SKIP()
+        << "Focused Shanghai regression skipped for requested revision";
+  }
+
+  const std::string FixturePath =
+      DEFAULT_TEST_DIR +
+      "/shanghai/eip3651_warm_coinbase/test_warm_coinbase_call_out_of_gas.json";
+  const std::string FixtureName =
+      "tests/shanghai/eip3651_warm_coinbase/test_warm_coinbase.py::"
+      "test_warm_coinbase_call_out_of_gas[fork_Shanghai-state_test-"
+      "DELEGATECALL-sufficient_gas]";
+  const std::string ForkName = "Shanghai";
+
+  assertFocusedFixturePasses(
+      FixturePath, FixtureName, ForkName,
+      "Focused Shanghai warm coinbase DELEGATECALL sufficient-gas regression");
+}
+
+TEST(EVMStateFocused, WarmCoinbaseStaticcallSufficientGasShanghai) {
+  const evmc_revision TargetRevision = getTargetRevision();
+  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_SHANGHAI) {
+    GTEST_SKIP()
+        << "Focused Shanghai regression skipped for requested revision";
+  }
+
+  const std::string FixturePath =
+      DEFAULT_TEST_DIR +
+      "/shanghai/eip3651_warm_coinbase/test_warm_coinbase_call_out_of_gas.json";
+  const std::string FixtureName =
+      "tests/shanghai/eip3651_warm_coinbase/test_warm_coinbase.py::"
+      "test_warm_coinbase_call_out_of_gas[fork_Shanghai-state_test-"
+      "STATICCALL-sufficient_gas]";
+  const std::string ForkName = "Shanghai";
+
+  assertFocusedFixturePasses(
+      FixturePath, FixtureName, ForkName,
+      "Focused Shanghai warm coinbase STATICCALL sufficient-gas regression");
+}
+
 TEST_P(EVMStateTest, ExecutesStateTest) {
   const auto &Param = GetParam();
 
