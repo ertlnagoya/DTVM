@@ -502,6 +502,10 @@ int main(int argc, char *argv[]) {
   /// ================ EVM mode ================
 #ifdef ZEN_ENABLE_EVM
   if (Config.Format == InputFormat::EVM) {
+    // Wrap the EVM path so that invalid addresses / uint256 / bytes32 inputs
+    // (which throw from zen::utils::parse* helpers) surface as a clear error
+    // instead of an uncaught exception aborting the process.
+    try {
     if (GasLimit > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
       ZEN_LOG_ERROR("gas limit out of range for EVM execution: %llu",
                     static_cast<unsigned long long>(GasLimit));
@@ -617,9 +621,11 @@ int main(int argc, char *argv[]) {
     CalldataBytes.clear();
     if (!Calldata.empty()) {
       auto Bytes = zen::utils::fromHex(Calldata);
-      if (Bytes.has_value()) {
-        CalldataBytes = std::move(*Bytes);
+      if (!Bytes.has_value()) {
+        SIMPLE_LOG_ERROR("invalid --calldata hex string: %s", Calldata.c_str());
+        return exitMain(EXIT_FAILURE, RT.get());
       }
+      CalldataBytes = std::move(*Bytes);
     }
 
     EVMMessageConfig MsgConfig{.Kind = MsgKind,
@@ -747,6 +753,14 @@ int main(int argc, char *argv[]) {
     }
 
     return exitMain(ExitCode, RT.get());
+    } catch (const Error &E) {
+      SIMPLE_LOG_ERROR("EVM execution failed: %s",
+                       E.getFormattedMessage(false).c_str());
+      return exitMain(EXIT_FAILURE);
+    } catch (const std::exception &E) {
+      SIMPLE_LOG_ERROR("EVM execution failed: %s", E.what());
+      return exitMain(EXIT_FAILURE);
+    }
   }
 #endif // ZEN_ENABLE_EVM
 
