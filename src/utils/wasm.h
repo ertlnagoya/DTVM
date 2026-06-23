@@ -73,19 +73,35 @@ const uint8_t *readLEBNumber(const uint8_t *Ip, const uint8_t *End, T &Value) {
 }
 
 template <typename T>
-static const uint8_t *readSafeLEBNumber(const uint8_t *Ip, T &Value) {
+static const uint8_t *readSafeLEBNumber(const uint8_t *Ip, const uint8_t *End,
+                                        T &Value) {
+  using common::ErrorCode;
+  using common::getError;
+
+  if (Ip >= End) {
+    throw getError(ErrorCode::UnexpectedEnd);
+  }
+
+  constexpr int MaxBytes = (sizeof(T) * 8 + 6) / 7;
   constexpr bool IsSigned = std::is_signed<T>::value;
 
   T Result = 0;
   uint32_t Shift = 0;
+  uint32_t Count = 0;
   uint8_t Byte = 0;
-  while (true) {
+  while (Ip < End && Count < MaxBytes) {
     Byte = *Ip++;
     Result |= ((T)(Byte & 0x7f)) << Shift;
     Shift += 7;
+    Count++;
     if ((Byte & 0x80) == 0) {
       break;
     }
+  }
+
+  if ((Byte & 0x80) != 0) {
+    throw getError(Ip >= End ? ErrorCode::UnexpectedEnd
+                             : ErrorCode::LEBIntTooLong);
   }
 
   if constexpr (IsSigned) {
@@ -106,6 +122,7 @@ template <typename T>
 const uint8_t *readFixedNumber(const uint8_t *Ip, const uint8_t *End,
                                T &Value) {
   if (Ip + sizeof(T) > End) {
+    Value = T{};
     return End;
   }
 

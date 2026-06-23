@@ -6,7 +6,12 @@
 #include "evm/evm.h"
 #include "evm/evm_cache.h"
 #include "evmc/evmc.hpp"
+#include "runtime/evm_memory_specialization.h"
 #include "runtime/module.h"
+#include <atomic>
+#include <future>
+#include <limits>
+#include <memory>
 
 #ifdef ZEN_ENABLE_JIT
 namespace COMPILER {
@@ -25,7 +30,8 @@ class EVMModule final : public BaseModule<EVMModule> {
 public:
   using Byte = zen::common::Byte;
   static EVMModuleUniquePtr
-  newEVMModule(Runtime &RT, CodeHolderUniquePtr CodeHolder, evmc_revision Rev);
+  newEVMModule(Runtime &RT, CodeHolderUniquePtr CodeHolder, evmc_revision Rev,
+               EVMMemorySpecializationProfile MemoryProfile = {});
 
   virtual ~EVMModule();
 
@@ -36,19 +42,70 @@ public:
   const evm::EVMBytecodeCache &getBytecodeCache() const;
   evmc_revision getRevision() const { return Revision; }
   void setRevision(evmc_revision Rev) { Revision = Rev; }
+  const EVMMemorySpecializationProfile &getMemorySpecializationProfile() const {
+    return MemoryProfile;
+  }
+  void setMemorySpecializationProfile(EVMMemorySpecializationProfile Profile) {
+    MemoryProfile = Profile;
+  }
+  uint8_t getMemoryLinearStrideSkipLeadingZeroLimbStores() const {
+    return MemoryProfile.SkipLeadingZeroLimbStores;
+  }
+  bool hasFullCallDataLoad0Window() const {
+    return MemoryProfile.HasFullCallDataLoad0Window;
+  }
+  bool hasKnownCallDataLoad0Low64() const {
+    return MemoryProfile.HasKnownCallDataLoad0Low64;
+  }
+  uint64_t getKnownCallDataLoad0Low64() const {
+    return MemoryProfile.KnownCallDataLoad0Low64;
+  }
+  static constexpr int32_t getCodeSizeOffset() {
+    static_assert(offsetof(EVMModule, CodeSize) <=
+                      std::numeric_limits<int32_t>::max(),
+                  "EVMModule offsets should fit in 32-bit signed range");
+    return static_cast<int32_t>(offsetof(EVMModule, CodeSize));
+  }
+
+  /// Cached result from EVMAnalyzer: true if the contract should fall back
+  /// to interpreter mode instead of JIT. Set once at module creation to
+  /// avoid per-call O(n) bytecode scans.
+  bool ShouldFallbackToInterp = false;
 
 #ifdef ZEN_ENABLE_JIT
-  common::CodeMemPool &getJITCodeMemPool() { return JITCodeMemPool; }
-
-  void *getJITCode() const { return JITCode; }
-
-  size_t getJITCodeSize() const { return JITCodeSize; }
+  common::CodeMemPool &getJITCodeMemPool() {
+    if (!JITCodeMemPool) {
+      JITCodeMemPool = std::make_unique<common::CodeMemPool>();
+    }
+    return *JITCodeMemPool;
+  }
 
   void setJITCodeAndSize(void *Code, size_t Size) {
-    JITCode = Code;
-    JITCodeSize = Size;
+    JITCodeSize.store(Size, std::memory_order_relaxed);
+    JITCode.store(Code, std::memory_order_release);
   }
+  // Future for background JIT compilation (managed by JITCompilePool).
+  std::future<void> JITCompileFuture;
+
+  // Per-module execution statistics for profile-guided JIT diagnostics.
+  uint64_t ModuleExecuteCount = 0;
 #endif // ZEN_ENABLE_JIT
+
+  void *getJITCode() const {
+#ifdef ZEN_ENABLE_JIT
+    return JITCode;
+#else
+    return nullptr;
+#endif
+  }
+
+  size_t getJITCodeSize() const {
+#ifdef ZEN_ENABLE_JIT
+    return JITCodeSize.load(std::memory_order_acquire);
+#else
+    return 0;
+#endif
+  }
 
 private:
   EVMModule(Runtime *RT);
@@ -61,12 +118,23 @@ private:
   void initBytecodeCache() const;
   mutable bool BytecodeCacheInitialized = false;
   mutable evm::EVMBytecodeCache BytecodeCache;
+  // Whether this module will be consumed by the multipass JIT. When true,
+  // buildBytecodeCache runs the expensive SPP metering pipeline so the JIT
+  // can read shifted gas costs from GasChunkCostSPP. When false, only the
+  // cheap per-block pass runs — interpreter-only modules pay nothing extra.
+  //
+  // Must be set before any getBytecodeCache() call: once the cache is
+  // built, the EnableSPP decision is fixed for the lifetime of the
+  // module. Future lazy / on-demand JIT paths must flip this flag before
+  // triggering the lazy cache build.
+  bool CacheNeedsSPP = false;
   evmc_revision Revision = zen::evm::DEFAULT_REVISION;
+  EVMMemorySpecializationProfile MemoryProfile = {};
 
 #ifdef ZEN_ENABLE_JIT
-  common::CodeMemPool JITCodeMemPool;
-  void *JITCode = nullptr;
-  size_t JITCodeSize = 0;
+  std::unique_ptr<common::CodeMemPool> JITCodeMemPool;
+  std::atomic<void *> JITCode{nullptr};
+  std::atomic<size_t> JITCodeSize{0};
 #endif // ZEN_ENABLE_JIT
 };
 

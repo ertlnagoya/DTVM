@@ -12,6 +12,7 @@
 #include "runtime/evm_module.h"
 #include "runtime/instance.h"
 #include <array>
+#include <deque>
 #include <limits>
 #include <memory>
 
@@ -25,6 +26,16 @@ class Instantiator;
 } // namespace action
 
 namespace runtime {
+
+inline constexpr std::size_t ReturnDataReleaseThreshold = 64 * 1024;
+
+inline void clearReturnDataBuffer(std::vector<uint8_t> &Buffer) {
+  if (Buffer.capacity() > ReturnDataReleaseThreshold) {
+    std::vector<uint8_t>().swap(Buffer);
+    return;
+  }
+  Buffer.clear();
+}
 
 /// \warning: not support multi-threading
 class EVMInstance final : public RuntimeObject<EVMInstance> {
@@ -62,22 +73,32 @@ public:
   static uint64_t calculateMemoryExpansionCost(uint64_t CurrentSize,
                                                uint64_t NewSize);
   void consumeMemoryExpansionGas(uint64_t RequiredSize);
-  void expandMemory(uint64_t RequiredSize);
+  bool expandMemory(uint64_t RequiredSize);
   void expandMemoryNoGas(uint64_t RequiredSize);
   bool expandMemoryChecked(uint64_t Offset, uint64_t Size);
   bool expandMemoryChecked(uint64_t OffsetA, uint64_t SizeA, uint64_t OffsetB,
                            uint64_t SizeB);
-  void chargeGas(uint64_t GasCost);
+  bool chargeGas(uint64_t GasCost);
+  bool addGas(uint64_t GasAmount);
 
-  void addGasRefund(uint64_t Amount) { GasRefund += Amount; }
-  void setGasRefund(uint64_t Amount) { GasRefund = Amount; }
-  uint64_t getGasRefund() const { return GasRefund; }
+  void addGasRefund(int64_t Amount) { GasRefund += Amount; }
+  void setGasRefund(int64_t Amount) { GasRefund = Amount; }
+  int64_t getGasRefund() const { return GasRefund; }
+  void restoreGasRefundSnapshot() {
+    if (!GasRefundStack.empty()) {
+      GasRefund = GasRefundStack.back();
+    }
+  }
   void setRevision(evmc_revision NewRev) { Rev = NewRev; }
 
   // ==================== Memory Methods ====================
   uint64_t getMemorySize() const { return MemorySize; }
   uint8_t *getMemoryBase() const { return MemoryBase; }
   uint8_t *getMemory() { return Memory.get(); }
+
+  // ==================== Stack Methods ====================
+  const uint8_t *getEVMStack() const { return EVMStack; }
+  uint64_t getEVMStackSize() const { return EVMStackSize; }
 
   // ==================== Evmc Message Stack Methods ====================
   // Note: These methods manage the call stack for JIT host interface functions
@@ -101,6 +122,12 @@ public:
   const Error &getError() const { return Err; }
   void setError(const Error &E) { Err = E; }
   void clearError() { Err = ErrorCode::NoError; }
+
+  /// Reset instance state for reuse across EVMC execute() calls, regardless
+  /// of execution mode (interpreter, multipass, or JIT). This avoids the cost
+  /// of destroying and recreating the instance for each call.
+  void resetForNewCall(evmc_revision NewRev);
+  void resetForNewCall(evmc_revision NewRev, const EVMModule &M);
 
   // can only called by hostapi directly
   // setExceptionByHostapi must be inline to capture the hostapi's frame
@@ -142,17 +169,36 @@ public:
     std::unordered_map<std::pair<const evmc_message *, uint64_t>, evmc::bytes32,
                        PairHash>
         CalldataLoads;
-    std::vector<evmc::bytes32> ExtcodeHashes;
-    std::vector<evmc::bytes32> Keccak256Results;
+    std::deque<evmc::bytes32> ExtcodeHashes;
+    std::deque<evmc::bytes32> Keccak256Results;
     bool TxContextCached = false;
+
+    void clear() {
+      TxContext = {};
+      TxContextCached = false;
+      BlockHashes.clear();
+      BlobHashes.clear();
+      CalldataLoads.clear();
+      ExtcodeHashes.clear();
+      Keccak256Results.clear();
+    }
   };
 
   ExecutionCache &getMessageCache() { return InstanceExecutionCache; }
-  void clearMessageCache() { InstanceExecutionCache = ExecutionCache{}; }
+  void clearMessageCache() {
+    // Keep allocated capacity across calls to reduce allocator churn.
+    InstanceExecutionCache.clear();
+  }
   void setReturnData(std::vector<uint8_t> Data) {
+    ReturnDataSize = Data.size();
     ReturnData = std::move(Data);
   }
+  void clearReturnData() {
+    clearReturnDataBuffer(ReturnData);
+    ReturnDataSize = 0;
+  }
   const std::vector<uint8_t> &getReturnData() const { return ReturnData; }
+  uint64_t getReturnDataSize() const { return ReturnDataSize; }
   void setExeResult(evmc::Result Result) { ExeResult = std::move(Result); }
   const evmc::Result &getExeResult() const { return ExeResult; }
   void exit(int32_t ExitCode);
@@ -172,11 +218,46 @@ public:
     return static_cast<int32_t>(offsetof(EVMInstance, CurrentMessage));
   }
 
+  static constexpr int32_t getModuleOffset() {
+    static_assert(offsetof(EVMInstance, Mod) <=
+                      std::numeric_limits<int32_t>::max(),
+                  "EVMInstance offsets should fit in 32-bit signed range");
+    return static_cast<int32_t>(offsetof(EVMInstance, Mod));
+  }
+
   static constexpr int32_t getMessageGasOffset() {
     static_assert(offsetof(evmc_message, gas) <=
                       std::numeric_limits<int32_t>::max(),
                   "evmc_message offsets should fit in 32-bit signed range");
     return static_cast<int32_t>(offsetof(evmc_message, gas));
+  }
+
+  static constexpr int32_t getMessageRecipientOffset() {
+    static_assert(offsetof(evmc_message, recipient) <=
+                      std::numeric_limits<int32_t>::max(),
+                  "evmc_message offsets should fit in 32-bit signed range");
+    return static_cast<int32_t>(offsetof(evmc_message, recipient));
+  }
+
+  static constexpr int32_t getMessageSenderOffset() {
+    static_assert(offsetof(evmc_message, sender) <=
+                      std::numeric_limits<int32_t>::max(),
+                  "evmc_message offsets should fit in 32-bit signed range");
+    return static_cast<int32_t>(offsetof(evmc_message, sender));
+  }
+
+  static constexpr int32_t getMessageInputSizeOffset() {
+    static_assert(offsetof(evmc_message, input_size) <=
+                      std::numeric_limits<int32_t>::max(),
+                  "evmc_message offsets should fit in 32-bit signed range");
+    return static_cast<int32_t>(offsetof(evmc_message, input_size));
+  }
+
+  static constexpr int32_t getMessageValueOffset() {
+    static_assert(offsetof(evmc_message, value) <=
+                      std::numeric_limits<int32_t>::max(),
+                  "evmc_message offsets should fit in 32-bit signed range");
+    return static_cast<int32_t>(offsetof(evmc_message, value));
   }
 
   static constexpr int32_t getMessageDepthOffset() {
@@ -227,6 +308,13 @@ public:
                       std::numeric_limits<int32_t>::max(),
                   "EVMInstance offsets should fit in 32-bit signed range");
     return static_cast<int32_t>(offsetof(EVMInstance, MemorySize));
+  }
+
+  static constexpr int32_t getReturnDataSizeOffset() {
+    static_assert(offsetof(EVMInstance, ReturnDataSize) <=
+                      std::numeric_limits<int32_t>::max(),
+                  "EVMInstance offsets should fit in 32-bit signed range");
+    return static_cast<int32_t>(offsetof(EVMInstance, ReturnDataSize));
   }
 
   // Capacity for EVMStack: 1024 * 256 / 8 = 32768
@@ -286,6 +374,17 @@ private:
 
 #ifdef ZEN_ENABLE_VIRTUAL_STACK
   std::queue<utils::VirtualStackInfo *> VirtualStacks;
+
+public:
+  void pushVirtualStack(utils::VirtualStackInfo *VStack) {
+    VirtualStacks.push(VStack);
+  }
+  void popVirtualStack() { VirtualStacks.pop(); }
+  utils::VirtualStackInfo *currentVirtualStack() const {
+    return VirtualStacks.empty() ? nullptr : VirtualStacks.back();
+  }
+
+private:
 #endif
   // ========= EVM-specific fields start here =========
 
@@ -293,7 +392,7 @@ private:
   newEVMInstance(Isolation &Iso, const EVMModule &Mod, uint64_t GasLimit = 0);
 
   const EVMModule *Mod = nullptr;
-  uint64_t GasRefund = 0;
+  int64_t GasRefund = 0;
   // memory
   uint8_t *MemoryBase = nullptr;
   uint64_t MemorySize = 0;
@@ -304,11 +403,13 @@ private:
   };
   std::vector<MemoryFrame> MemoryStack;
   std::vector<uint8_t> ReturnData;
+  uint64_t ReturnDataSize = 0;
   evmc::Result ExeResult{EVMC_SUCCESS, 0, 0};
 
   // Message stack for call hierarchy tracking
   evmc_message *CurrentMessage = nullptr;
   std::vector<evmc_message *> MessageStack;
+  std::vector<uint64_t> GasRefundStack;
   evmc_revision Rev = zen::evm::DEFAULT_REVISION;
 
   // Instance-level cache storage (shared across all messages in execution)

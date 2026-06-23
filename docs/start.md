@@ -17,6 +17,44 @@ The fastest way to set up the compilation environment is to use a Docker image o
 docker pull dtvmdev1/dtvm-dev-x64:main
 ```
 
+## Build dependency cache
+
+DTVM uses CMake `FetchContent` to pull up to 8 external dependencies
+declared in `third_party/AddDeps.cmake` (`CLI11`, `intx`, `boost`,
+`rapidjson` are unconditional; `spdlog` is on unless `ZEN_ENABLE_SGX=ON`;
+`asmjit` is on with `ZEN_ENABLE_SINGLEPASS_JIT=ON`; `googletest` and
+`yaml-cpp` are on with `ZEN_ENABLE_SPEC_TEST=ON`). On a clean build
+these are downloaded fresh, which is the main source of CI / cold-build
+flakiness when an upstream host is slow or returns 504.
+
+To share the populated sources across builds (worktrees, repeated clean
+builds, multiple machines mounting the same home dir), export
+`FETCHCONTENT_BASE_DIR` before invoking cmake:
+
+```sh
+# Add to ~/.zshrc or ~/.bashrc:
+export FETCHCONTENT_BASE_DIR="$HOME/.cache/cmake-fetchcontent"
+mkdir -p "$FETCHCONTENT_BASE_DIR"
+```
+
+The top-level `CMakeLists.txt` honors this env var when no
+`-DFETCHCONTENT_BASE_DIR=…` is passed on the cmake command line. After
+the first successful configure, subsequent clean builds re-use the
+populated sources without re-downloading.
+
+To opt out (use the default `build/_deps/` per-build dir): `unset
+FETCHCONTENT_BASE_DIR`.
+
+**Note for SGX local builds**: if you build with `ZEN_ENABLE_SGX=ON`,
+use a separate cache directory (e.g.,
+`~/.cache/cmake-fetchcontent-sgx`) — asmjit gets a `PATCH_COMMAND`
+applied to its sources under SGX, and mixing patched and unpatched
+sources in one cache causes silent breakage. No current CI job builds
+with SGX, so the workflow-level cache (`/github/home/.fetchcontent`,
+keyed on `hashFiles('third_party/AddDeps.cmake')`) does not need to
+distinguish SGX state. Revisit the cache key composition when SGX is
+added to CI.
+
 ## Interpreter
 
 Interpreter mode is the current default execution mode. No specific CMake parameters are needed during compilation. Reference compilation commands are as follows:

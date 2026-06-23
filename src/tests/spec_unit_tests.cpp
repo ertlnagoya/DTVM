@@ -168,6 +168,15 @@ GTEST_API_ int main(int argc, char *argv[]) {
       ->excludes(DMMOption);
   CLIParser.add_flag("--enable-multipass-lazy", Config.EnableMultipassLazy,
                      "Enable multipass lazy mode(on request compile)");
+  CLIParser.add_flag("--enable-profile-guided-jit",
+                     Config.EnableProfileGuidedJIT,
+                     "Enable profile-guided JIT mode");
+  CLIParser.add_option("--jit-trigger-calls", Config.JITTriggerCallCount,
+                       "PGJ: call count threshold to trigger JIT");
+  CLIParser.add_option("--jit-trigger-gas", Config.JITTriggerTotalGas,
+                       "PGJ: gas usage threshold to trigger JIT");
+  CLIParser.add_option("--ring-buffer-capacity", Config.RingBufferCapacity,
+                       "PGJ: sliding window ring buffer capacity");
 #endif // ZEN_ENABLE_MULTIPASS_JIT
 
   CLI11_PARSE(CLIParser, argc, argv);

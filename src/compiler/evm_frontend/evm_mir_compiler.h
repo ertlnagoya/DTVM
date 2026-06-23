@@ -6,12 +6,15 @@
 
 #include "action/vm_eval_stack.h"
 #include "compiler/context.h"
+#include "compiler/evm_frontend/evm_value_range.h"
 #include "compiler/mir/function.h"
 #include "compiler/mir/instructions.h"
 #include "compiler/mir/pointer.h"
 #include "evm/evm.h"
 #include "evmc/instructions.h"
 #include "intx/intx.hpp"
+#include <algorithm>
+#include <unordered_map>
 #include <vector>
 
 // Forward declaration to avoid circular dependency
@@ -66,20 +69,36 @@ public:
   bool isGasMeteringEnabled() const { return GasMeteringEnabled; }
 
   void setGasChunkInfo(const uint32_t *ChunkEnd, const uint64_t *ChunkCost,
-                       size_t Size) {
+                       const uint64_t *ChunkCostSPP, size_t Size) {
     GasChunkEnd = ChunkEnd;
     GasChunkCost = ChunkCost;
+    GasChunkCostSPP = ChunkCostSPP;
     GasChunkSize = Size;
   }
   const uint32_t *getGasChunkEnd() const { return GasChunkEnd; }
   const uint64_t *getGasChunkCost() const { return GasChunkCost; }
+  const uint64_t *getGasChunkCostSPP() const { return GasChunkCostSPP; }
   size_t getGasChunkSize() const { return GasChunkSize; }
   bool hasGasChunks() const {
     return GasChunkEnd && GasChunkCost && GasChunkSize > 0;
   }
 
+  void setResolvedJumpTargets(
+      const std::unordered_map<uint32_t, uint32_t> *Targets) {
+    ResolvedJumpTargets = Targets;
+  }
+  const std::unordered_map<uint32_t, uint32_t> *getResolvedJumpTargets() const {
+    return ResolvedJumpTargets;
+  }
+
   void setRevision(evmc_revision Rev) { Revision = Rev; }
   evmc_revision getRevision() const { return Revision; }
+  void setMemoryLinearStrideSkipLeadingZeroLimbStores(uint8_t Count) {
+    MemoryLinearStrideSkipLeadingZeroLimbStores = Count;
+  }
+  uint8_t getMemoryLinearStrideSkipLeadingZeroLimbStores() const {
+    return MemoryLinearStrideSkipLeadingZeroLimbStores;
+  }
 
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   void setGasRegisterEnabled(bool Enabled) { GasRegisterEnabled = Enabled; }
@@ -92,8 +111,11 @@ private:
   bool GasMeteringEnabled = false;
   const uint32_t *GasChunkEnd = nullptr;
   const uint64_t *GasChunkCost = nullptr;
+  const uint64_t *GasChunkCostSPP = nullptr;
   size_t GasChunkSize = 0;
+  const std::unordered_map<uint32_t, uint32_t> *ResolvedJumpTargets = nullptr;
   evmc_revision Revision = zen::evm::DEFAULT_REVISION;
+  uint8_t MemoryLinearStrideSkipLeadingZeroLimbStores = 0;
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   bool GasRegisterEnabled = false;
 #endif
@@ -115,10 +137,21 @@ public:
   using U256Value = std::array<uint64_t, EVM_ELEMENTS_COUNT>;
   using U256ConstInt = std::array<MConstantInt *, EVM_ELEMENTS_COUNT>;
 
+  // Range classification for u256 operands.  Narrower ranges enable
+  // single-instruction fast paths instead of expensive multi-limb arithmetic.
+  using ValueRange = EVMValueRange;
+
   EVMMirBuilder(CompilerContext &Context, MFunction &MFunc);
 
   class Operand {
   public:
+    enum class DeferredKind : uint8_t {
+      NONE,
+      BITWISE_NOT,
+      ZERO_TEST_EQ,
+      ZERO_TEST_NE
+    };
+
     Operand() = default;
     Operand(MInstruction *Instr, EVMType Type) : Instr(Instr), Type(Type) {}
     Operand(Variable *Var, EVMType Type) : Var(Var), Type(Type) {}
@@ -129,6 +162,13 @@ public:
       ZEN_ASSERT(Type == EVMType::UINT256 && "Multi-component only for U256");
     }
 
+    // Constructor for U256 multi-component with explicit range
+    Operand(U256Inst Components, EVMType Type, ValueRange Range)
+        : Type(Type), Range(Range), U256Components(Components),
+          IsU256MultiComponent(true) {
+      ZEN_ASSERT(Type == EVMType::UINT256 && "Multi-component only for U256");
+    }
+
     Operand(U256Var VarComponents, EVMType Type)
         : Type(Type), U256VarComponents(VarComponents),
           IsU256MultiComponent(true) {
@@ -136,7 +176,35 @@ public:
     }
 
     Operand(const U256Value &ConstValue)
-        : Type(EVMType::UINT256), ConstValue(ConstValue), IsConstant(true) {}
+        : Type(EVMType::UINT256), ConstValue(ConstValue), IsConstant(true) {
+      // Auto-derive range from constant value
+      if (ConstValue[1] == 0 && ConstValue[2] == 0 && ConstValue[3] == 0) {
+        Range = ValueRange::U64;
+      } else if (ConstValue[2] == 0 && ConstValue[3] == 0) {
+        Range = ValueRange::U128;
+      } else {
+        Range = ValueRange::U256;
+      }
+    }
+
+    static Operand createDeferredBitwiseNot(U256Inst BaseComponents) {
+      Operand Result;
+      Result.Type = EVMType::UINT256;
+      Result.DeferredValueKind = DeferredKind::BITWISE_NOT;
+      Result.U256Components = BaseComponents;
+      return Result;
+    }
+
+    static Operand createDeferredZeroTest(U256Inst BaseComponents,
+                                          bool IsNegated) {
+      Operand Result;
+      Result.Type = EVMType::UINT256;
+      Result.DeferredValueKind =
+          IsNegated ? DeferredKind::ZERO_TEST_NE : DeferredKind::ZERO_TEST_EQ;
+      Result.U256Components = BaseComponents;
+      Result.Range = ValueRange::U64;
+      return Result;
+    }
 
     MInstruction *getInstr() const { return Instr; }
     Variable *getVar() const { return Var; }
@@ -144,11 +212,42 @@ public:
 
     bool isEmpty() const {
       return !Instr && !Var && !IsU256MultiComponent && !IsConstant &&
-             Type == EVMType::VOID;
+             DeferredValueKind == DeferredKind::NONE && Type == EVMType::VOID;
     }
 
     bool isU256MultiComponent() const { return IsU256MultiComponent; }
     bool isConstant() const { return IsConstant; }
+    bool isZeroConstant() const {
+      return IsConstant && ConstValue[0] == 0 && ConstValue[1] == 0 &&
+             ConstValue[2] == 0 && ConstValue[3] == 0;
+    }
+    bool isOneConstant() const {
+      return IsConstant && ConstValue[0] == 1 && ConstValue[1] == 0 &&
+             ConstValue[2] == 0 && ConstValue[3] == 0;
+    }
+    bool isAllOnesConstant() const {
+      return IsConstant && ConstValue[0] == UINT64_MAX &&
+             ConstValue[1] == UINT64_MAX && ConstValue[2] == UINT64_MAX &&
+             ConstValue[3] == UINT64_MAX;
+    }
+    bool isConstU64() const {
+      return IsConstant && ConstValue[1] == 0 && ConstValue[2] == 0 &&
+             ConstValue[3] == 0;
+    }
+    bool isDeferredValue() const {
+      return DeferredValueKind != DeferredKind::NONE;
+    }
+    bool isDeferredBitwiseNot() const {
+      return DeferredValueKind == DeferredKind::BITWISE_NOT;
+    }
+    bool isDeferredZeroTest() const {
+      return DeferredValueKind == DeferredKind::ZERO_TEST_EQ ||
+             DeferredValueKind == DeferredKind::ZERO_TEST_NE;
+    }
+    bool isDeferredZeroTestNegated() const {
+      ZEN_ASSERT(isDeferredZeroTest() && "Not a deferred zero-test value");
+      return DeferredValueKind == DeferredKind::ZERO_TEST_NE;
+    }
 
     const U256Inst &getU256Components() const {
       ZEN_ASSERT(IsU256MultiComponent && "Not a multi-component U256");
@@ -162,6 +261,30 @@ public:
       ZEN_ASSERT(IsConstant && "Not a constant value");
       return ConstValue;
     }
+    const U256Inst &getDeferredBaseComponents() const {
+      ZEN_ASSERT(DeferredValueKind != DeferredKind::NONE &&
+                 "Not a deferred value");
+      return U256Components;
+    }
+
+    // Provable value range — narrower ranges enable fast arithmetic paths
+    ValueRange getRange() const { return Range; }
+    void setRange(ValueRange NewRange) { Range = NewRange; }
+
+    // Check whether both operands provably fit in u64
+    static bool bothFitU64(const Operand &A, const Operand &B) {
+      return A.getRange() == ValueRange::U64 && B.getRange() == ValueRange::U64;
+    }
+
+    static ValueRange maxRange(const Operand &A, const Operand &B) {
+      return std::max(A.getRange(), B.getRange());
+    }
+
+    // One tier wider in the U64<U128<U256 lattice: U64->U128, else U256. Shared
+    // by the u64-const ADD/MUL result ranges (u64+u64 < 2^65, u64*u64 < 2^128).
+    static ValueRange widenOneTier(ValueRange R) {
+      return R == ValueRange::U64 ? ValueRange::U128 : ValueRange::U256;
+    }
 
     constexpr bool isReg() { return false; }
     constexpr bool isTempReg() { return true; }
@@ -170,6 +293,7 @@ public:
     MInstruction *Instr = nullptr;
     Variable *Var = nullptr;
     EVMType Type = EVMType::VOID;
+    ValueRange Range = ValueRange::U256;
 
     // For EVMU256Type: 4 I64 components [0]=low, [1]=mid-low, [2]=mid-high,
     // [3]=high
@@ -178,6 +302,7 @@ public:
     U256Value ConstValue = {};
     bool IsConstant = false;
     bool IsU256MultiComponent = false;
+    DeferredKind DeferredValueKind = DeferredKind::NONE;
   };
 
   bool compile(CompilerContext *Context);
@@ -186,6 +311,7 @@ public:
   void finalizeEVMBase();
 
   void meterOpcode(evmc_opcode Opcode, uint64_t PC);
+  void meterOpcodeRange(uint64_t StartPC, uint64_t EndPCExclusive);
   bool isOpcodeDefined(evmc_opcode Opcode) const;
   void meterGas(uint64_t GasCost);
 
@@ -206,6 +332,20 @@ public:
 
   void stackSet(int32_t IndexFromTop, Operand SetValue);
   Operand stackGet(int32_t IndexFromTop);
+  void setTrackedStackDepth(uint32_t Depth);
+  Operand createStackEntryOperand(ValueRange Range = ValueRange::U256);
+  void assignStackEntryOperand(const Operand &Dest, const Operand &Value);
+  Operand prepareStackPhiIncoming(const Operand &Value);
+  void registerCurrentBlockPC(uint64_t BlockPC);
+  Operand materializeStackMergeOperand(
+      const std::vector<uint64_t> &PredBlockPCs,
+      const std::vector<std::pair<uint64_t, Operand>> &IncomingValues);
+  void assignStackMergeOperand(const Operand &Dest, uint64_t PredBlockPC,
+                               const Operand &Value);
+  void spillTrackedStack(const std::vector<Operand> &TrackedStack);
+  void
+  spillTrackedStackPreservingPrefix(const std::vector<Operand> &TrackedStack,
+                                    uint32_t PrefixDepth);
 
   // PUSH0: place value 0 on stack
   // PUSH1-PUSH32: Push N bytes onto stack
@@ -223,6 +363,87 @@ public:
 
   template <BinaryOperator Operator>
   Operand handleBinaryArithmetic(const Operand &LHSOp, const Operand &RHSOp) {
+    // Phase 0: Constant folding
+    if (LHSOp.isConstant() && RHSOp.isConstant()) {
+      intx::uint256 L = u256ValueToIntx(LHSOp.getConstValue());
+      intx::uint256 R = u256ValueToIntx(RHSOp.getConstValue());
+      intx::uint256 Res;
+      if constexpr (Operator == BinaryOperator::BO_ADD) {
+        Res = L + R;
+      } else if constexpr (Operator == BinaryOperator::BO_SUB) {
+        Res = L - R;
+      } else {
+        ZEN_ASSERT_TODO();
+      }
+      return Operand(intxToU256Value(Res));
+    }
+
+    if constexpr (Operator == BinaryOperator::BO_ADD) {
+      if (LHSOp.isZeroConstant()) {
+        return RHSOp;
+      }
+      if (RHSOp.isZeroConstant()) {
+        return LHSOp;
+      }
+    }
+
+    if constexpr (Operator == BinaryOperator::BO_SUB) {
+      if (RHSOp.isZeroConstant()) {
+        return LHSOp;
+      }
+    }
+
+    // Phase 1: Range-based u64 fast path for ADD
+    // When both operands provably fit in u64, emit single ADD + carry
+    // instead of the full 4-limb ADC chain.  Result fits in u128.
+    if constexpr (Operator == BinaryOperator::BO_ADD) {
+      if (Operand::bothFitU64(LHSOp, RHSOp) && !LHSOp.isConstant() &&
+          !RHSOp.isConstant()) {
+        MType *MirI64Type =
+            EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+        MInstruction *Zero = createIntConstInstruction(MirI64Type, 0);
+        U256Inst LHS = extractU256Operand(LHSOp);
+        U256Inst RHS = extractU256Operand(RHSOp);
+        MInstruction *Sum = createInstruction<BinaryInstruction>(
+            false, OP_add, MirI64Type, LHS[0], RHS[0]);
+        Sum = protectUnsafeValue(Sum, MirI64Type);
+        // Carry = (Sum < LHS[0]) ? 1 : 0
+        MInstruction *CarryCmp = createInstruction<CmpInstruction>(
+            false, CmpInstruction::ICMP_ULT, MirI64Type, Sum, LHS[0]);
+        MInstruction *CarryExt = zeroExtendToI64(CarryCmp);
+        U256Inst Result = {Sum, CarryExt, Zero, Zero};
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+        ++MemStats.AddFastRangeU64Count;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+        return Operand(Result, EVMType::UINT256, ValueRange::U128);
+      }
+    }
+
+    // Phase 2: u64 fast path for ADD - share zero const for upper RHS limbs
+    if constexpr (Operator == BinaryOperator::BO_ADD) {
+      bool LHSIsU64 = LHSOp.isConstU64();
+      bool RHSIsU64 = RHSOp.isConstU64();
+      if (LHSIsU64 || RHSIsU64) {
+        // ADD is commutative: normalize so the u64 const is on the RHS
+        const Operand &FullOp = LHSIsU64 ? RHSOp : LHSOp;
+        const Operand &U64Op = LHSIsU64 ? LHSOp : RHSOp;
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+        ++MemStats.AddFastConstU64Count;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+        return handleAddU64Const(FullOp, U64Op);
+      }
+    }
+
+    // Phase 2: u64 fast path for SUB (only when RHS is u64 const)
+    if constexpr (Operator == BinaryOperator::BO_SUB) {
+      if (RHSOp.isConstU64()) {
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+        ++MemStats.SubFastConstU64Count;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+        return handleSubU64Const(LHSOp, RHSOp);
+      }
+    }
+
     U256Inst Result = {};
     U256Inst LHS = extractU256Operand(LHSOp);
     U256Inst RHS = extractU256Operand(RHSOp);
@@ -230,59 +451,66 @@ public:
         EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
 
     if constexpr (Operator == BinaryOperator::BO_ADD) {
-      // u256 in little-endian order: [low64, mid64_1, mid64_2, high64]
-
-      // The carry here is only used for constructing the adc instruction.
-      // We currently use adc only in bo_add, and since we can guarantee the
-      // instructions are consecutive, there's no need to compute the carry
-      // in DMIR.
       MInstruction *Carry = createIntConstInstruction(MirI64Type, 0);
+
+      // Pre-materialize all operand components into variables before the
+      // ADD/ADC carry chain to prevent flag-clobbering during x86 lowering.
+      for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+        LHS[I] = protectUnsafeValue(LHS[I], MirI64Type);
+        RHS[I] = protectUnsafeValue(RHS[I], MirI64Type);
+      }
 
       for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
         if (I == 0) {
-          // First component: use regular ADD without carry
           MInstruction *LocalResult = createInstruction<BinaryInstruction>(
               false, OP_add, MirI64Type, LHS[I], RHS[I]);
           Result[I] = protectUnsafeValue(LocalResult, MirI64Type);
         } else {
-          // Subsequent components: use ADC (without carry)
-          // The carry here is only used for constructing the adc instruction.
           MInstruction *LocalResult = createInstruction<AdcInstruction>(
               false, MirI64Type, LHS[I], RHS[I], Carry);
           Result[I] = protectUnsafeValue(LocalResult, MirI64Type);
         }
       }
     } else if constexpr (Operator == BinaryOperator::BO_SUB) {
+      // The borrow here is only used for constructing the sbb instruction.
+      // We currently use sbb only in bo_sub, and since we can guarantee the
+      // instructions are consecutive, there's no need to compute the borrow
+      // in DMIR.
       MInstruction *Borrow = createIntConstInstruction(MirI64Type, 0);
 
+      // Pre-materialize all operand components into variables before the
+      // SUB/SBB borrow chain. This ensures that during x86 lowering, no
+      // flag-modifying instructions (e.g. ADD for address computation in
+      // BYTES32-to-U256 conversion) are emitted between the SUB and SBB
+      // instructions that form the borrow chain. Without this, lazy
+      // expression lowering of operands like BSWAP(LOAD(ADD(ptr, offset)))
+      // would emit x86 ADD instructions that clobber the carry flag (CF).
       for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
-        // Sub: LHS[I] - RHS[I] - Borrow
-        MInstruction *Diff1 = createInstruction<BinaryInstruction>(
-            false, OP_sub, MirI64Type, LHS[I], RHS[I]);
-        MInstruction *Diff2 = createInstruction<BinaryInstruction>(
-            false, OP_sub, MirI64Type, Diff1, Borrow);
+        LHS[I] = protectUnsafeValue(LHS[I], MirI64Type);
+        RHS[I] = protectUnsafeValue(RHS[I], MirI64Type);
+      }
 
-        Result[I] = protectUnsafeValue(Diff2, MirI64Type);
-
-        // (LHS[I] < RHS[I]) || (Diff1 < Borrow)
-        if (I < EVM_ELEMENTS_COUNT - 1) {
-          auto LTPredicate = CmpInstruction::Predicate::ICMP_ULT;
-          MInstruction *Borrow1 = createInstruction<CmpInstruction>(
-              false, LTPredicate, &Ctx.I64Type, LHS[I], RHS[I]);
-          MInstruction *Borrow2 = createInstruction<CmpInstruction>(
-              false, LTPredicate, &Ctx.I64Type, Diff1, Borrow);
-          // NOLINTBEGIN(readability-identifier-naming)
-          MInstruction *Borrow1_64 = zeroExtendToI64(Borrow1);
-          MInstruction *Borrow2_64 = zeroExtendToI64(Borrow2);
-          // NOLINTEND(readability-identifier-naming)
-
-          Borrow = createInstruction<BinaryInstruction>(
-              false, OP_or, MirI64Type, Borrow1_64, Borrow2_64);
+      for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+        if (I == 0) {
+          MInstruction *LocalResult = createInstruction<BinaryInstruction>(
+              false, OP_sub, MirI64Type, LHS[I], RHS[I]);
+          Result[I] = protectUnsafeValue(LocalResult, MirI64Type);
+        } else {
+          MInstruction *LocalResult = createInstruction<SbbInstruction>(
+              false, MirI64Type, LHS[I], RHS[I], Borrow);
+          Result[I] = protectUnsafeValue(LocalResult, MirI64Type);
         }
       }
     } else {
       ZEN_ASSERT_TODO();
     }
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    if constexpr (Operator == BinaryOperator::BO_ADD) {
+      ++MemStats.AddFullCount;
+    } else if constexpr (Operator == BinaryOperator::BO_SUB) {
+      ++MemStats.SubFullCount;
+    }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
     return Operand(Result, EVMType::UINT256);
   }
 
@@ -295,15 +523,208 @@ public:
   Operand handleMulMod(Operand MultiplicandOp, Operand MultiplierOp,
                        Operand ModulusOp);
   Operand handleExp(Operand BaseOp, Operand ExponentOp);
+  // EIP-160 dynamic gas for a constant-exponent EXP (GasPerByte * significant
+  // exponent bytes). Static + public so the const-fold path and tests share it.
+  static uint64_t constExpDynamicGas(const intx::uint256 &Exponent,
+                                     evmc_revision Rev);
   template <CompareOperator Operator>
   Operand handleCompareOp(Operand LHSOp, Operand RHSOp) {
+    // Phase 0: Constant folding
+    if constexpr (Operator == CompareOperator::CO_EQZ) {
+      if (LHSOp.isConstant()) {
+        const auto &V = LHSOp.getConstValue();
+        uint64_t R = (V[0] == 0 && V[1] == 0 && V[2] == 0 && V[3] == 0) ? 1 : 0;
+        return Operand(U256Value{R, 0, 0, 0});
+      }
+
+      if (LHSOp.isDeferredZeroTest()) {
+        return Operand::createDeferredZeroTest(
+            LHSOp.getDeferredBaseComponents(),
+            !LHSOp.isDeferredZeroTestNegated());
+      }
+
+      return Operand::createDeferredZeroTest(extractU256Operand(LHSOp), false);
+    } else {
+      if (LHSOp.isConstant() && RHSOp.isConstant()) {
+        intx::uint256 L = u256ValueToIntx(LHSOp.getConstValue());
+        intx::uint256 R = u256ValueToIntx(RHSOp.getConstValue());
+        uint64_t Res = 0;
+        if constexpr (Operator == CompareOperator::CO_EQ) {
+          Res = (L == R) ? 1 : 0;
+        } else if constexpr (Operator == CompareOperator::CO_LT) {
+          Res = (L < R) ? 1 : 0;
+        } else if constexpr (Operator == CompareOperator::CO_GT) {
+          Res = (L > R) ? 1 : 0;
+        } else if constexpr (Operator == CompareOperator::CO_LT_S) {
+          bool Lneg = (LHSOp.getConstValue()[3] >> 63) != 0;
+          bool Rneg = (RHSOp.getConstValue()[3] >> 63) != 0;
+          if (Lneg != Rneg) {
+            Res = Lneg ? 1 : 0;
+          } else {
+            Res = (L < R) ? 1 : 0;
+          }
+        } else if constexpr (Operator == CompareOperator::CO_GT_S) {
+          bool Lneg = (LHSOp.getConstValue()[3] >> 63) != 0;
+          bool Rneg = (RHSOp.getConstValue()[3] >> 63) != 0;
+          if (Lneg != Rneg) {
+            Res = Rneg ? 1 : 0;
+          } else {
+            Res = (L > R) ? 1 : 0;
+          }
+        }
+        return Operand(U256Value{Res, 0, 0, 0});
+      }
+    }
+
+    // Phase 3: u64 fast path for EQ
+    if constexpr (Operator == CompareOperator::CO_EQ) {
+      if (LHSOp.isConstU64() || RHSOp.isConstU64()) {
+        const Operand &U64Op = LHSOp.isConstU64() ? LHSOp : RHSOp;
+        const Operand &OtherOp = LHSOp.isConstU64() ? RHSOp : LHSOp;
+        return handleCompareEqU64(OtherOp, U64Op.getConstValue()[0]);
+      }
+    }
+
+    // Phase 3: u64 fast path for unsigned LT/GT
+    if constexpr (Operator == CompareOperator::CO_LT) {
+      if (RHSOp.isConstU64()) {
+        return handleCompareLtRhsU64(LHSOp, RHSOp.getConstValue()[0]);
+      }
+      if (LHSOp.isConstU64()) {
+        return handleCompareGtRhsU64(RHSOp, LHSOp.getConstValue()[0]);
+      }
+    }
+    if constexpr (Operator == CompareOperator::CO_GT) {
+      if (RHSOp.isConstU64()) {
+        return handleCompareGtRhsU64(LHSOp, RHSOp.getConstValue()[0]);
+      }
+      if (LHSOp.isConstU64()) {
+        return handleCompareLtRhsU64(RHSOp, LHSOp.getConstValue()[0]);
+      }
+    }
+
     U256Inst Result = handleCompareImpl<Operator>(LHSOp, RHSOp, &Ctx.I64Type);
-    return Operand(Result, EVMType::UINT256);
+    // Comparison results are always 0 or 1
+    return Operand(Result, EVMType::UINT256, ValueRange::U64);
   }
 
   // EVM bitwise opcode: and, or, xor
   template <BinaryOperator Operator>
   Operand handleBitwiseOp(const Operand &LHSOp, const Operand &RHSOp) {
+    // Phase 0: Constant folding
+    if (LHSOp.isConstant() && RHSOp.isConstant()) {
+      const auto &L = LHSOp.getConstValue();
+      const auto &R = RHSOp.getConstValue();
+      U256Value Res;
+      for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+        if constexpr (Operator == BinaryOperator::BO_AND) {
+          Res[I] = L[I] & R[I];
+        } else if constexpr (Operator == BinaryOperator::BO_OR) {
+          Res[I] = L[I] | R[I];
+        } else if constexpr (Operator == BinaryOperator::BO_XOR) {
+          Res[I] = L[I] ^ R[I];
+        }
+      }
+      return Operand(Res);
+    }
+
+    if constexpr (Operator == BinaryOperator::BO_AND) {
+      if (LHSOp.isZeroConstant() || RHSOp.isZeroConstant()) {
+        return Operand(U256Value{0, 0, 0, 0});
+      }
+      if (LHSOp.isAllOnesConstant()) {
+        return RHSOp;
+      }
+      if (RHSOp.isAllOnesConstant()) {
+        return LHSOp;
+      }
+    }
+
+    if constexpr (Operator == BinaryOperator::BO_OR ||
+                  Operator == BinaryOperator::BO_XOR) {
+      if (LHSOp.isZeroConstant()) {
+        return RHSOp;
+      }
+      if (RHSOp.isZeroConstant()) {
+        return LHSOp;
+      }
+    }
+
+    // Phase 1: u64 fast path for AND - upper limbs are annihilated to 0
+    if constexpr (Operator == BinaryOperator::BO_AND) {
+      if (LHSOp.isConstU64() || RHSOp.isConstU64()) {
+        const Operand &U64Op = LHSOp.isConstU64() ? LHSOp : RHSOp;
+        const Operand &OtherOp = LHSOp.isConstU64() ? RHSOp : LHSOp;
+        U256Inst Other = extractU256Operand(OtherOp);
+        MType *MirI64Type =
+            EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+        MInstruction *U64Val =
+            createIntConstInstruction(MirI64Type, U64Op.getConstValue()[0]);
+        MInstruction *Zero = createIntConstInstruction(MirI64Type, 0);
+        U256Inst Result = {};
+        Result[0] =
+            protectUnsafeValue(createInstruction<BinaryInstruction>(
+                                   false, OP_and, MirI64Type, Other[0], U64Val),
+                               MirI64Type);
+        for (size_t I = 1; I < EVM_ELEMENTS_COUNT; ++I) {
+          Result[I] = Zero;
+        }
+        return Operand(Result, EVMType::UINT256, ValueRange::U64);
+      }
+
+      // Non-constant AND with a U128 mask: result fits in U128
+      if (LHSOp.getRange() <= ValueRange::U128 ||
+          RHSOp.getRange() <= ValueRange::U128) {
+        // AND narrows to the smaller operand range
+        ValueRange NarrowRange = std::min(LHSOp.getRange(), RHSOp.getRange());
+        U256Inst LHS = extractU256Operand(LHSOp);
+        U256Inst RHS = extractU256Operand(RHSOp);
+        MType *MirI64Type =
+            EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+        MInstruction *Zero = createIntConstInstruction(MirI64Type, 0);
+        U256Inst Result = {};
+        for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+          if (NarrowRange == ValueRange::U64 && I >= 1) {
+            Result[I] = Zero;
+          } else if (NarrowRange == ValueRange::U128 && I >= 2) {
+            Result[I] = Zero;
+          } else {
+            Result[I] = protectUnsafeValue(
+                createInstruction<BinaryInstruction>(false, OP_and, MirI64Type,
+                                                     LHS[I], RHS[I]),
+                MirI64Type);
+          }
+        }
+        return Operand(Result, EVMType::UINT256, NarrowRange);
+      }
+    }
+
+    // Phase 1: u64 fast path for OR/XOR - upper limbs pass through (identity)
+    if constexpr (Operator == BinaryOperator::BO_OR ||
+                  Operator == BinaryOperator::BO_XOR) {
+      if (LHSOp.isConstU64() || RHSOp.isConstU64()) {
+        const Operand &U64Op = LHSOp.isConstU64() ? LHSOp : RHSOp;
+        const Operand &OtherOp = LHSOp.isConstU64() ? RHSOp : LHSOp;
+        U256Inst Other = extractU256Operand(OtherOp);
+        MType *MirI64Type =
+            EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+        MInstruction *U64Val =
+            createIntConstInstruction(MirI64Type, U64Op.getConstValue()[0]);
+        U256Inst Result = {};
+        Result[0] = protectUnsafeValue(
+            createInstruction<BinaryInstruction>(false, getMirOpcode(Operator),
+                                                 MirI64Type, Other[0], U64Val),
+            MirI64Type);
+        for (size_t I = 1; I < EVM_ELEMENTS_COUNT; ++I) {
+          Result[I] = Other[I];
+        }
+        // OR/XOR with a u64 constant: limbs[1..3] pass through as the same
+        // MInstruction pointers from OtherOp, so the value range of those
+        // limbs is preserved exactly. max(U64, OtherOp.range) = OtherOp.range.
+        return Operand(Result, EVMType::UINT256, OtherOp.getRange());
+      }
+    }
+
     U256Inst Result = {};
     U256Inst LHS = extractU256Operand(LHSOp);
     U256Inst RHS = extractU256Operand(RHSOp);
@@ -314,10 +735,17 @@ public:
           false, getMirOpcode(Operator), MirI64Type, LHS[I], RHS[I]);
       Result[I] = protectUnsafeValue(LocalResult, MirI64Type);
     }
+    if constexpr (Operator == BinaryOperator::BO_OR ||
+                  Operator == BinaryOperator::BO_XOR) {
+      ValueRange ResultRange = Operand::maxRange(LHSOp, RHSOp);
+      return Operand(Result, EVMType::UINT256, ResultRange);
+    }
     return Operand(Result, EVMType::UINT256);
   }
 
   Operand handleNot(const Operand &LHSOp);
+
+  Operand handleClz(const Operand &ValueOp);
 
   Operand handleByte(Operand IndexOp, Operand ValueOp);
 
@@ -325,6 +753,36 @@ public:
 
   template <BinaryOperator Operator>
   Operand handleShift(Operand ShiftOp, Operand ValueOp) {
+    // Phase 0: Constant folding
+    if (ShiftOp.isConstant() && ValueOp.isConstant()) {
+      intx::uint256 ShiftVal = u256ValueToIntx(ShiftOp.getConstValue());
+      intx::uint256 Value = u256ValueToIntx(ValueOp.getConstValue());
+      intx::uint256 Res;
+      if (ShiftVal >= 256) {
+        if constexpr (Operator == BinaryOperator::BO_SHR_S) {
+          bool SignBit = (ValueOp.getConstValue()[3] >> 63) != 0;
+          Res = SignBit ? ~intx::uint256(0) : intx::uint256(0);
+        } else {
+          Res = intx::uint256(0);
+        }
+      } else {
+        auto Amt = static_cast<unsigned>(ShiftVal);
+        if constexpr (Operator == BinaryOperator::BO_SHL) {
+          Res = Value << Amt;
+        } else if constexpr (Operator == BinaryOperator::BO_SHR_U) {
+          Res = Value >> Amt;
+        } else if constexpr (Operator == BinaryOperator::BO_SHR_S) {
+          bool SignBit = (ValueOp.getConstValue()[3] >> 63) != 0;
+          Res = Value >> Amt;
+          if (SignBit && Amt > 0) {
+            intx::uint256 Mask = ~intx::uint256(0) << (256 - Amt);
+            Res |= Mask;
+          }
+        }
+      }
+      return Operand(intxToU256Value(Res));
+    }
+
     U256Inst Shift = extractU256Operand(ShiftOp);
     U256Inst Value = extractU256Operand(ValueOp);
 
@@ -345,6 +803,12 @@ public:
       Result = handleArithmeticRightShift(Value, ShiftAmount, IsLargeShift);
     }
 
+    // Unsigned right shift cannot widen: an N-bit value shifted right yields an
+    // at-most-N-bit value. SHL widens by construction; SAR sign-fills upper
+    // limbs; both keep the conservative U256 default.
+    if constexpr (Operator == BinaryOperator::BO_SHR_U) {
+      return Operand(Result, EVMType::UINT256, ValueOp.getRange());
+    }
     return Operand(Result, EVMType::UINT256);
   }
 
@@ -390,6 +854,18 @@ public:
   void handleReturnDataCopy(Operand DestOffsetComponents,
                             Operand OffsetComponents, Operand SizeComponents);
   Operand handleReturnDataSize();
+  void dumpMemoryCompileStats() const;
+  void beginMemoryCompileBlock(uint64_t EntryPC);
+  void setMemoryCompileBlockConstPrecheckPlan(uint64_t MaxRequiredSize,
+                                              uint64_t CoveredDirectOps);
+  void
+  setMemoryCompileBlockLinearPrecheckPlan(uint64_t AccessWidth,
+                                          uint64_t CoveredDirectOps,
+                                          bool ValueEqualsFirstAddr = false);
+  void prepareLinearBlockMemoryPrecheck(Operand StrideComponents);
+  void noteMemoryOpcodeInBlock(evmc_opcode Opcode, uint64_t PC);
+  void noteHelperOpcodeInBlock(evmc_opcode Opcode, uint64_t PC);
+  void endMemoryCompileBlock();
   template <size_t NumTopics, typename... TopicArgs>
   void handleLogWithTopics(Operand OffsetOp, Operand SizeOp,
                            TopicArgs... Topics);
@@ -420,6 +896,11 @@ public:
   void handleTStore(Operand Index, Operand ValueComponents);
   void handleSelfDestruct(Operand Beneficiary);
 
+  // ==================== Fallback Methods ====================
+
+  // Fallback to interpreter execution
+  void fallbackToInterpreter(uint64_t targetPC);
+
   // ==================== Runtime Interface for JIT ====================
 
 private:
@@ -436,6 +917,17 @@ private:
   Variable *storeInstructionInTemp(MInstruction *Value, MType *Type);
   MInstruction *loadVariable(Variable *Var);
   MInstruction *protectUnsafeValue(MInstruction *Value, MType *Type);
+  MInstruction *loadProtectedInstancePointer(int32_t Offset);
+  MInstruction *getProtectedFieldAddress(MInstruction *BasePtr, int32_t Offset,
+                                         MType *PointerType);
+  MInstruction *loadProtectedU64Field(MInstruction *BasePtr, int32_t Offset);
+  Operand loadProtectedBytes32FieldAsU256(MInstruction *BasePtr,
+                                          int32_t Offset);
+  Operand loadProtectedAddressFieldAsU256(MInstruction *BasePtr,
+                                          int32_t Offset);
+  MInstruction *getHostArgScratchPtr(std::size_t ScratchSlot);
+  PhiInstruction *createPendingPhi(MType *Type, size_t NumIncoming);
+  size_t getPhiIncomingSlot(PhiInstruction *Phi, uint64_t PredBlockPC) const;
 
   template <class T, typename... Arguments>
   T *createInstruction(bool IsStmt, Arguments &&...Args) {
@@ -530,7 +1022,8 @@ private:
     }
   }
 
-  U256Inst handleCompareEQZ(const U256Inst &LHS, MType *ResultType);
+  U256Inst handleCompareEQZ(const U256Inst &LHS, MType *ResultType,
+                            bool IsNegated = false);
 
   U256Inst handleCompareEQ(const U256Inst &LHS, const U256Inst &RHS,
                            MType *ResultType);
@@ -550,6 +1043,43 @@ private:
                                       MInstruction *ShiftAmount,
                                       MInstruction *IsLargeShift);
 
+  // U256Value <-> intx::uint256 conversion helpers
+  static intx::uint256 u256ValueToIntx(const U256Value &V) {
+    return (intx::uint256(V[3]) << 192) | (intx::uint256(V[2]) << 128) |
+           (intx::uint256(V[1]) << 64) | intx::uint256(V[0]);
+  }
+  static U256Value intxToU256Value(const intx::uint256 &V) {
+    U256Value R;
+    for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I)
+      R[I] = static_cast<uint64_t>(V >> (I * 64));
+    return R;
+  }
+
+  // u64 fast path helpers
+  Operand handleAddU64Const(const Operand &FullOp, const Operand &U64ConstOp);
+  Operand handleSubU64Const(const Operand &LHSOp, const Operand &U64ConstRHSOp);
+  Operand handleCompareEqU64(const Operand &FullOp, uint64_t U64Val);
+  Operand handleCompareLtRhsU64(const Operand &LHSOp, uint64_t RhsU64);
+  Operand handleCompareGtRhsU64(const Operand &LHSOp, uint64_t RhsU64);
+
+  // Helper functions for inline U256 multiplication
+  MInstruction *createEvmUmul128(MInstruction *LHS, MInstruction *RHS);
+  MInstruction *createEvmUmul128Hi(MInstruction *MulInst);
+
+  // Helper functions for inline U256/U64 division
+  MInstruction *createEvmUdiv128By64(MInstruction *Hi, MInstruction *Lo,
+                                     MInstruction *Divisor);
+  MInstruction *createEvmUrem128By64(MInstruction *DivInst);
+  Operand handleDivU64Divisor(const Operand &DividendOp, uint64_t Divisor);
+  Operand handleModU64Divisor(const Operand &DividendOp, uint64_t Divisor);
+  Operand handleDivU64Dividend(uint64_t Dividend, const Operand &DivisorOp);
+  Operand handleModU64Dividend(uint64_t Dividend, const Operand &DivisorOp);
+
+  // General u256 div/mod with runtime divisor-size branching.
+  // WantQuotient=true returns quotient (DIV), false returns remainder (MOD).
+  Operand handleDivModGeneral(const Operand &DividendOp,
+                              const Operand &DivisorOp, bool WantQuotient);
+
   // ==================== EVM to MIR Opcode Mapping ====================
 
   Opcode getMirOpcode(BinaryOperator BinOpr);
@@ -561,6 +1091,10 @@ private:
   // Template versions of runtime calls
   template <typename RetType>
   Operand callRuntimeFor(RetType (*RuntimeFunc)(runtime::EVMInstance *));
+  // Emits host soft-error checks in check mode after runtime call.
+  template <typename RetType>
+  Operand callRuntimeForWithErrorCheck(
+      RetType (*RuntimeFunc)(runtime::EVMInstance *));
 
   template <typename ArgType>
   U256Inst convertOperandToInstruction(const Operand &Param);
@@ -575,6 +1109,12 @@ private:
   Operand callRuntimeFor(RetType (*RuntimeFunc)(runtime::EVMInstance *,
                                                 ArgTypes...),
                          const ParamTypes &...Params);
+  // Emits host soft-error checks in check mode after runtime call.
+  template <typename RetType, typename... ArgTypes, typename... ParamTypes>
+  Operand callRuntimeForWithErrorCheck(
+      RetType (*RuntimeFunc)(runtime::EVMInstance *, ArgTypes...),
+      const ParamTypes &...Params);
+  void emitRuntimeSoftErrorCheck(MInstruction *InstancePtr);
 
   // Helper template functions for runtime call type mapping
   template <typename RetType> MType *getMIRReturnType();
@@ -591,16 +1131,44 @@ private:
   // Split normalization for const and non-const U256.
   void normalizeOperandU64Const(Operand &Param, uint64_t *Value = nullptr);
   void normalizeOperandU64NonConst(Operand &Param, uint64_t *Value = nullptr);
+  MInstruction *anchorDirectMemoryPointer(MInstruction *Ptr);
+  MInstruction *extractKnownU64LowOperand(const Operand &Opnd);
+  void normalizeOffsetWithSize(Operand &Offset, Operand &Size);
 
   Operand convertSingleInstrToU256Operand(MInstruction *SingleInstr);
   Operand convertU256InstrToU256Operand(MInstruction *U256Instr);
   Operand convertBytes32ToU256Operand(const Operand &Bytes32Op);
+  Operand loadU256FromBytes32PointerDisplaced(MInstruction *Bytes32Ptr);
+  Operand loadU256FromBytes32BaseDisplaced(MInstruction *BytesBasePtr,
+                                           uint64_t BaseOffset);
+  void storeU256ToBytes32Pointer(MInstruction *Bytes32Ptr,
+                                 const U256Inst &ValueParts,
+                                 uint64_t SkipLeadingZeroLimbStores = 0);
+  void storeU256ToBytes32BaseDisplaced(MInstruction *BytesBasePtr,
+                                       uint64_t BaseOffset,
+                                       const U256Inst &ValueParts,
+                                       uint64_t SkipLeadingZeroLimbStores = 0);
 
   // Helper functions for operand conversion
   template <size_t N>
   U256Inst convertOperandToUNInstruction(const Operand &Param);
 
-  MBasicBlock *getOrCreateIndirectJumpBB();
+  MBasicBlock *getOrCreateIndirectJumpBB(uint64_t SourceBlockPC);
+  void registerPhiIncomingBlock(uint64_t TargetBlockPC, uint64_t PredBlockPC,
+                                MBasicBlock *PredBB);
+  void registerDynamicJumpPhiIncomingBlock(uint64_t TargetBlockPC,
+                                           uint64_t PredBlockPC,
+                                           MBasicBlock *PredBB);
+  MBasicBlock *getPhiIncomingBlock(uint64_t TargetBlockPC,
+                                   uint64_t PredBlockPC) const;
+  uint64_t getCanonicalJumpDestPC(uint64_t TargetBlockPC) const;
+  MBasicBlock *resolvePhiIncomingPredecessorBB(uint64_t TargetBlockPC,
+                                               MBasicBlock *DirectPredBB) const;
+  MBasicBlock *
+  resolveReachablePhiIncomingPredecessorBB(uint64_t TargetBlockPC,
+                                           MBasicBlock *CandidateBB) const;
+  MBasicBlock *resolveReachablePredecessorBB(MBasicBlock *TargetBB,
+                                             MBasicBlock *CandidateBB) const;
 
   CompilerContext &Ctx;
   MFunction *CurFunc = nullptr;
@@ -620,14 +1188,23 @@ private:
 
   // Jump table for dynamic jumps
   bool HasIndirectJump = false;
+  // Entry blocks for jump targets (may be tiny thunks for shared JUMPDEST
+  // bodies).
   std::map<uint64_t, MBasicBlock *> JumpDestTable;
-  MBasicBlock *DefaultJumpBB = nullptr; // For invalid jump destinations
+  std::map<uint64_t, uint64_t> JumpDestCanonicalPCTable;
+  // Canonical execution blocks for JUMPDEST opcodes in linear decode.
+  std::map<uint64_t, MBasicBlock *> JumpDestBodyTable;
+  // Cached skipped-metering for merged consecutive JUMPDEST runs.
+  // Cache it so meterOpcodeRange(S, E) doesn't have to re-scan the same run.
+  std::vector<uint32_t> JumpDestRunLastPC;   // [S] = E, else invalid sentinel
+  std::vector<uint64_t> JumpDestRunSkipCost; // [S] = sum cost for [S, E)
+  MBasicBlock *DefaultJumpBB = nullptr;      // For invalid jump destinations
 
   std::map<uint64_t, std::vector<MBasicBlock *>> JumpHashTable;
   std::map<uint64_t, std::vector<uint64_t>> JumpHashReverse;
   uint64_t HashMask = 0;
   Variable *JumpTargetVar = nullptr;
-  MBasicBlock *IndirectJumpBB = nullptr;
+  std::map<uint64_t, MBasicBlock *> IndirectJumpBBs;
 
   // Stack check block for stack overflow/underflow checking
   MBasicBlock *StackCheckBB = nullptr;
@@ -635,9 +1212,269 @@ private:
   Variable *StackSizeVar = nullptr;
   Variable *MemoryBaseVar = nullptr;
   Variable *MemorySizeVar = nullptr;
+  uint64_t CurrentBlockPC = 0;
+  std::map<uint64_t, MBasicBlock *> BlockEntryTable;
+  std::map<uint64_t, std::map<uint64_t, MBasicBlock *>>
+      DynamicPhiIncomingBlockTable;
+  std::map<PhiInstruction *, std::map<uint64_t, size_t>> PhiIncomingSlotMap;
+  std::map<VariableIdx, PhiInstruction *> StackMergePhiVarMap;
+
+  // Stack-merge phis and the loop-header block they belong to. A merge phi's
+  // incoming block is resolved eagerly when each predecessor edge's stack
+  // state is assigned (materializeStackMergeOperand / assignStackMergeOperand).
+  // For a loop back-edge this assignment happens before the predecessor's
+  // terminator wires the real CFG edge into the loop header, so the resolved
+  // incoming block can be the predecessor EVM block's entry MIR block rather
+  // than its terminator MIR block. finalizeStackMergePhiIncomingBlocks()
+  // re-resolves every recorded incoming block against the now-complete CFG.
+  std::vector<std::pair<PhiInstruction *, MBasicBlock *>> StackMergePhiBlocks;
+  void finalizeStackMergePhiIncomingBlocks();
+
+  struct MemoryCompileStats {
+    uint64_t MLoadExpandCount = 0;
+    uint64_t MStoreExpandCount = 0;
+    uint64_t MStore8ExpandCount = 0;
+    uint64_t MCopyExpandCount = 0;
+    uint64_t BlockConstPrecheckCount = 0;
+    uint64_t BlockLinearPrecheckCount = 0;
+    uint64_t PrecheckedMLoadOpCount = 0;
+    uint64_t PrecheckedMStoreOpCount = 0;
+    uint64_t MStoreAddrValueAliasReuseCount = 0;
+    uint64_t LinearU64AddrFastPathCount = 0;
+    uint64_t LinearU64MLoadFastPathCount = 0;
+    uint64_t LinearU64MStoreFastPathCount = 0;
+    uint64_t ConstBasePtrInitCount = 0;
+    uint64_t ConstBasePtrReuseCount = 0;
+    uint64_t ConstDispBytes32MLoadCount = 0;
+    uint64_t ConstDispBytes32MStoreCount = 0;
+    uint64_t DispBytes32MLoadCount = 0;
+    uint64_t DispBytes32MStoreCount = 0;
+    uint64_t MStoreZeroLimbStoreCount = 0;
+    uint64_t MStoreOverlapElidedLimbCount = 0;
+
+    uint64_t ReloadMemorySizeCount = 0;
+    uint64_t GetMemoryDataPointerCount = 0;
+    uint64_t MemoryBaseInstanceLoadCount = 0;
+    uint64_t MemoryBaseCacheUseCount = 0;
+
+    uint64_t ExpandNeedExpandCFGCount = 0;
+
+    uint64_t SmallFrameCandidateTotal = 0;
+    uint64_t SmallFramePrecheckedTotal = 0;
+    uint64_t SmallFrameOffsetConstTotal = 0;
+    uint64_t SmallFrameOffsetKnownU64Total = 0;
+    uint64_t SmallFrameMLoadCandidate = 0;
+    uint64_t SmallFrameMStoreCandidate = 0;
+    uint64_t SmallFrameMStore8Candidate = 0;
+    uint64_t SmallFrameFallbackUnknownOffset = 0;
+    uint64_t SmallFrameFallbackOver128 = 0;
+    uint64_t SmallFrameFallbackNoPrecheck = 0;
+    uint64_t SmallFrameFallbackOverflow = 0;
+    uint64_t SmallFrameFallbackDynamicSize = 0;
+    uint64_t SmallFrameFallbackGasOrMemorySemanticsUncertain = 0;
+
+    uint64_t HashPrepRegionCandidateCount = 0;
+    uint64_t HashPrepRegionCandidateOpCount = 0;
+    uint64_t HashPrepRegionVerifiedCount = 0;
+    uint64_t HashPrepRegionVerifiedOpCount = 0;
+    uint64_t HashPrepKeccakConstRangeCount = 0;
+    uint64_t HashPrepKeccakRange0_64Count = 0;
+    uint64_t HashPrepKeccakDynamicRangeCount = 0;
+    uint64_t HashPrepKeccakOver128Count = 0;
+    uint64_t HashPrepRegionVerifiedTwoWordPreimageCount = 0;
+    uint64_t HashPrepRegionVerifiedMultiHashCount = 0;
+    uint64_t HashPrepRegionRejectedDynamicOffset = 0;
+    uint64_t HashPrepRegionRejectedRangeOver128 = 0;
+    uint64_t HashPrepRegionRejectedNonTwoWordRange = 0;
+    uint64_t HashPrepRegionRejectedOrderingRisk = 0;
+    uint64_t HashPrepRegionRejectedAliasRisk = 0;
+    uint64_t HashPrepRegionRejectedInterveningWrite = 0;
+    uint64_t HashPrepRegionRejectedByteExactRisk = 0;
+    uint64_t HashPrepRegionRejectedMissingTwoWordStores = 0;
+    uint64_t HashPrepRegionRejectedAliasOrInterveningWrite = 0;
+
+    uint64_t HashPrepLiftSimCandidateRegionCount = 0;
+    uint64_t HashPrepLiftSimCandidateOpCount = 0;
+    uint64_t HashPrepLiftSimCoveredRegionCount = 0;
+    uint64_t HashPrepLiftSimCoveredOpCount = 0;
+    uint64_t HashPrepLiftSimSafeToLiftRegionCount = 0;
+    uint64_t HashPrepLiftSimSafeToLiftOpCount = 0;
+    uint64_t HashPrepLiftSimRejectedRegionCount = 0;
+    uint64_t HashPrepLiftSimRejectedOpCount = 0;
+
+    uint64_t HashPrepMarkerCandidateRegionCount = 0;
+    uint64_t HashPrepMarkerCandidateOpCount = 0;
+    uint64_t HashPrepMarkerMarkedRegionCount = 0;
+    uint64_t HashPrepMarkerCoveredOpCount = 0;
+    uint64_t HashPrepMarkerCoveredMStoreOpCount = 0;
+    uint64_t HashPrepMarkerCoveredMLoadOpCount = 0;
+    uint64_t HashPrepMarkerCoveredKeccakOpCount = 0;
+    uint64_t HashPrepMarkerRejectedRegionCount = 0;
+    uint64_t HashPrepMarkerRejectedOpCount = 0;
+    uint64_t HashPrepMarkerRejectedNon0_64Range = 0;
+    uint64_t HashPrepMarkerRejectedDynamicOffset = 0;
+    uint64_t HashPrepMarkerRejectedAliasOrInterveningWrite = 0;
+    uint64_t HashPrepMarkerRejectedMixedPredecessor = 0;
+    uint64_t HashPrepMarkerRejectedByteExactRisk = 0;
+    uint64_t HashPrepMarkerRejectedGasMemorySemantics = 0;
+    uint64_t HashPrepMarkerRejectedPointerInstability = 0;
+    uint64_t HashPrepMarkerRejectedUnknownHelper = 0;
+
+    // Arithmetic fast-path tier hit counters. Increments are gated by
+    // ZEN_ENABLE_MULTIPASS_JIT_LOGGING; the fields always exist.
+    uint64_t AddFastRangeU64Count = 0;
+    uint64_t AddFastConstU64Count = 0;
+    uint64_t AddFullCount = 0;
+    uint64_t SubFastConstU64Count = 0;
+    uint64_t SubFullCount = 0;
+    uint64_t MulFastRangeU64Count = 0;
+    uint64_t MulFastConstU64Count = 0;
+    uint64_t MulFullCount = 0;
+    uint64_t DivFastRangeU64Count = 0;
+    uint64_t DivFastConstU64Count = 0;
+    uint64_t DivFullCount = 0;
+    uint64_t ModFastRangeU64Count = 0;
+    uint64_t ModFastConstU64Count = 0;
+    uint64_t ModFullCount = 0;
+
+    // U128-consumer opportunity counters: incremented on the genuine
+    // full-limb fallback when one operand has proven range U128 and the
+    // other is <= U128, i.e. a 128-bit half-width path could have applied.
+    uint64_t MulU128OpportunityCount = 0;
+    uint64_t DivU128OpportunityCount = 0;
+    uint64_t ModU128OpportunityCount = 0;
+  };
+  bool hasMemoryCompileStats() const;
+  bool hasArithCompileStats() const;
+  MemoryCompileStats MemStats;
+
+  struct MemoryBlockCompileStats {
+    bool Active = false;
+    bool HasMemoryEvent = false;
+    bool DirectMemoryOnlyCandidate = true;
+    bool HasHelperBarrier = false;
+
+    uint64_t BlockSeqId = 0;
+    uint64_t BlockEntryPC = 0;
+    uint64_t FirstMemoryEventPC = 0;
+    uint64_t LastMemoryEventPC = 0;
+
+    uint64_t DirectMemoryOpCount = 0;
+    uint64_t MLoadCount = 0;
+    uint64_t MStoreCount = 0;
+    uint64_t MStore8Count = 0;
+    uint64_t MSizeCount = 0;
+    uint64_t MCopyCount = 0;
+
+    uint64_t HelperSensitiveOpCount = 0;
+    uint64_t LogCount = 0;
+    uint64_t KeccakCount = 0;
+    uint64_t CopyFamilyCount = 0;
+    uint64_t CallFamilyCount = 0;
+    uint64_t CreateFamilyCount = 0;
+
+    uint64_t ExpandCallCount = 0;
+    uint64_t NeedExpandCFGCount = 0;
+    uint64_t GetMemPtrCount = 0;
+    uint64_t MemoryBaseInstanceLoadCount = 0;
+    uint64_t MemoryBaseCacheUseCount = 0;
+    uint64_t ReloadMemSizeCount = 0;
+    uint64_t BlockConstPrecheckCount = 0;
+    uint64_t BlockLinearPrecheckCount = 0;
+    uint64_t PrecheckedDirectOpCount = 0;
+    uint64_t PrecheckedMLoadOpCount = 0;
+    uint64_t PrecheckedMStoreOpCount = 0;
+    uint64_t MStoreAddrValueAliasReuseCount = 0;
+    uint64_t LinearU64AddrFastPathCount = 0;
+    uint64_t LinearU64MLoadFastPathCount = 0;
+    uint64_t LinearU64MStoreFastPathCount = 0;
+    uint64_t ConstBasePtrInitCount = 0;
+    uint64_t ConstBasePtrReuseCount = 0;
+    uint64_t ConstDispBytes32MLoadCount = 0;
+    uint64_t ConstDispBytes32MStoreCount = 0;
+    uint64_t DispBytes32MLoadCount = 0;
+    uint64_t DispBytes32MStoreCount = 0;
+    uint64_t MStoreZeroLimbStoreCount = 0;
+    uint64_t MStoreOverlapElidedLimbCount = 0;
+
+    uint64_t SmallFrameCandidateCount = 0;
+    uint64_t SmallFramePrecheckedCount = 0;
+    uint64_t SmallFrameFallbackNoPrecheckCount = 0;
+    uint64_t SmallFrameFallbackDynamicSizeCount = 0;
+    uint64_t SmallFrameFallbackOver128Count = 0;
+    uint64_t SmallFrameNoPrecheckMLoadCount = 0;
+    uint64_t SmallFrameNoPrecheckMStoreCount = 0;
+    uint64_t SmallFrameNoPrecheckMStore8Count = 0;
+
+    bool HashPrepPendingMStore0 = false;
+    bool HashPrepPendingMStore32 = false;
+    bool HashPrepPendingUnsupportedWrite = false;
+    bool HashPrepPendingAliasRisk = false;
+    bool HashPrepPendingInterveningWrite = false;
+    uint64_t HashPrepKeccakConstRangeCount = 0;
+    uint64_t HashPrepKeccakRange0_64Count = 0;
+    uint64_t HashPrepKeccakDynamicRangeCount = 0;
+    uint64_t HashPrepKeccakOver128Count = 0;
+    uint64_t HashPrepKeccakNonTwoWordRangeCount = 0;
+    uint64_t HashPrepVerifiedKeccakCount = 0;
+    uint64_t HashPrepRejectedOrderingRiskCount = 0;
+    uint64_t HashPrepRejectedAliasRiskCount = 0;
+    uint64_t HashPrepRejectedInterveningWriteCount = 0;
+    uint64_t HashPrepRejectedByteExactRiskCount = 0;
+    uint64_t HashPrepRejectedMissingTwoWordStoresCount = 0;
+    uint64_t HashPrepRejectedAliasOrInterveningWriteCount = 0;
+
+    bool HashPrepMarkerCandidate = false;
+    bool HashPrepMarkerMarked = false;
+    uint64_t HashPrepMarkerId = 0;
+    uint64_t HashPrepMarkerRangeBegin = 0;
+    uint64_t HashPrepMarkerRangeEnd = 0;
+    uint64_t HashPrepMarkerCoveredOpCount = 0;
+    uint64_t HashPrepMarkerCoveredMStoreOpCount = 0;
+    uint64_t HashPrepMarkerCoveredMLoadOpCount = 0;
+    uint64_t HashPrepMarkerCoveredKeccakOpCount = 0;
+    uint64_t HashPrepMarkerRejectedReason = 0;
+  };
+  void noteBlockMemoryEventPC(uint64_t PC);
+  bool hasCurrentMemoryBlockStats() const;
+  struct MemoryBlockConstPrecheckPlan {
+    bool Active = false;
+    bool Emitted = false;
+    bool HasAnchoredBasePtr = false;
+    uint64_t MaxRequiredSize = 0;
+    uint64_t CoveredDirectOpsTotal = 0;
+    uint64_t CoveredDirectOpsRemaining = 0;
+    Variable *AnchoredBasePtrVar = nullptr;
+  };
+  struct MemoryBlockLinearPrecheckPlan {
+    bool Active = false;
+    bool Emitted = false;
+    bool HasPendingStride = false;
+    bool ValueEqualsFirstAddr = false;
+    uint64_t AccessWidth = 0;
+    uint64_t CoveredDirectOpsTotal = 0;
+    uint64_t CoveredDirectOpsRemaining = 0;
+    Operand PendingStrideComponents;
+  };
+  bool tryConsumeConstBlockMemoryPrecheck();
+  bool tryConsumeLinearBlockMemoryPrecheck(MInstruction *FirstAddr,
+                                           MInstruction *OrderingDep);
+  uint64_t NextHashPrepMarkerId = 0;
+  enum class SmallFrameMemoryOp : uint8_t { MLoad, MStore, MStore8 };
+  void noteSmallFrameMemoryOp(SmallFrameMemoryOp Op, bool OffsetWasConst,
+                              uint64_t ConstOffset, bool OffsetKnownU64,
+                              uint64_t AccessSize, bool UsedSharedPrecheck);
+  void noteKeccak256MemoryAccess(bool OffsetWasConstU64, uint64_t ConstOffset,
+                                 bool LengthWasConstU64, uint64_t ConstLength);
+  uint64_t NextMemoryBlockSeqId = 0;
+  MemoryBlockCompileStats CurBlockMemStats;
+  MemoryBlockConstPrecheckPlan CurBlockConstPrecheckPlan;
+  MemoryBlockLinearPrecheckPlan CurBlockLinearPrecheckPlan;
 
   // Helper methods for memory operations
   MInstruction *getMemoryDataPointer();
+  MInstruction *getDirectMemoryDataPointer(bool PreferCachedBase);
+  MInstruction *getConstBlockDirectMemoryBasePtr();
   MInstruction *getMemorySize();
   void reloadMemorySizeFromInstance();
   void expandMemoryIR(MInstruction *RequiredSize, MInstruction *Overflow);
@@ -649,6 +1486,7 @@ private:
   // Chunk gas metering
   const uint32_t *GasChunkEnd = nullptr;
   const uint64_t *GasChunkCost = nullptr;
+  const uint64_t *GasChunkCostSPP = nullptr;
   size_t GasChunkSize = 0;
 
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER

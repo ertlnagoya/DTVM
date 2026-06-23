@@ -18,9 +18,11 @@
 #ifdef ZEN_ENABLE_EVM
 #include "evm/evm.h"
 #include "evm/interpreter.h"
+#include "evm/opcode_handlers.h"
 #include "runtime/evm_instance.h"
 #include "utils/evm.h"
 #include <evmc/hex.hpp>
+#include <memory>
 #endif // ZEN_ENABLE_EVM
 #include "runtime/codeholder.h"
 #include "runtime/instance.h"
@@ -41,6 +43,35 @@ namespace zen::runtime {
 
 using namespace common;
 using namespace utils;
+
+namespace {
+
+class ScopedRuntimeConfig {
+public:
+  ScopedRuntimeConfig(Runtime *RT, const RuntimeConfig &NewConfig)
+      : RT(RT), PreviousConfig(RT->getConfig()) {
+    RT->setConfig(NewConfig);
+  }
+
+  ~ScopedRuntimeConfig() { RT->setConfig(PreviousConfig); }
+
+  ScopedRuntimeConfig(const ScopedRuntimeConfig &) = delete;
+  ScopedRuntimeConfig &operator=(const ScopedRuntimeConfig &) = delete;
+  ScopedRuntimeConfig(ScopedRuntimeConfig &&) = delete;
+  ScopedRuntimeConfig &operator=(ScopedRuntimeConfig &&) = delete;
+
+private:
+  Runtime *RT;
+  RuntimeConfig PreviousConfig;
+};
+
+bool shouldFallbackEVMCompilationToInterpreter(const Runtime &RT,
+                                               const Error &Err) {
+  return RT.getConfig().Mode != RunMode::InterpMode &&
+         Err.getPhase() == ErrorPhase::Compilation;
+}
+
+} // namespace
 
 void Runtime::cleanRuntime() {
 
@@ -229,7 +260,8 @@ Module *Runtime::loadModule(WASMSymbol Name, CodeHolderUniquePtr CodeHolder,
 
 #ifdef ZEN_ENABLE_EVM
 MayBe<EVMModule *>
-Runtime::loadEVMModule(const std::string &Filename) noexcept {
+Runtime::loadEVMModule(const std::string &Filename, evmc_revision Rev,
+                       EVMMemorySpecializationProfile MemoryProfile) noexcept {
   if (Filename.empty()) {
     return getError(ErrorCode::InvalidFilePath);
   }
@@ -261,7 +293,7 @@ Runtime::loadEVMModule(const std::string &Filename) noexcept {
     // Create CodeHolder with decoded bytes
     auto Code = CodeHolder::newRawDataCodeHolder(*this, DecodedBytes->data(),
                                                  DecodedBytes->size());
-    return loadEVMModule(Name, std::move(Code), zen::evm::DEFAULT_REVISION);
+    return loadEVMModule(Name, std::move(Code), Rev, MemoryProfile);
   } catch (const Error &Err) {
     Stats.clearAllTimers();
     freeSymbol(Name);
@@ -273,9 +305,10 @@ Runtime::loadEVMModule(const std::string &Filename) noexcept {
   }
 }
 
-MayBe<EVMModule *> Runtime::loadEVMModule(const std::string &ModName,
-                                          const void *Data, size_t Size,
-                                          evmc_revision Rev) noexcept {
+MayBe<EVMModule *>
+Runtime::loadEVMModule(const std::string &ModName, const void *Data,
+                       size_t Size, evmc_revision Rev,
+                       EVMMemorySpecializationProfile MemoryProfile) noexcept {
   if (ModName.empty() || (Size != 0 && Data == nullptr)) {
     return getError(ErrorCode::InvalidRawData);
   }
@@ -288,7 +321,7 @@ MayBe<EVMModule *> Runtime::loadEVMModule(const std::string &ModName,
 
   try {
     auto Code = CodeHolder::newRawDataCodeHolder(*this, Data, Size);
-    return loadEVMModule(Name, std::move(Code), Rev);
+    return loadEVMModule(Name, std::move(Code), Rev, MemoryProfile);
   } catch (const Error &Err) {
     Stats.clearAllTimers();
     freeSymbol(Name);
@@ -297,14 +330,32 @@ MayBe<EVMModule *> Runtime::loadEVMModule(const std::string &ModName,
 }
 
 // Before executing this function, it is necessary to ensure that name is unique
-EVMModule *Runtime::loadEVMModule(EVMSymbol Name,
-                                  CodeHolderUniquePtr CodeHolder,
-                                  evmc_revision Rev) {
+EVMModule *
+Runtime::loadEVMModule(EVMSymbol Name, CodeHolderUniquePtr CodeHolder,
+                       evmc_revision Rev,
+                       EVMMemorySpecializationProfile MemoryProfile) {
   ZEN_ASSERT(Name);
   ZEN_ASSERT(CodeHolder);
 
-  EVMModuleUniquePtr Mod =
-      EVMModule::newEVMModule(*this, std::move(CodeHolder), Rev);
+  CodeHolderUniquePtr RetryCode;
+  if (getConfig().Mode != RunMode::InterpMode) {
+    RetryCode = CodeHolder::newRawDataCodeHolder(*this, CodeHolder->getData(),
+                                                 CodeHolder->getSize());
+  }
+  EVMModuleUniquePtr Mod;
+  try {
+    Mod = EVMModule::newEVMModule(*this, std::move(CodeHolder), Rev,
+                                  MemoryProfile);
+  } catch (const Error &Err) {
+    if (!shouldFallbackEVMCompilationToInterpreter(*this, Err)) {
+      throw;
+    }
+    RuntimeConfig RetryConfig = getConfig();
+    RetryConfig.Mode = RunMode::InterpMode;
+    ScopedRuntimeConfig Retry(this, RetryConfig);
+    Mod = EVMModule::newEVMModule(*this, std::move(RetryCode), Rev,
+                                  MemoryProfile);
+  }
   // All errors in Module::newModule are thrown as exceptions, so the return
   // value must be valid when the following line is executed
   ZEN_ASSERT(Mod);
@@ -667,11 +718,74 @@ void Runtime::callWasmFunctionInInterpMode(Instance &Inst, uint32_t FuncIdx,
 #ifdef ZEN_ENABLE_EVM
 void Runtime::callEVMInInterpMode(EVMInstance &Inst, evmc_message &Msg,
                                   evmc::Result &Result) {
-  evm::InterpreterExecContext Ctx(&Inst);
-  evm::BaseInterpreter Interpreter(Ctx);
-  Ctx.allocTopFrame(&Msg);
-  Interpreter.interpret();
-  Result = std::move(const_cast<evmc::Result &>(Ctx.getExeResult()));
+  // Reuse a thread-local InterpreterExecContext for top-level calls to avoid
+  // re-allocating the ~33 KB EVMFrame (1024 × uint256 stack) on every call.
+  // For nested calls (CALL/CREATE re-entering this function via Host->call()),
+  // we must create a fresh context to avoid corrupting the outer call's state.
+  static thread_local std::unique_ptr<evm::InterpreterExecContext> TLCtx;
+  static thread_local bool TLCtxInUse = false;
+
+  if (!TLCtxInUse) {
+    // Top-level call: reuse the cached context
+    if (!TLCtx) {
+      TLCtx = std::make_unique<evm::InterpreterExecContext>(&Inst);
+    } else {
+      TLCtx->resetForNewCall(&Inst);
+    }
+
+    struct TLCtxGuard {
+      bool &Flag;
+      explicit TLCtxGuard(bool &F) : Flag(F) { Flag = true; }
+      ~TLCtxGuard() { Flag = false; }
+    } Guard(TLCtxInUse);
+
+    evm::BaseInterpreter Interpreter(*TLCtx);
+    TLCtx->allocTopFrame(&Msg);
+    Interpreter.interpret();
+    Result = std::move(const_cast<evmc::Result &>(TLCtx->getExeResult()));
+  } else {
+    // Nested call: use a stack-local context to avoid corrupting the outer one
+    evm::InterpreterExecContext Ctx(&Inst);
+    evm::BaseInterpreter Interpreter(Ctx);
+    Ctx.allocTopFrame(&Msg);
+    Interpreter.interpret();
+    Result = std::move(const_cast<evmc::Result &>(Ctx.getExeResult()));
+  }
+}
+
+#ifdef ZEN_ENABLE_VIRTUAL_STACK
+static void callEVMFuncFromVirtualStack(VirtualStackInfo *StackInfo) {
+  auto *Inst = static_cast<EVMInstance *>(StackInfo->SavedPtr1);
+  auto *Msg = static_cast<evmc_message *>(StackInfo->SavedPtr2);
+  auto *Result = static_cast<evmc::Result *>(StackInfo->SavedPtr3);
+  Inst->getRuntime()->callEVMMainOnPhysStack(*Inst, *Msg, *Result);
+}
+#endif // ZEN_ENABLE_VIRTUAL_STACK
+
+void Runtime::callEVMMainOnPhysStack(EVMInstance &Inst, evmc_message &Msg,
+                                     evmc::Result &Result) {
+  Inst.clearMessageCache();
+  evmc_message MsgWithCode = Msg;
+  MsgWithCode.code = reinterpret_cast<uint8_t *>(Inst.getModule()->Code);
+  MsgWithCode.code_size = Inst.getModule()->CodeSize;
+  Inst.setExeResult(evmc::Result{EVMC_SUCCESS, 0, 0});
+  Inst.pushMessage(&MsgWithCode);
+
+  bool UseJIT = false;
+#ifdef ZEN_ENABLE_JIT
+  const auto *Module = Inst.getModule();
+  UseJIT = (getConfig().Mode != RunMode::InterpMode) &&
+           !Module->ShouldFallbackToInterp && Module->getJITCode() != nullptr;
+#endif
+
+  if (UseJIT) {
+#ifdef ZEN_ENABLE_JIT
+    callEVMInJITMode(Inst, MsgWithCode, Result);
+#endif
+  } else {
+    callEVMInInterpMode(Inst, MsgWithCode, Result);
+  }
+  Result.gas_left = Inst.getGas();
 }
 
 void Runtime::callEVMMain(EVMInstance &Inst, evmc_message &Msg,
@@ -679,28 +793,32 @@ void Runtime::callEVMMain(EVMInstance &Inst, evmc_message &Msg,
 #ifdef ZEN_ENABLE_LINUX_PERF
   auto Timer = Stats.startRecord(utils::StatisticPhase::Execution);
 #endif
-  Inst.clearMessageCache();
-  Inst.clearDiffLog();
-  evmc_message MsgWithCode = Msg;
-  MsgWithCode.code = reinterpret_cast<uint8_t *>(Inst.getModule()->Code);
-  MsgWithCode.code_size = Inst.getModule()->CodeSize;
-  Inst.setExeResult(evmc::Result{EVMC_SUCCESS, 0, 0});
-  Inst.pushMessage(&MsgWithCode);
+
+#ifdef ZEN_ENABLE_VIRTUAL_STACK
+  // Interpreter mode does not need a virtual stack: CALL/CREATE re-enter
+  // execution via the host with an incremented evmc_message.depth rather
+  // than pushing additional frames onto InterpreterExecContext::FrameStack,
+  // so call depth is bounded by the EVM depth limit rather than unbounded
+  // native recursion.  Skipping the virtual-stack allocation/mprotect/setjmp
+  // round-trip on every call eliminates ~50 % of the per-execution overhead
+  // measured on ERC-20 transfers.
   if (getConfig().Mode == RunMode::InterpMode) {
-    callEVMInInterpMode(Inst, MsgWithCode, Result);
+    callEVMMainOnPhysStack(Inst, Msg, Result);
+  } else if (Msg.depth == 0) {
+    VirtualStackInfo StackInfo;
+    StackInfo.SavedPtr1 = &Inst;
+    StackInfo.SavedPtr2 = &Msg;
+    StackInfo.SavedPtr3 = &Result;
+    Inst.pushVirtualStack(&StackInfo);
+    StackInfo.runInVirtualStack(&callEVMFuncFromVirtualStack);
+    Inst.popVirtualStack();
   } else {
-#ifdef ZEN_ENABLE_JIT
-    callEVMInJITMode(Inst, MsgWithCode, Result);
+    callEVMMainOnPhysStack(Inst, Msg, Result);
+  }
 #else
-    ZEN_UNREACHABLE();
-#endif
-  }
-  Result.gas_left = Inst.getGas();
-  if (auto *Sink = Inst.getStorageDiffSink();
-      Sink != nullptr && Result.status_code == EVMC_SUCCESS) {
-    Sink->on_finish(Inst.getDiffLog());
-  }
-  Inst.clearDiffLog();
+  callEVMMainOnPhysStack(Inst, Msg, Result);
+#endif // ZEN_ENABLE_VIRTUAL_STACK
+
 #ifdef ZEN_ENABLE_LINUX_PERF
   Stats.stopRecord(Timer);
 #endif
@@ -718,14 +836,17 @@ void Runtime::callWasmFunctionInJITMode(Instance &Inst, uint32_t FuncIdx,
       GenericFunctionPointer(IsImport ? Func->CodePtr : Func->JITCodePtr);
 
 #ifdef ZEN_ENABLE_CPU_EXCEPTION
-  jmp_buf JmpBuf;
+  sigjmp_buf JmpBuf;
   common::traphandler::CallThreadState TLS(&Inst, &JmpBuf,
                                            __builtin_frame_address(0), nullptr);
 
+  // siglongjmp from signal handlers skips C++ unwinding on intermediate frames.
+  // Keep this wrapper minimal and avoid introducing non-trivial RAII objects
+  // between sigsetjmp() and callNativeGeneral().
   // longjmp with asan(in gcc-9) not works well, it affects the asan stack
   // malloc. so use wrapper func to recover the stack
   auto CallWasmFnWrapper = [&]() {
-    int JmpSignum = ::setjmp(JmpBuf);
+    int JmpSignum = ::sigsetjmp(JmpBuf, 1);
     if (JmpSignum == 0) {
       TLS.restartHandler();
 
@@ -748,49 +869,42 @@ void Runtime::callWasmFunctionInJITMode(Instance &Inst, uint32_t FuncIdx,
       case SIGBUS: {
         // out of bounds signal
         CapturedTapErrCode = ErrorCode::OutOfBoundsMemory;
-#ifdef ZEN_ENABLE_STACK_CHECK_CPU
-        // when the accessed address in virtual stack, raise CallStackExhausted
-        auto *FaultingAddress =
-            static_cast<uint8_t *>(TLS.getTrapState().FaultingAddress);
 #ifdef ZEN_ENABLE_VIRTUAL_STACK
-        auto *VirtualStack = Inst.currentVirtualStack();
-        if (FaultingAddress != nullptr && VirtualStack) {
-          if (FaultingAddress >= VirtualStack->AllInfo &&
-              FaultingAddress < VirtualStack->StackMemoryTop) {
-            CapturedTapErrCode = ErrorCode::CallStackExhausted;
+        {
+          auto *FaultingAddress =
+              static_cast<uint8_t *>(TLS.getTrapState().FaultingAddress);
+          auto *VirtualStack = Inst.currentVirtualStack();
+          if (FaultingAddress != nullptr && VirtualStack) {
+            if (FaultingAddress >= VirtualStack->AllInfo &&
+                FaultingAddress < VirtualStack->StackMemoryTop) {
+              CapturedTapErrCode = ErrorCode::CallStackExhausted;
+            }
           }
         }
-#else
-
+#elif defined(ZEN_ENABLE_STACK_CHECK_CPU)
+        {
+          auto *FaultingAddress =
+              static_cast<uint8_t *>(TLS.getTrapState().FaultingAddress);
 #ifdef ZEN_BUILD_PLATFORM_DARWIN
-        // on darwin get stack info
-        void *StackAddr = pthread_get_stackaddr_np(pthread_self());
-        size_t StackSize = pthread_get_stacksize_np(pthread_self());
+          void *StackAddr = pthread_get_stackaddr_np(pthread_self());
+          size_t StackSize = pthread_get_stacksize_np(pthread_self());
 #else
-        // on linux get stack info
-        pthread_attr_t Attrs;
-        pthread_getattr_np(pthread_self(), &Attrs);
-
-        void *StackAddr;
-        size_t StackSize;
-        pthread_attr_getstack(&Attrs, &StackAddr, &StackSize);
+          pthread_attr_t Attrs;
+          pthread_getattr_np(pthread_self(), &Attrs);
+          void *StackAddr;
+          size_t StackSize;
+          pthread_attr_getstack(&Attrs, &StackAddr, &StackSize);
 #endif
-
-        size_t GuardSize =
-            common::StackGuardSize; // stack overflow guard, when overflow not
-                                    // in dwasm, not greater then StackGuardSize
-                                    // bytes
-        if ((uintptr_t)FaultingAddress >= (uintptr_t)StackAddr - GuardSize &&
-            (uintptr_t)FaultingAddress < ((uintptr_t)StackAddr + StackSize)) {
-          CapturedTapErrCode = ErrorCode::CallStackExhausted;
-        }
+          size_t GuardSize = common::StackGuardSize;
+          if ((uintptr_t)FaultingAddress >= (uintptr_t)StackAddr - GuardSize &&
+              (uintptr_t)FaultingAddress < ((uintptr_t)StackAddr + StackSize)) {
+            CapturedTapErrCode = ErrorCode::CallStackExhausted;
+          }
 #ifndef ZEN_BUILD_PLATFORM_DARWIN
-        pthread_attr_destroy(&Attrs);
+          pthread_attr_destroy(&Attrs);
 #endif // ZEN_BUILD_PLATFORM_DARWIN
-
-#endif // ZEN_ENABLE_VIRTUAL_STACK
-
-#endif // ZEN_ENABLE_STACK_CHECK_CPU
+        }
+#endif // ZEN_ENABLE_VIRTUAL_STACK / ZEN_ENABLE_STACK_CHECK_CPU
         break;
       }
       default: {
@@ -843,14 +957,17 @@ void Runtime::callEVMInJITMode(EVMInstance &Inst, evmc_message &Msg,
   };
 
 #ifdef ZEN_ENABLE_CPU_EXCEPTION
-  jmp_buf JmpBuf;
+  sigjmp_buf JmpBuf;
   common::evm_traphandler::EVMCallThreadState TLS(&Inst, &JmpBuf,
                                                   __builtin_frame_address(0));
 
+  // siglongjmp from signal handlers skips C++ unwinding on intermediate frames.
+  // Keep this wrapper minimal and avoid introducing non-trivial RAII objects
+  // between sigsetjmp() and callNativeGeneral().
   // longjmp with asan(in gcc-9) not works well, it affects the asan stack
   // malloc. so use wrapper func to recover the stack
   auto CallEVMFnWrapper = [&]() {
-    int JmpSignum = ::setjmp(JmpBuf);
+    int JmpSignum = ::sigsetjmp(JmpBuf, 1);
     if (JmpSignum == 0) {
       TLS.restartHandler();
 #endif // ZEN_ENABLE_CPU_EXCEPTION
@@ -882,51 +999,44 @@ void Runtime::callEVMInJITMode(EVMInstance &Inst, evmc_message &Msg,
         // out of bounds signal
         CapturedTapErrCode = ErrorCode::OutOfBoundsMemory;
         StatusCode = EVMC_INVALID_MEMORY_ACCESS;
-#ifdef ZEN_ENABLE_STACK_CHECK_CPU
-        // when the accessed address in virtual stack, raise CallStackExhausted
-        auto *FaultingAddress =
-            static_cast<uint8_t *>(TLS.getTrapState().FaultingAddress);
 #ifdef ZEN_ENABLE_VIRTUAL_STACK
-        auto *VirtualStack = Inst.currentVirtualStack();
-        if (FaultingAddress != nullptr && VirtualStack) {
-          if (FaultingAddress >= VirtualStack->AllInfo &&
-              FaultingAddress < VirtualStack->StackMemoryTop) {
+        {
+          auto *FaultingAddress =
+              static_cast<uint8_t *>(TLS.getTrapState().FaultingAddress);
+          auto *VirtualStack = Inst.currentVirtualStack();
+          if (FaultingAddress != nullptr && VirtualStack) {
+            if (FaultingAddress >= VirtualStack->AllInfo &&
+                FaultingAddress < VirtualStack->StackMemoryTop) {
+              CapturedTapErrCode = ErrorCode::CallStackExhausted;
+              StatusCode = EVMC_STACK_OVERFLOW;
+            }
+          }
+        }
+#elif defined(ZEN_ENABLE_STACK_CHECK_CPU)
+        {
+          auto *FaultingAddress =
+              static_cast<uint8_t *>(TLS.getTrapState().FaultingAddress);
+#ifdef ZEN_BUILD_PLATFORM_DARWIN
+          void *StackAddr = pthread_get_stackaddr_np(pthread_self());
+          size_t StackSize = pthread_get_stacksize_np(pthread_self());
+#else
+          pthread_attr_t Attrs;
+          pthread_getattr_np(pthread_self(), &Attrs);
+          void *StackAddr;
+          size_t StackSize;
+          pthread_attr_getstack(&Attrs, &StackAddr, &StackSize);
+#endif
+          size_t GuardSize = common::StackGuardSize;
+          if ((uintptr_t)FaultingAddress >= (uintptr_t)StackAddr - GuardSize &&
+              (uintptr_t)FaultingAddress < ((uintptr_t)StackAddr + StackSize)) {
             CapturedTapErrCode = ErrorCode::CallStackExhausted;
             StatusCode = EVMC_STACK_OVERFLOW;
           }
-        }
-#else
-
-#ifdef ZEN_BUILD_PLATFORM_DARWIN
-        // on darwin get stack info
-        void *StackAddr = pthread_get_stackaddr_np(pthread_self());
-        size_t StackSize = pthread_get_stacksize_np(pthread_self());
-#else
-        // on linux get stack info
-        pthread_attr_t Attrs;
-        pthread_getattr_np(pthread_self(), &Attrs);
-
-        void *StackAddr;
-        size_t StackSize;
-        pthread_attr_getstack(&Attrs, &StackAddr, &StackSize);
-#endif
-
-        size_t GuardSize =
-            common::StackGuardSize; // stack overflow guard, when overflow not
-                                    // in dwasm, not greater then StackGuardSize
-                                    // bytes
-        if ((uintptr_t)FaultingAddress >= (uintptr_t)StackAddr - GuardSize &&
-            (uintptr_t)FaultingAddress < ((uintptr_t)StackAddr + StackSize)) {
-          CapturedTapErrCode = ErrorCode::CallStackExhausted;
-          StatusCode = EVMC_STACK_OVERFLOW;
-        }
 #ifndef ZEN_BUILD_PLATFORM_DARWIN
-        pthread_attr_destroy(&Attrs);
-#endif // ZEN_BUILD_PLATFORM_DARWIN
-
-#endif // ZEN_ENABLE_VIRTUAL_STACK
-
-#endif // ZEN_ENABLE_STACK_CHECK_CPU
+          pthread_attr_destroy(&Attrs);
+#endif
+        }
+#endif // ZEN_ENABLE_VIRTUAL_STACK / ZEN_ENABLE_STACK_CHECK_CPU
         break;
       }
       default: {

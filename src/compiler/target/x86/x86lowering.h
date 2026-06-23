@@ -5,6 +5,9 @@
 
 #include "compiler/cgir/lowering.h"
 #include "compiler/llvm-prebuild/Target/X86/X86Subtarget.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include <array>
 
 namespace COMPILER {
 
@@ -68,7 +71,14 @@ public:
   CgRegister lowerSelectExpr(const SelectInstruction &Inst);
   CgRegister lowerWasmOverflowI128BinaryExpr(
       const WasmOverflowI128BinaryInstruction &Inst);
+  CgRegister lowerEvmUmul128Expr(const EvmUmul128Instruction &Inst);
+  CgRegister lowerEvmUmul128HiExpr(const EvmUmul128HiInstruction &Inst);
+  CgRegister lowerEvmU256MulExpr(const EvmU256MulInstruction &Inst);
+  CgRegister lowerEvmU256MulResultExpr(const EvmU256MulResultInstruction &Inst);
+  CgRegister lowerEvmUdiv128By64Expr(const EvmUdiv128By64Instruction &Inst);
+  CgRegister lowerEvmUrem128By64Expr(const EvmUrem128By64Instruction &Inst);
   CgRegister lowerAdcExpr(const AdcInstruction &Inst);
+  CgRegister lowerSbbExpr(const SbbInstruction &Inst);
 
   // ==================== Memory Instructions ====================
 
@@ -105,6 +115,25 @@ private:
   static unsigned X86ChooseCmpImmediateOpcode(MVT VT, int64_t Val);
   static unsigned X86ChooseCmpImmediateOpcode(MVT VT, const APInt &Value);
   static unsigned X86ChooseCmpOpcode(MVT VT);
+  CgRegister emitAdd64NoCarry(const TargetRegisterClass *RC, CgRegister LHSReg,
+                              CgRegister RHSReg);
+  std::pair<CgRegister, CgRegister>
+  emitAdd64WithCarryCounter(const TargetRegisterClass *RC, CgRegister SumReg,
+                            CgRegister CarryReg, CgRegister TermReg);
+  CgRegister emitAdcx64(const TargetRegisterClass *RC, CgRegister DstReg,
+                        CgRegister SrcReg);
+  CgRegister emitAdox64(const TargetRegisterClass *RC, CgRegister DstReg,
+                        CgRegister SrcReg);
+  CgRegister collectCarryChains(const TargetRegisterClass *RC,
+                                CgRegister CarryReg, CgRegister ZeroReg);
+  void clearCarryChains(CgRegister ZeroReg);
+  std::pair<CgRegister, CgRegister>
+  emitMulx64(const TargetRegisterClass *RC, CgRegister &MulxSourceReg,
+             CgRegister &DeadMulxHiReg, CgRegister SourceReg,
+             CgRegister OperandReg, bool NeedHigh);
+
+  CgRegister lowerEvmU256MulExprLegacy(const EvmU256MulInstruction &Inst);
+  CgRegister lowerEvmU256MulExprAdx(const EvmU256MulInstruction &Inst);
 
   void lowerFastCompareExpr(const MInstruction *LHS, const MInstruction *RHS,
                             MVT VT);
@@ -121,6 +150,11 @@ private:
 
   const X86Subtarget *Subtarget;
   const TargetRegisterInfo *TRI;
+  llvm::DenseMap<const MInstruction *, CgRegister> Umul128HiRegs;
+  llvm::DenseSet<const MInstruction *> Umul128NeedHi;
+  llvm::DenseMap<const MInstruction *, std::array<CgRegister, 3>>
+      U256MulResultRegs;
+  llvm::DenseMap<const MInstruction *, CgRegister> Udiv128RemRegs;
 };
 
 } // namespace COMPILER

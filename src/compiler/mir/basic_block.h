@@ -23,11 +23,24 @@ public:
 
   auto begin() { return Statements.begin(); }
   auto end() { return Statements.end(); }
+  auto begin() const { return Statements.begin(); }
+  auto end() const { return Statements.end(); }
   bool empty() const { return Statements.empty(); }
 
   void addStatement(MInstruction *Inst) {
     Statements.push_back(Inst);
     Inst->setParentBB(this);
+  }
+
+  void addStatementBeforeFirstNonPhi(MInstruction *Inst) {
+    size_t InsertIdx = 0;
+    for (MInstruction *Stmt : Statements) {
+      if (Stmt->getOpcode() != OP_phi) {
+        break;
+      }
+      ++InsertIdx;
+    }
+    addStatement(InsertIdx, Inst);
   }
 
   void addStatement(size_t Idx, MInstruction *Inst) {

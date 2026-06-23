@@ -45,13 +45,31 @@
 namespace zen::evm {
 class EVMResource {
 public:
-  static EVMFrame *CurrentFrame;
-  static InterpreterExecContext *CurrentContext;
+  static thread_local EVMFrame *CurrentFrame;
+  static thread_local InterpreterExecContext *CurrentContext;
+  static thread_local const evmc_instruction_metrics *CurrentMetricsTable;
 
   static void setExecutionContext(EVMFrame *Frame,
                                   InterpreterExecContext *Context) {
     CurrentFrame = Frame;
     CurrentContext = Context;
+  }
+  static void setMetricsTable(const evmc_instruction_metrics *Table) {
+    CurrentMetricsTable = Table;
+  }
+  /// Clear thread-local execution pointers after an interpreter run so reused
+  /// InterpreterExecContext cannot leak cross-call state to host or tooling.
+  static void clear() {
+    CurrentFrame = nullptr;
+    CurrentContext = nullptr;
+    CurrentMetricsTable = nullptr;
+  }
+  /// Runs clear() on scope exit (including when interpret() throws).
+  struct ClearGuard {
+    ~ClearGuard() { clear(); }
+  };
+  static const evmc_instruction_metrics *getMetricsTable() {
+    return CurrentMetricsTable;
   }
   static EVMFrame *getCurFrame() { return CurrentFrame; }
   static InterpreterExecContext *getInterpreterExecContext() {
@@ -170,7 +188,6 @@ DEFINE_BINARY_OP(Sub, (A - B));
 DEFINE_BINARY_OP(Mul, (A * B));
 DEFINE_BINARY_OP(Div, ((B == 0) ? intx::uint256(0) : (A / B)));
 DEFINE_BINARY_OP(Mod, ((B == 0) ? intx::uint256(0) : A % B));
-DEFINE_BINARY_OP(Exp, intx::exp(A, B));
 DEFINE_BINARY_OP(SDiv,
                  ((B == 0) ? intx::uint256(0) : intx::sdivrem(A, B).quot));
 DEFINE_BINARY_OP(SMod, ((B == 0) ? intx::uint256(0) : intx::sdivrem(A, B).rem));
@@ -184,6 +201,7 @@ DEFINE_TERNARY_OP(Mulmod,
 // Unary operations
 DEFINE_UNARY_OP(Not, (~A));
 DEFINE_UNARY_OP(IsZero, (A == 0));
+DEFINE_UNARY_OP(Clz, (intx::clz(A)));
 
 // Bitwise operations
 DEFINE_BINARY_OP(And, (A & B));
@@ -211,7 +229,7 @@ DEFINE_BINARY_OP(Sgt, intx::slt(B, A));
 #define DEFINE_MULTIOPCODE_UNIMPLEMENT_HANDLER(OpName)                         \
   class OpName##Handler : public EVMOpcodeHandlerBase<OpName##Handler> {       \
   public:                                                                      \
-    inline static evmc_opcode OpCode = OP_INVALID;                             \
+    inline static thread_local evmc_opcode OpCode = OP_INVALID;                \
     static EVMFrame *getFrame() { return EVMResource::getCurFrame(); }         \
     static InterpreterExecContext *getContext() {                              \
       return EVMResource::getInterpreterExecContext();                         \
@@ -257,6 +275,7 @@ DEFINE_UNIMPLEMENT_HANDLER(SStore);
 DEFINE_UNIMPLEMENT_HANDLER(SignExtend);
 DEFINE_UNIMPLEMENT_HANDLER(Byte);
 DEFINE_UNIMPLEMENT_HANDLER(Sar);
+DEFINE_UNIMPLEMENT_HANDLER(Exp);
 
 // Memory operations
 DEFINE_UNIMPLEMENT_HANDLER(MStore);
@@ -282,13 +301,6 @@ DEFINE_UNIMPLEMENT_HANDLER(Gas);
 DEFINE_UNIMPLEMENT_HANDLER(GasLimit);
 DEFINE_UNIMPLEMENT_HANDLER(Return);
 DEFINE_UNIMPLEMENT_HANDLER(Revert);
-
-// Stack operations
-DEFINE_UNIMPLEMENT_HANDLER(Pop);
-DEFINE_MULTIOPCODE_UNIMPLEMENT_HANDLER(Push);
-DEFINE_UNIMPLEMENT_HANDLER(Push0);
-DEFINE_MULTIOPCODE_UNIMPLEMENT_HANDLER(Dup);
-DEFINE_MULTIOPCODE_UNIMPLEMENT_HANDLER(Swap);
 
 // Call operations
 DEFINE_MULTIOPCODE_UNIMPLEMENT_HANDLER(Create);

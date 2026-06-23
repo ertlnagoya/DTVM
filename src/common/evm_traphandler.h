@@ -40,8 +40,8 @@ class EVMCallThreadState {
   typedef void (*SigActionHandlerType)(int, siginfo_t *, void *);
 
 public:
-  EVMCallThreadState(runtime::EVMInstance *Inst, jmp_buf *Env, void *FrameAddr,
-                     void *PC = nullptr)
+  EVMCallThreadState(runtime::EVMInstance *Inst, sigjmp_buf *Env,
+                     void *FrameAddr, void *PC = nullptr)
       : Inst(Inst) {
     StartFrame = {.PC = PC, .FrameAddr = FrameAddr};
     Parent = currentThreadStateOrUpdate(nullptr, false);
@@ -69,7 +69,7 @@ public:
 
   EVMCallThreadState *parent() const { return Parent; }
 
-  jmp_buf *jmpbuf() { return JmpBuf; }
+  sigjmp_buf *jmpbuf() { return JmpBuf; }
 
   void setHandler(SigActionHandlerType Handler) { restartHandler(); }
 
@@ -77,7 +77,7 @@ public:
 
   void restartHandler() { Handling = true; }
 
-  void jmpToMarked(int Signum) { longjmp(*JmpBuf, Signum); }
+  void jmpToMarked(int Signum) { siglongjmp(*JmpBuf, Signum); }
 
   void setTrapFrameAddr(void *Addr, void *PC, void *FaultingAddress,
                         uint32_t NumIgnoredFrames) {
@@ -127,7 +127,7 @@ private:
   EVMCallThreadState *Parent = nullptr;
   bool Handling = false;
 
-  jmp_buf *JmpBuf = nullptr; // must be default nullptr
+  sigjmp_buf *JmpBuf = nullptr; // must be default nullptr
   // the frames count to ignore when dump wasm call stack by trap_frame_addr_
   uint32_t NumIgnoredTrapFrames = 0;
   // the frame address(rbp register) when trap happen

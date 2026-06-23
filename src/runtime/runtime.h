@@ -12,6 +12,7 @@
 #ifdef ZEN_ENABLE_EVM
 #include "evm/evm.h"
 #include "evmc/evmc.hpp"
+#include "runtime/evm_memory_specialization.h"
 #endif // ZEN_ENABLE_EVM
 #include "runtime/config.h"
 #include "runtime/destroyer.h"
@@ -83,11 +84,11 @@ public:
   newEVMRuntime(RuntimeConfig Config = {},
                 evmc::Host *EVMHost = nullptr) noexcept {
     auto RT = newRuntime(Config);
-
-    // SinglepassMode is not supported for EVMRuntime
-    ZEN_ASSERT(Config.Mode != RunMode::SinglepassMode);
-
-    RT->EVMHost = EVMHost;
+    if (RT) {
+      // SinglepassMode is not supported for EVMRuntime
+      ZEN_ASSERT(Config.Mode != RunMode::SinglepassMode);
+      RT->EVMHost = EVMHost;
+    }
 
     return RT;
   }
@@ -158,12 +159,15 @@ public:
 #ifdef ZEN_ENABLE_EVM
   /// \warning not thread-safe
   common::MayBe<EVMModule *>
-  loadEVMModule(const std::string &Filename) noexcept;
+  loadEVMModule(const std::string &Filename,
+                evmc_revision Rev = zen::evm::DEFAULT_REVISION,
+                EVMMemorySpecializationProfile MemoryProfile = {}) noexcept;
 
   /// \warning not thread-safe
   common::MayBe<EVMModule *>
   loadEVMModule(const std::string &ModName, const void *Data, size_t DataSize,
-                evmc_revision Rev = zen::evm::DEFAULT_REVISION) noexcept;
+                evmc_revision Rev = zen::evm::DEFAULT_REVISION,
+                EVMMemorySpecializationProfile MemoryProfile = {}) noexcept;
 #endif // ZEN_ENABLE_EVM
 
   /// \warning not thread-safe
@@ -328,6 +332,12 @@ public:
 
 #ifdef ZEN_ENABLE_EVM
   void callEVMMain(EVMInstance &Inst, evmc_message &Msg, evmc::Result &Result);
+  void callEVMMainOnPhysStack(EVMInstance &Inst, evmc_message &Msg,
+                              evmc::Result &Result);
+#ifdef ZEN_ENABLE_JIT
+  void callEVMInJITMode(EVMInstance &Inst, evmc_message &Msg,
+                        evmc::Result &Result);
+#endif // ZEN_ENABLE_JIT
   evmc::Host *getEVMHost() const { return EVMHost; }
   void setEVMHost(evmc::Host *Host) { EVMHost = Host; }
 #endif // ZEN_ENABLE_EVM
@@ -346,7 +356,8 @@ private:
 
 #ifdef ZEN_ENABLE_EVM
   EVMModule *loadEVMModule(EVMSymbol ModName, CodeHolderUniquePtr CodeHolder,
-                           evmc_revision Rev);
+                           evmc_revision Rev,
+                           EVMMemorySpecializationProfile MemoryProfile = {});
 #endif // ZEN_ENABLE_EVM
 
   void callWasmFunctionInInterpMode(Instance &Inst, uint32_t FuncIdx,
@@ -362,12 +373,6 @@ private:
   void callWasmFunctionInJITMode(Instance &Inst, uint32_t FuncIdx,
                                  const std::vector<TypedValue> &Args,
                                  std::vector<common::TypedValue> &Results);
-
-#ifdef ZEN_ENABLE_EVM
-  void callEVMInJITMode(EVMInstance &Inst, evmc_message &Msg,
-                        evmc::Result &Result);
-#endif // ZEN_ENABLE_EVM
-
 #endif // ZEN_ENABLE_JIT
 
   common::Mutex Mtx;

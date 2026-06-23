@@ -147,6 +147,34 @@ where
     return_data_size
 }
 
+fn validate_returndata_copy_bounds(
+    return_data_len: usize,
+    data_offset: u32,
+    length: u32,
+) -> HostFunctionResult<(usize, usize)> {
+    let data_offset_usize = data_offset as usize;
+    let length_usize = length as usize;
+    let data_end = data_offset_usize.checked_add(length_usize).ok_or_else(|| {
+        crate::evm::error::out_of_bounds_error_with_function(
+            data_offset,
+            length,
+            "return_data_copy: return data offset overflow",
+            "return_data_copy",
+        )
+    })?;
+
+    if data_end > return_data_len {
+        return Err(crate::evm::error::out_of_bounds_error_with_function(
+            data_offset,
+            length,
+            "return_data_copy: return data out of bounds",
+            "return_data_copy",
+        ));
+    }
+
+    Ok((data_offset_usize, data_end))
+}
+
 /// Copy return data from the last call to memory
 /// Copies the return data from the last external call to the specified memory location
 ///
@@ -184,26 +212,57 @@ where
 
     // Get the return data from the evmhost
     let return_data = evmhost.return_data_copy();
-    let data_offset_usize = data_offset as usize;
-
-    // Prepare buffer for copying
-    let mut buffer = vec![0u8; length_u32 as usize];
-
-    // Copy from return data with bounds checking
-    let available_bytes = if data_offset_usize < return_data.len() {
-        return_data.len() - data_offset_usize
-    } else {
-        0
-    };
-
-    let copy_len = std::cmp::min(available_bytes, length_u32 as usize);
-    if copy_len > 0 {
-        buffer[..copy_len]
-            .copy_from_slice(&return_data[data_offset_usize..data_offset_usize + copy_len]);
-    }
+    let data_offset_u32 = data_offset as u32;
+    let (data_offset_usize, data_end) =
+        validate_returndata_copy_bounds(return_data.len(), data_offset_u32, length_u32)?;
 
     // Write the buffer to memory
-    memory.write_bytes(result_offset_u32, &buffer)?;
+    memory.write_bytes(result_offset_u32, &return_data[data_offset_usize..data_end])?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_returndata_copy_bounds;
+
+    #[test]
+    fn test_validate_returndata_copy_bounds_exact_end_ok() {
+        let (start, end) =
+            validate_returndata_copy_bounds(4, 2, 2).expect("bounds should be valid");
+        assert_eq!((start, end), (2, 4));
+    }
+
+    #[test]
+    fn test_validate_returndata_copy_bounds_oob_rejected() {
+        let err = validate_returndata_copy_bounds(4, 3, 2).expect_err("must fail");
+        assert_eq!(err.category(), "memory");
+        assert!(
+            err.message().contains("out of bounds"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_returndata_copy_bounds_overflow_rejected() {
+        let err = validate_returndata_copy_bounds(4, u32::MAX, 2).expect_err("must fail");
+        assert_eq!(err.category(), "memory");
+        assert!(
+            err.message().contains("offset overflow"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_returndata_copy_bounds_zero_length_past_end_rejected() {
+        let err = validate_returndata_copy_bounds(4, 5, 0).expect_err("must fail");
+        assert_eq!(err.category(), "memory");
+        assert!(
+            err.message().contains("out of bounds"),
+            "unexpected error: {}",
+            err
+        );
+    }
 }

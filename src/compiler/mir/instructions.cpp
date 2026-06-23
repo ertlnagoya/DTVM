@@ -60,6 +60,30 @@ void MInstruction::print(llvm::raw_ostream &OS) const {
        << getOperand<1>() << ", " << getOperand<2>() << ", " << getOperand<3>()
        << ')';
     break;
+  case PHI: {
+    auto *phi = llvm::cast<PhiInstruction>(this);
+    OS << "phi [";
+    for (size_t I = 0; I < phi->getNumIncoming(); ++I) {
+      if (I != 0) {
+        OS << ", ";
+      }
+      MBasicBlock *IncomingBB = phi->getIncomingBlock(I);
+      const MInstruction *IncomingValue = phi->getIncomingValue(I);
+      if (IncomingBB) {
+        OS << '@' << IncomingBB->getIdx();
+      } else {
+        OS << "<pending-bb>";
+      }
+      OS << ": ";
+      if (IncomingValue) {
+        OS << IncomingValue;
+      } else {
+        OS << "<pending-value>";
+      }
+    }
+    OS << "]\n";
+    break;
+  }
   case DASSIGN: {
     auto *assign = llvm::cast<DassignInstruction>(this);
     OS << '$' << assign->getVarIdx() << " = " << getOperand<0>() << "\n";
@@ -83,6 +107,11 @@ void MInstruction::print(llvm::raw_ostream &OS) const {
   }
   case ADC: {
     OS << "adc (" << getOperand<0>() << ", " << getOperand<1>() << ", "
+       << getOperand<2>() << ')';
+    break;
+  }
+  case SBB: {
+    OS << "sbb (" << getOperand<0>() << ", " << getOperand<1>() << ", "
        << getOperand<2>() << ')';
     break;
   }
@@ -184,6 +213,41 @@ void MInstruction::print(llvm::raw_ostream &OS) const {
     ZEN_ASSERT(_opcode >= OP_CONV_EXPR_START && _opcode <= OP_CONV_EXPR_END);
     OS << getOpcodeString(_opcode) << " (" << getOperand<0>() << ", "
        << getType() << ")";
+    break;
+  }
+  case EVM_UMUL128: {
+    OS << getOpcodeString(_opcode) << " (" << getOperand<0>() << ", "
+       << getOperand<1>() << ')';
+    break;
+  }
+  case EVM_UMUL128_HI: {
+    OS << getOpcodeString(_opcode) << " (" << getOperand<0>() << ')';
+    break;
+  }
+  case EVM_U256_MUL: {
+    OS << getOpcodeString(_opcode) << " (";
+    for (OperandNum I = 0; I < getNumOperands(); ++I) {
+      OS << getOperand(I);
+      if (I != getNumOperands() - 1) {
+        OS << ", ";
+      }
+    }
+    OS << ')';
+    break;
+  }
+  case EVM_U256_MUL_RESULT: {
+    auto *MulResult = llvm::cast<EvmU256MulResultInstruction>(this);
+    OS << getOpcodeString(_opcode) << " (" << MulResult->getMulInst()
+       << ", idx = " << MulResult->getResultIdx() << ')';
+    break;
+  }
+  case EVM_UDIV128_BY64: {
+    OS << getOpcodeString(_opcode) << " (" << getOperand<0>() << ", "
+       << getOperand<1>() << ", " << getOperand<2>() << ')';
+    break;
+  }
+  case EVM_UREM128_BY64: {
+    OS << getOpcodeString(_opcode) << " (" << getOperand<0>() << ')';
     break;
   }
   case WASM_CHECK: {

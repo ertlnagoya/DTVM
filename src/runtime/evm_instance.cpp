@@ -28,12 +28,18 @@ bool calcRequiredMemorySize(uint64_t Offset, uint64_t Size,
 
 void initMemoryFrame(std::unique_ptr<uint8_t[]> &Memory, uint8_t *&Base,
                      uint64_t &Size) {
+  // Reset frame state only; backing allocation is handled lazily by
+  // ensureMemoryBuffer() when real memory growth happens.
+  Base = Memory.get();
+  Size = 0;
+}
+
+void ensureMemoryBuffer(std::unique_ptr<uint8_t[]> &Memory, uint8_t *&Base) {
   if (!Memory) {
-    // Allocate raw buffer; expansion will zero the used range.
+    // Lazily allocate memory backing store on first real expansion.
     Memory.reset(new uint8_t[zen::evm::MAX_REQUIRED_MEMORY_SIZE]);
   }
   Base = Memory.get();
-  Size = 0;
 }
 } // namespace
 
@@ -60,6 +66,47 @@ EVMInstanceUniquePtr EVMInstance::newEVMInstance(Isolation &Iso,
 
 EVMInstance::~EVMInstance() {}
 
+void EVMInstance::resetForNewCall(evmc_revision NewRev) {
+  // Reset gas accounting
+  Gas = 0;
+  GasRefund = 0;
+  Rev = NewRev;
+  InstanceExitCode = 0;
+  Err = common::ErrorCode::NoError;
+
+  // Reset message stack (clear but keep capacity)
+  CurrentMessage = nullptr;
+  MessageStack.clear();
+  GasRefundStack.clear();
+
+  // Reset memory: keep the 16MB allocation, just reset the size
+  MemoryBase = nullptr;
+  MemorySize = 0;
+  // Don't release Memory - reuse the allocation on next pushMessage()
+  MemoryStack.clear();
+
+  // Reset output
+  clearReturnData();
+  ExeResult = evmc::Result{EVMC_SUCCESS, 0, 0};
+
+  // Reset execution cache: clear() keeps allocated bucket arrays,
+  // avoiding repeated alloc/free of unordered_map internals.
+  InstanceExecutionCache.BlockHashes.clear();
+  InstanceExecutionCache.BlobHashes.clear();
+  InstanceExecutionCache.CalldataLoads.clear();
+  InstanceExecutionCache.ExtcodeHashes.clear();
+  InstanceExecutionCache.Keccak256Results.clear();
+  InstanceExecutionCache.TxContextCached = false;
+
+  // Reset JIT stack
+  EVMStackSize = 0;
+}
+
+void EVMInstance::resetForNewCall(evmc_revision NewRev, const EVMModule &M) {
+  resetForNewCall(NewRev);
+  Mod = &M;
+}
+
 void EVMInstance::setGas(uint64_t NewGas) { Gas = NewGas; }
 
 void EVMInstance::pushMessage(evmc_message *Msg) {
@@ -71,6 +118,7 @@ void EVMInstance::pushMessage(evmc_message *Msg) {
   initMemoryFrame(Memory, MemoryBase, MemorySize);
   MessageStack.push_back(Msg);
   CurrentMessage = Msg;
+  GasRefundStack.push_back(GasRefund);
   Gas = Msg ? Msg->gas : 0;
 }
 
@@ -79,6 +127,12 @@ void EVMInstance::popMessage() {
     MessageStack.pop_back();
   }
   CurrentMessage = MessageStack.empty() ? nullptr : MessageStack.back();
+  if (!GasRefundStack.empty()) {
+    // Only pop the snapshot: successful subcalls keep their accumulated
+    // refunds. On failures, refund rollback is handled by
+    // restoreGasRefundSnapshot() using this stack.
+    GasRefundStack.pop_back();
+  }
   if (!MemoryStack.empty()) {
     Memory = std::move(MemoryStack.back().Data);
     MemorySize = MemoryStack.back().Size;
@@ -111,6 +165,10 @@ void EVMInstance::setExecutionError(const Error &NewErr, uint32_t IgnoredDepth,
                                     common::evm_traphandler::EVMTrapState TS) {
   ZEN_ASSERT(NewErr.getPhase() == common::ErrorPhase::Execution);
   setError(NewErr);
+  if (NewErr.getCode() != ErrorCode::NoError &&
+      NewErr.getCode() != ErrorCode::InstanceExit) {
+    restoreGasRefundSnapshot();
+  }
   if (NewErr.getCode() == ErrorCode::GasLimitExceeded) {
     setGas(0); // gas left
   }
@@ -148,13 +206,15 @@ void EVMInstance::triggerInstanceExceptionOnJIT(EVMInstance *Inst,
 }
 #endif // ZEN_ENABLE_JIT
 
-void EVMInstance::expandMemory(uint64_t RequiredSize) {
+bool EVMInstance::expandMemory(uint64_t RequiredSize) {
   auto NewSize = (RequiredSize + 31) / 32 * 32;
   uint64_t ExpansionCost = calculateMemoryExpansionCost(MemorySize, NewSize);
-  chargeGas(ExpansionCost);
+  if (!chargeGas(ExpansionCost)) {
+    return false;
+  }
   if (NewSize > MemorySize) {
     if (!MemoryBase) {
-      initMemoryFrame(Memory, MemoryBase, MemorySize);
+      ensureMemoryBuffer(Memory, MemoryBase);
     }
     if (NewSize > MemorySize) {
       std::memset(MemoryBase + MemorySize, 0,
@@ -162,13 +222,14 @@ void EVMInstance::expandMemory(uint64_t RequiredSize) {
       MemorySize = NewSize;
     }
   }
+  return true;
 }
 
 void EVMInstance::expandMemoryNoGas(uint64_t RequiredSize) {
   auto NewSize = (RequiredSize + 31) / 32 * 32;
   if (NewSize > MemorySize) {
     if (!MemoryBase) {
-      initMemoryFrame(Memory, MemoryBase, MemorySize);
+      ensureMemoryBuffer(Memory, MemoryBase);
     }
     if (NewSize > MemorySize) {
       std::memset(MemoryBase + MemorySize, 0,
@@ -179,24 +240,34 @@ void EVMInstance::expandMemoryNoGas(uint64_t RequiredSize) {
 }
 
 bool EVMInstance::expandMemoryChecked(uint64_t Offset, uint64_t Size) {
+  auto markOutOfGasForOversizedMemory = [this]() {
+    // Intentionally force an OOG path so all modes share one behavior:
+    // - check mode: chargeGas sets GasLimitExceeded (soft error, no throw)
+    // - CPU exception mode: trigger trap
+    // - interpreter mode: throw
+    (void)chargeGas(getGas() + 1);
+  };
   if (Size == 0) {
     return true;
   }
   uint64_t RequiredSize = 0;
   if (!calcRequiredMemorySize(Offset, Size, RequiredSize)) {
-    chargeGas(getGas() + 1);
+    markOutOfGasForOversizedMemory();
     return false;
   }
   if (RequiredSize > zen::evm::MAX_REQUIRED_MEMORY_SIZE) {
-    chargeGas(getGas() + 1);
+    markOutOfGasForOversizedMemory();
     return false;
   }
-  expandMemory(RequiredSize);
-  return true;
+  return expandMemory(RequiredSize);
 }
 
 bool EVMInstance::expandMemoryChecked(uint64_t OffsetA, uint64_t SizeA,
                                       uint64_t OffsetB, uint64_t SizeB) {
+  auto markOutOfGasForOversizedMemory = [this]() {
+    // Keep oversize/overflow handling consistent with single-range overload.
+    (void)chargeGas(getGas() + 1);
+  };
   const bool NeedA = SizeA > 0;
   const bool NeedB = SizeB > 0;
   if (!NeedA && !NeedB) {
@@ -212,32 +283,57 @@ bool EVMInstance::expandMemoryChecked(uint64_t OffsetA, uint64_t SizeA,
   uint64_t RequiredSizeB = 0;
   if (!calcRequiredMemorySize(OffsetA, SizeA, RequiredSizeA) ||
       !calcRequiredMemorySize(OffsetB, SizeB, RequiredSizeB)) {
-    chargeGas(getGas() + 1);
+    markOutOfGasForOversizedMemory();
     return false;
   }
   const uint64_t RequiredSize = std::max(RequiredSizeA, RequiredSizeB);
   if (RequiredSize > zen::evm::MAX_REQUIRED_MEMORY_SIZE) {
-    chargeGas(getGas() + 1);
+    markOutOfGasForOversizedMemory();
     return false;
   }
-  expandMemory(RequiredSize);
-  return true;
+  return expandMemory(RequiredSize);
 }
-void EVMInstance::chargeGas(uint64_t GasCost) {
+
+bool EVMInstance::chargeGas(uint64_t GasCost) {
   evmc_message *Msg = getCurrentMessage();
   ZEN_ASSERT(Msg && "Active message required for gas accounting");
-
   uint64_t GasLeft = getGas();
   if (GasLeft < GasCost) {
 #if defined(ZEN_ENABLE_JIT) && defined(ZEN_ENABLE_CPU_EXCEPTION)
     triggerInstanceExceptionOnJIT(this, common::ErrorCode::GasLimitExceeded);
+#elif defined(ZEN_ENABLE_JIT) && !defined(ZEN_ENABLE_CPU_EXCEPTION)
+    setInstanceExceptionOnJIT(this, common::ErrorCode::GasLimitExceeded);
+    return false;
 #else
     throw common::getError(common::ErrorCode::GasLimitExceeded);
 #endif
+    return false;
   }
   uint64_t NewGas = GasLeft - GasCost;
   setGas(NewGas);
   Msg->gas = static_cast<int64_t>(NewGas);
+  return true;
+}
+
+bool EVMInstance::addGas(uint64_t GasAmount) {
+  evmc_message *Msg = getCurrentMessage();
+  ZEN_ASSERT(Msg && "Active message required for gas accounting");
+  uint64_t GasLeft = getGas();
+  if (GasLeft > UINT64_MAX - GasAmount) {
+#if defined(ZEN_ENABLE_JIT) && !defined(ZEN_ENABLE_CPU_EXCEPTION)
+    setInstanceExceptionOnJIT(this, common::ErrorCode::GasLimitExceeded);
+    return false;
+#elif defined(ZEN_ENABLE_JIT) && defined(ZEN_ENABLE_CPU_EXCEPTION)
+    triggerInstanceExceptionOnJIT(this, common::ErrorCode::GasLimitExceeded);
+    return false;
+#else
+    throw common::getError(common::ErrorCode::GasLimitExceeded);
+#endif
+  }
+  uint64_t NewGas = GasLeft + GasAmount;
+  setGas(NewGas);
+  Msg->gas = static_cast<int64_t>(NewGas);
+  return true;
 }
 
 } // namespace zen::runtime

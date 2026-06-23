@@ -1,0 +1,8 @@
+status: invalid memory access
+error_code: 9
+stack: []
+memory: ''
+storage: {}
+transient_storage: {}
+return: ''
+events: []

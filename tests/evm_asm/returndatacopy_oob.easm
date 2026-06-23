@@ -1,0 +1,28 @@
+// RETURNDATACOPY out-of-bounds must fail per EIP-211.
+// Build a 1-byte return buffer via identity precompile (0x04),
+// then request offset=1, size=1 (1 + 1 > 1) to trigger failure.
+
+// input[0] = 0x42
+PUSH1 0x42
+PUSH1 0x00
+MSTORE8
+
+// CALL identity precompile with 1-byte input and 32-byte output area.
+// Stack order for CALL: gas, addr, value, argsOffset, argsSize, retOffset, retSize
+PUSH1 0x20
+PUSH1 0x80
+PUSH1 0x01
+PUSH1 0x00
+PUSH1 0x00
+PUSH1 0x04
+PUSH4 0x100000
+CALL
+POP
+
+// RETURNDATACOPY(dst=0, offset=1, size=1) -> out-of-bounds
+PUSH1 0x01
+PUSH1 0x01
+PUSH1 0x00
+RETURNDATACOPY
+
+STOP

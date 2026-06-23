@@ -33,6 +33,10 @@ if(ZEN_ENABLE_SPEC_TEST)
   add_definitions(-DZEN_ENABLE_SPEC_TEST)
 endif()
 
+if(ZEN_ENABLE_JIT_FALLBACK_TEST)
+  add_definitions(-DZEN_ENABLE_JIT_FALLBACK_TEST)
+endif()
+
 if(ZEN_ENABLE_DWASM)
   add_definitions(-DZEN_ENABLE_DWASM)
 endif()
@@ -63,6 +67,14 @@ endif()
 
 if(ZEN_ENABLE_EVM)
   add_definitions(-DZEN_ENABLE_EVM)
+endif()
+
+if(ZEN_ENABLE_JIT_PRECOMPILE_FALLBACK)
+  add_definitions(-DZEN_ENABLE_JIT_PRECOMPILE_FALLBACK)
+endif()
+
+if(ZEN_ENABLE_EVM_STACK_SSA_LIFT)
+  add_definitions(-DZEN_ENABLE_EVM_STACK_SSA_LIFT)
 endif()
 
 if(ZEN_ENABLE_CPU_EXCEPTION)

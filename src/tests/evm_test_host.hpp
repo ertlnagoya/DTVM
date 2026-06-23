@@ -12,7 +12,6 @@
 #include "utils/evm.h"
 #include "utils/rlp_encoding.h"
 
-#include <limits>
 #include <unordered_set>
 #include <utility>
 
@@ -28,6 +27,11 @@ constexpr evmc::address DEFAULT_DEPLOYER_ADDRESS =
 /// interpreters
 class ZenMockedEVMHost : public evmc::MockedHost {
 private:
+  static evmc::Result
+  makeInternalExecutionFailure(const evmc_message &Msg) noexcept {
+    return evmc::Result(EVMC_INTERNAL_ERROR, Msg.gas, 0, nullptr, 0);
+  }
+
   struct IsolationDeleter {
     Runtime *RT = nullptr;
     void operator()(Isolation *Iso) const {
@@ -46,6 +50,8 @@ private:
       PrewarmStorageKeys;
   std::unordered_set<evmc::address> CreatedInTx;
   std::unordered_set<evmc::address> PendingSelfdestructs;
+  uint64_t CallStipendRefund = 0; // track CALL stipend refunds for prepaid fees
+  bool FeesPrepaidInTx = false;
 
 public:
   struct AccountInitEntry {
@@ -58,14 +64,6 @@ public:
     std::vector<evmc::bytes32> StorageKeys;
   };
 
-  struct AuthorizationListEntry {
-    evmc::uint256be ChainId{};
-    evmc::address Address{};
-    uint64_t Nonce = 0;
-    evmc::address Signer{};
-    bool HasSigner = false;
-  };
-
   struct TransactionExecutionConfig {
     std::string ModuleName;
     const uint8_t *Bytecode = nullptr;
@@ -74,11 +72,9 @@ public:
     uint64_t GasLimit = 0;
     uint64_t GasLimitMultiplier = 1;
     uint64_t IntrinsicGas = 0;
-    uint64_t MinimumChargedGas = 0;
     std::optional<evmc::uint256be> MaxPriorityFeePerGas;
     std::optional<evmc::uint256be> MaxFeePerBlobGas;
     std::vector<AccessListEntry> AccessList;
-    std::vector<AuthorizationListEntry> AuthorizationList;
     evmc_revision Revision = zen::evm::DEFAULT_REVISION;
   };
 
@@ -96,8 +92,6 @@ public:
 
   void setRuntime(Runtime *NewRT) { RT = NewRT; }
   Runtime *getRuntime() const { return RT; }
-  void setRevision(evmc_revision NewRevision) { Revision = NewRevision; }
-  evmc_revision getRevision() const { return Revision; }
 
   void loadInitialState(const evmc_tx_context &Context,
                         const std::vector<AccountInitEntry> &Accounts,
@@ -120,18 +114,31 @@ public:
       Result.ErrorMessage = "Runtime is not attached to ZenMockedEVMHost";
       return Result;
     }
+    const evmc_revision ActiveRevision = Config.Revision;
     const bool IsCreateTx = Config.Message.kind == EVMC_CREATE ||
                             Config.Message.kind == EVMC_CREATE2;
-    if ((!Config.Bytecode || Config.BytecodeSize == 0) && !IsCreateTx) {
-      Result.ErrorMessage = "Bytecode buffer is empty";
+    const evmc::address &PrecompileAddr =
+        (Config.Message.kind == EVMC_CALLCODE ||
+         Config.Message.kind == EVMC_DELEGATECALL)
+            ? Config.Message.code_address
+            : Config.Message.recipient;
+    const bool IsPrecompile =
+        precompile::isModExpPrecompile(PrecompileAddr) ||
+        precompile::isBlake2bPrecompile(PrecompileAddr, ActiveRevision) ||
+        precompile::isIdentityPrecompile(PrecompileAddr) ||
+        precompile::isBnAddPrecompile(PrecompileAddr, ActiveRevision) ||
+        precompile::isBnMulPrecompile(PrecompileAddr, ActiveRevision) ||
+        precompile::isBnPairingPrecompile(PrecompileAddr, ActiveRevision);
+    if (!Config.Bytecode && Config.BytecodeSize != 0) {
+      Result.ErrorMessage = "Bytecode buffer is null";
       return Result;
     }
 
     uint64_t GasLimit = Config.GasLimit;
-    const evmc_revision ActiveRevision = Config.Revision;
     Revision = ActiveRevision;
     CreatedInTx.clear();
     PendingSelfdestructs.clear();
+    FeesPrepaidInTx = false;
     if (GasLimit == 0) {
       if (Config.Message.gas < 0) {
         Result.ErrorMessage = "Invalid gas provided in message";
@@ -148,10 +155,17 @@ public:
       GasLimit *= Config.GasLimitMultiplier;
     }
 
-    // EIP-3651: coinbase is warm starting from Shanghai
-    if (ActiveRevision >= EVMC_SHANGHAI) {
-      access_account(tx_context.block_coinbase);
-    }
+    // EIP-2929/EIP-3651: Pre-warm transaction-level accounts.
+    // For CREATE/CREATE2, the parsed message recipient is not the effective
+    // created address at this point, so avoid pre-warming it here.
+    const evmc::address TransactionRecipient =
+        (Config.Message.kind == EVMC_CREATE ||
+         Config.Message.kind == EVMC_CREATE2)
+            ? evmc::address{}
+            : Config.Message.recipient;
+    zen::utils::prewarmTransactionAccounts(
+        *this, ActiveRevision, Config.Message.sender, TransactionRecipient,
+        tx_context.block_coinbase);
 
     uint64_t AvailableGas = GasLimit;
 
@@ -177,6 +191,70 @@ public:
       }
     }
 
+    uint64_t TotalGasLimit = GasLimit;
+    if (Config.IntrinsicGas > 0) {
+      if (TotalGasLimit >
+          std::numeric_limits<uint64_t>::max() - Config.IntrinsicGas) {
+        Result.ErrorMessage = "Gas limit overflow detected";
+        return Result;
+      }
+      TotalGasLimit += Config.IntrinsicGas;
+    }
+    const bool FeesPrepaid =
+        Config.MaxFeePerBlobGas && tx_context.blob_hashes_count > 0;
+    FeesPrepaidInTx = FeesPrepaid;
+    if (FeesPrepaid &&
+        !prepayGasAndBlobFees(TotalGasLimit, Config, Msg, Result)) {
+      return Result;
+    }
+
+    if (!IsCreateTx && IsPrecompile) {
+      auto StateSnapshot = captureHostState();
+      if (!applyPreExecutionState(Msg, Result)) {
+        restoreHostState(StateSnapshot);
+        return Result;
+      }
+
+      evmc::Result PrecompileResult = call(Msg);
+      if (shouldRevertState(PrecompileResult.status_code)) {
+        restoreHostState(StateSnapshot);
+        auto &SenderAccount = accounts[Msg.sender];
+        ensureAccountHasCodeHash(SenderAccount);
+        SenderAccount.nonce++;
+      }
+
+      Result.Status = PrecompileResult.status_code;
+      Result.Success = true;
+      Result.RemainingGas = PrecompileResult.gas_left;
+      if (PrecompileResult.output_data && PrecompileResult.output_size > 0) {
+        ReturnData.assign(PrecompileResult.output_data,
+                          PrecompileResult.output_data +
+                              PrecompileResult.output_size);
+      } else {
+        ReturnData.clear();
+      }
+
+      Result.GasUsed =
+          AvailableGas > static_cast<uint64_t>(Result.RemainingGas)
+              ? AvailableGas - static_cast<uint64_t>(Result.RemainingGas)
+              : 0;
+      Result.GasUsed += Config.IntrinsicGas;
+      uint64_t GasRefund = static_cast<uint64_t>(
+          std::max<int64_t>(0, PrecompileResult.gas_refund));
+      uint64_t RefundLimit = Result.GasUsed / 5;
+      Result.GasRefund = std::min(GasRefund, RefundLimit);
+      Result.GasCharged = Result.GasUsed > Result.GasRefund
+                              ? Result.GasUsed - Result.GasRefund
+                              : 0;
+
+      if (Result.GasCharged != 0) {
+        settleGasCharges(Result.GasCharged, TotalGasLimit, Config, Msg, Result,
+                         FeesPrepaid);
+      }
+      finalizeSelfdestructs();
+      return Result;
+    }
+
     if (IsCreateTx) {
       auto SenderIt = accounts.find(Msg.sender);
       uint64_t SenderNonceBefore =
@@ -200,14 +278,14 @@ public:
       Result.GasUsed += Config.IntrinsicGas;
       uint64_t GasRefund =
           static_cast<uint64_t>(std::max<int64_t>(0, CreateResult.gas_refund));
-      uint64_t RefundLimit = computeRefundLimit(Result.GasUsed, ActiveRevision);
+      uint64_t RefundLimit = Result.GasUsed / 5;
       Result.GasRefund = std::min(GasRefund, RefundLimit);
       Result.GasCharged = Result.GasUsed > Result.GasRefund
                               ? Result.GasUsed - Result.GasRefund
                               : 0;
-      applyMinimumChargedGas(Config, Result);
       if (Result.GasCharged != 0) {
-        settleGasCharges(Result.GasCharged, Config, Msg, Result);
+        settleGasCharges(Result.GasCharged, TotalGasLimit, Config, Msg, Result,
+                         FeesPrepaid);
       }
       SenderIt = accounts.find(Msg.sender);
       if (SenderIt != accounts.end()) {
@@ -260,11 +338,6 @@ public:
 
     uint64_t OriginalGas = static_cast<uint64_t>(Inst->getGas());
 
-    applySenderNonce(Msg.sender);
-
-    uint64_t AuthorizationRefund = 0;
-    applyAuthorizationList(Config, AuthorizationRefund);
-
     auto StateSnapshot = captureHostState();
     if (!applyPreExecutionState(Msg, Result)) {
       restoreHostState(StateSnapshot);
@@ -284,6 +357,9 @@ public:
     }
     if (shouldRevertState(ExecResult.status_code)) {
       restoreHostState(StateSnapshot);
+      auto &SenderAccount = accounts[Msg.sender];
+      ensureAccountHasCodeHash(SenderAccount);
+      SenderAccount.nonce++;
     }
 
     Result.Status = ExecResult.status_code;
@@ -302,19 +378,17 @@ public:
             : 0;
 
     Result.GasUsed += Config.IntrinsicGas;
-
     uint64_t GasRefund =
         static_cast<uint64_t>(std::max<int64_t>(0, Inst->getGasRefund()));
-    GasRefund += AuthorizationRefund;
-    uint64_t RefundLimit = computeRefundLimit(Result.GasUsed, ActiveRevision);
+    uint64_t RefundLimit = Result.GasUsed / 5;
     Result.GasRefund = std::min(GasRefund, RefundLimit);
     Result.GasCharged = Result.GasUsed > Result.GasRefund
                             ? Result.GasUsed - Result.GasRefund
                             : 0;
-    applyMinimumChargedGas(Config, Result);
 
     if (Result.GasCharged != 0) {
-      settleGasCharges(Result.GasCharged, Config, Msg, Result);
+      settleGasCharges(Result.GasCharged, TotalGasLimit, Config, Msg, Result,
+                       FeesPrepaid);
     }
 
     finalizeSelfdestructs();
@@ -389,35 +463,23 @@ public:
         (Msg.kind == EVMC_CALLCODE || Msg.kind == EVMC_DELEGATECALL)
             ? Msg.code_address
             : Msg.recipient;
-    if (precompile::isEcRecoverPrecompile(PrecompileAddr)) {
-      return precompile::executeEcRecover(Msg, ReturnData);
+    if (precompile::isBlake2bPrecompile(PrecompileAddr, Revision)) {
+      return precompile::executeBlake2b(Msg, ReturnData);
     }
-    if (precompile::isSha256Precompile(PrecompileAddr)) {
-      return precompile::executeSha256(Msg, ReturnData);
-    }
-    if (precompile::isRipemd160Precompile(PrecompileAddr)) {
-      return precompile::executeRipemd160(Msg, ReturnData);
-    }
-    if (precompile::isBn256AddPrecompile(PrecompileAddr, Revision)) {
-      return precompile::executeBn256Add(Msg, Revision, ReturnData);
-    }
-    if (precompile::isBn256MulPrecompile(PrecompileAddr, Revision)) {
-      return precompile::executeBn256Mul(Msg, Revision, ReturnData);
-    }
-    if (precompile::isBn256PairingPrecompile(PrecompileAddr, Revision)) {
-      return precompile::executeBn256Pairing(Msg, Revision, ReturnData);
-    }
-    if (precompile::isKzgPointEvaluationPrecompile(PrecompileAddr, Revision)) {
-      return precompile::executeKzgPointEvaluation(Msg, ReturnData);
+    if (precompile::isModExpPrecompile(PrecompileAddr)) {
+      return precompile::executeModExp(Msg, Revision, ReturnData);
     }
     if (precompile::isIdentityPrecompile(PrecompileAddr)) {
       return precompile::executeIdentity(Msg, ReturnData);
     }
-    if (precompile::isBlake2bPrecompile(PrecompileAddr, Revision)) {
-      return precompile::executeBlake2b(Msg, ReturnData);
+    if (precompile::isBnAddPrecompile(PrecompileAddr, Revision)) {
+      return precompile::executeBnAdd(Msg, Revision, ReturnData);
     }
-    if (precompile::isModExpPrecompile(PrecompileAddr, Revision)) {
-      return precompile::executeModExp(Msg, Revision, ReturnData);
+    if (precompile::isBnMulPrecompile(PrecompileAddr, Revision)) {
+      return precompile::executeBnMul(Msg, Revision, ReturnData);
+    }
+    if (precompile::isBnPairingPrecompile(PrecompileAddr, Revision)) {
+      return precompile::executeBnPairing(Msg, Revision, ReturnData);
     }
 
     // For CALLCODE and DELEGATECALL, code comes from code_address, not
@@ -431,7 +493,7 @@ public:
     if (It == accounts.end() || It->second.code.empty()) {
       // No contract found, return parent result
       ZEN_LOG_DEBUG(
-          "No contract found for code address {}, return parent result",
+          "No contract found for code address %s, return parent result",
           evmc::hex(evmc::bytes_view(CodeAddr.bytes, 20)).c_str());
       if (Msg.kind == EVMC_CALL && !applyCallValueTransfer(Msg)) {
         return ParentResult;
@@ -439,6 +501,12 @@ public:
       if (ParentResult.status_code == EVMC_SUCCESS &&
           ParentResult.gas_left == 0) {
         ParentResult.gas_left = Msg.gas;
+      }
+      if (FeesPrepaidInTx && Msg.kind == EVMC_CALL &&
+          toUint256Bytes(Msg.value) != intx::uint256{0} &&
+          ParentResult.status_code == EVMC_SUCCESS &&
+          ParentResult.gas_left < Msg.gas) {
+        this->CallStipendRefund += CALL_GAS_STIPEND;
       }
       return ParentResult;
     }
@@ -448,7 +516,7 @@ public:
       const auto &ContractCode = It->second.code;
       if (ContractCode.empty()) {
         ZEN_LOG_DEBUG(
-            "Contract code is empty for recipient {}",
+            "Contract code is empty for recipient %s",
             evmc::hex(evmc::bytes_view(Msg.recipient.bytes, 20)).c_str());
         return ParentResult;
       }
@@ -461,8 +529,9 @@ public:
       auto ModRet =
           RT->loadEVMModule(ModName, ContractCode.data(), ContractCode.size());
       if (!ModRet) {
-        ZEN_LOG_ERROR("Failed to load EVM module: {}", ModName.c_str());
-        return ParentResult;
+        ZEN_LOG_ERROR("Failed to load EVM module: %s", ModName.c_str());
+        restoreHostState(StateSnapshot);
+        return makeInternalExecutionFailure(Msg);
       }
 
       EVMModule *Mod = *ModRet;
@@ -470,17 +539,19 @@ public:
       IsolationPtr Iso(nullptr, IsolationDeleter{RT});
       Iso.reset(RT->createManagedIsolation());
       if (!Iso) {
-        ZEN_LOG_ERROR("Failed to create isolation for module: {}",
+        ZEN_LOG_ERROR("Failed to create isolation for module: %s",
                       ModName.c_str());
-        return ParentResult;
+        restoreHostState(StateSnapshot);
+        return makeInternalExecutionFailure(Msg);
       }
 
       // Create EVM instance
       auto InstRet = Iso->createEVMInstance(*Mod, Msg.gas);
       if (!InstRet) {
-        ZEN_LOG_ERROR("Failed to create EVM instance for module: {}",
+        ZEN_LOG_ERROR("Failed to create EVM instance for module: %s",
                       ModName.c_str());
-        return ParentResult;
+        restoreHostState(StateSnapshot);
+        return makeInternalExecutionFailure(Msg);
       }
 
       EVMInstance *Inst = *InstRet;
@@ -489,37 +560,16 @@ public:
       evmc_message CallMsg = Msg;
       evmc::Result ExecResult{};
 
-      int64_t InterpGasLeft = -1;
       try {
         if (!applyCallValueTransfer(CallMsg)) {
           restoreHostState(StateSnapshot);
-          return ParentResult;
+          return makeInternalExecutionFailure(Msg);
         }
-        const bool UseInterp =
-            (RT->getConfig().Mode == common::RunMode::MultipassMode) &&
-            (Msg.depth > 0);
-        if (UseInterp) {
-          Inst->clearMessageCache();
-          evmc_message MsgWithCode = CallMsg;
-          MsgWithCode.code =
-              reinterpret_cast<uint8_t *>(Inst->getModule()->Code);
-          MsgWithCode.code_size = Inst->getModule()->CodeSize;
-          Inst->setExeResult(evmc::Result{EVMC_SUCCESS, 0, 0});
-          evm::InterpreterExecContext Ctx(Inst);
-          evm::BaseInterpreter Interpreter(Ctx);
-          Ctx.allocTopFrame(&MsgWithCode);
-          Interpreter.interpret();
-          ExecResult =
-              std::move(const_cast<evmc::Result &>(Ctx.getExeResult()));
-          InterpGasLeft = static_cast<int64_t>(Inst->getGas());
-          Inst->popMessage();
-        } else {
-          RT->callEVMMain(*Inst, CallMsg, ExecResult);
-        }
+        RT->callEVMMain(*Inst, CallMsg, ExecResult);
       } catch (const std::exception &E) {
-        ZEN_LOG_ERROR("Error in recursive call: {}", E.what());
+        ZEN_LOG_ERROR("Error in recursive call: %s", E.what());
         restoreHostState(StateSnapshot);
-        return ParentResult;
+        return makeInternalExecutionFailure(Msg);
       }
 
       if (ExecResult.output_data && ExecResult.output_size > 0) {
@@ -528,8 +578,7 @@ public:
       } else {
         ReturnData.clear();
       }
-      int64_t RemainingGas =
-          (InterpGasLeft >= 0) ? InterpGasLeft : ExecResult.gas_left;
+      int64_t RemainingGas = ExecResult.gas_left;
       if (RemainingGas < 0) {
         RemainingGas = static_cast<int64_t>(Inst->getGas());
       }
@@ -543,9 +592,9 @@ public:
 
     } catch (const std::exception &E) {
       // On error, return parent result
-      ZEN_LOG_ERROR("Error in recursive call: {}", E.what());
+      ZEN_LOG_ERROR("Error in recursive call: %s", E.what());
       restoreHostState(StateSnapshot);
-      return ParentResult;
+      return makeInternalExecutionFailure(Msg);
     }
   }
   using hash256 = evmc::bytes32;
@@ -599,6 +648,12 @@ public:
       return true;
     if (Acc.codehash != EMPTY_CODE_HASH)
       return true;
+    if (Revision >= EVMC_PARIS) {
+      for (const auto &Slot : Acc.storage) {
+        if (!evmc::is_zero(Slot.second.current))
+          return true;
+      }
+    }
     return false;
   }
   evmc_message prepareMessage(evmc_message Msg) noexcept {
@@ -633,7 +688,7 @@ public:
       if (!IsNewAccount) {
         ensureAccountHasCodeHash(It->second);
         if (isCreateCollision(It->second)) {
-          ZEN_LOG_ERROR("Create collision at address {}",
+          ZEN_LOG_ERROR("Create collision at address %s",
                         evmc::hex(NewAddr).c_str());
           auto SenderIt = accounts.find(Msg.sender);
           if (SenderIt != accounts.end() &&
@@ -659,7 +714,7 @@ public:
       auto ModRet = RT->loadEVMModule(ModName, InitcodePtr, InitcodeSize);
       if (!ModRet) {
         restoreHostState(StateSnapshot);
-        ZEN_LOG_ERROR("Failed to load EVM module: {}", ModName.c_str());
+        ZEN_LOG_ERROR("Failed to load EVM module: %s", ModName.c_str());
         return evmc::Result{EVMC_FAILURE, Msg.gas, 0, NewAddr};
       }
       EVMModule *Mod = *ModRet;
@@ -668,7 +723,7 @@ public:
       Iso.reset(RT->createManagedIsolation());
       if (!Iso) {
         restoreHostState(StateSnapshot);
-        ZEN_LOG_ERROR("Failed to create isolation for module: {}",
+        ZEN_LOG_ERROR("Failed to create isolation for module: %s",
                       ModName.c_str());
         return evmc::Result{EVMC_FAILURE, Msg.gas, 0, NewAddr};
       }
@@ -676,7 +731,7 @@ public:
       auto InstRet = Iso->createEVMInstance(*Mod, Msg.gas);
       if (!InstRet) {
         restoreHostState(StateSnapshot);
-        ZEN_LOG_ERROR("Failed to create EVM instance for module: {}",
+        ZEN_LOG_ERROR("Failed to create EVM instance for module: %s",
                       ModName.c_str());
         return evmc::Result{EVMC_FAILURE, Msg.gas, 0, NewAddr};
       }
@@ -699,8 +754,10 @@ public:
           intx::be::load<intx::uint256>(SenderAcc.balance);
       if (SenderBalance < Value) {
         restoreHostState(StateSnapshot);
-        ZEN_LOG_ERROR("Insufficient balance for CREATE: have {}, need {}",
-                      SenderBalance, Value);
+        const auto SenderBalanceStr = intx::to_string(SenderBalance);
+        const auto ValueStr = intx::to_string(Value);
+        ZEN_LOG_ERROR("Insufficient balance for CREATE: have %s, need %s",
+                      SenderBalanceStr.c_str(), ValueStr.c_str());
         return evmc::Result{EVMC_INSUFFICIENT_BALANCE, Msg.gas, 0, NewAddr};
       }
       SenderBalance -= Value;
@@ -712,32 +769,11 @@ public:
 
       evmc_message CallMsg = Msg;
       evmc::Result ExecResult{};
-      int64_t InterpGasLeft = -1;
       try {
-        const bool UseInterp =
-            (RT->getConfig().Mode == common::RunMode::MultipassMode) &&
-            (Msg.depth > 0);
-        if (UseInterp) {
-          Inst->clearMessageCache();
-          evmc_message MsgWithCode = CallMsg;
-          MsgWithCode.code =
-              reinterpret_cast<uint8_t *>(Inst->getModule()->Code);
-          MsgWithCode.code_size = Inst->getModule()->CodeSize;
-          Inst->setExeResult(evmc::Result{EVMC_SUCCESS, 0, 0});
-          evm::InterpreterExecContext Ctx(Inst);
-          evm::BaseInterpreter Interpreter(Ctx);
-          Ctx.allocTopFrame(&MsgWithCode);
-          Interpreter.interpret();
-          ExecResult =
-              std::move(const_cast<evmc::Result &>(Ctx.getExeResult()));
-          InterpGasLeft = static_cast<int64_t>(Inst->getGas());
-          Inst->popMessage();
-        } else {
-          RT->callEVMMain(*Inst, CallMsg, ExecResult);
-        }
+        RT->callEVMMain(*Inst, CallMsg, ExecResult);
       } catch (const std::exception &E) {
         restoreHostState(StateSnapshot);
-        ZEN_LOG_ERROR("Error in handleCreate execution: {}", E.what());
+        ZEN_LOG_ERROR("Error in handleCreate execution: %s", E.what());
         return evmc::Result{EVMC_FAILURE, Msg.gas, 0, evmc::address{}};
       }
 
@@ -748,8 +784,7 @@ public:
         ReturnData.clear();
       }
 
-      int64_t RemainingGas =
-          (InterpGasLeft >= 0) ? InterpGasLeft : ExecResult.gas_left;
+      int64_t RemainingGas = ExecResult.gas_left;
       if (RemainingGas < 0) {
         RemainingGas = static_cast<int64_t>(Inst->getGas());
       }
@@ -764,6 +799,10 @@ public:
           SenderIt->second.nonce++;
         }
         evmc::Result Failure(ExecResult.status_code, RemainingGas, GasRefund);
+        if (ExecResult.status_code == EVMC_REVERT && !ReturnData.empty()) {
+          Failure.output_data = ReturnData.data();
+          Failure.output_size = ReturnData.size();
+        }
         Failure.create_address = NewAddr;
         return Failure;
       }
@@ -816,14 +855,13 @@ public:
         }
       }
 
-      evmc::Result CreateResult(
-          EVMC_SUCCESS, RemainingGas, GasRefund,
-          NewAccPost.code.empty() ? nullptr : NewAccPost.code.data(),
-          NewAccPost.code.size());
+      // evmone behavior: CREATE success returns empty output_data
+      evmc::Result CreateResult(EVMC_SUCCESS, RemainingGas, GasRefund, nullptr,
+                                0);
       CreateResult.create_address = NewAddr;
       return CreateResult;
     } catch (const std::exception &E) {
-      ZEN_LOG_ERROR("Error in handleCreate: {}", E.what());
+      ZEN_LOG_ERROR("Error in handleCreate: %s", E.what());
       restoreHostState(StateSnapshot);
       return evmc::Result{EVMC_FAILURE, Msg.gas, 0, evmc::address{}};
     }
@@ -870,52 +908,11 @@ private:
     return intx::be::store<evmc::bytes32>(Value);
   }
 
-  static uint64_t computeRefundLimit(uint64_t GasUsed,
-                                     evmc_revision Revision) noexcept {
-    return Revision >= EVMC_LONDON ? GasUsed / 5 : GasUsed / 2;
-  }
-
-  static bool isDelegationIndicatorCode(const evmc::bytes &Code) noexcept {
-    return Code.size() == 23 && Code[0] == 0xef && Code[1] == 0x01 &&
-           Code[2] == 0x00;
-  }
-
-  static evmc::bytes
-  makeDelegationIndicatorCode(const evmc::address &Target) noexcept {
-    evmc::bytes Code(23, '\0');
-    Code[0] = 0xef;
-    Code[1] = 0x01;
-    Code[2] = 0x00;
-    std::memcpy(Code.data() + 3, Target.bytes, sizeof(Target.bytes));
-    return Code;
-  }
-
   void ensureAccountHasCodeHash(evmc::MockedAccount &Account) {
     if (Account.code.empty() &&
         std::memcmp(Account.codehash.bytes, EMPTY_CODE_HASH.bytes, 32) != 0) {
       Account.codehash = EMPTY_CODE_HASH;
     }
-  }
-
-  void updateAccountCode(evmc::MockedAccount &Account,
-                         const evmc::bytes &Code) {
-    Account.code = Code;
-    const std::vector<uint8_t> CodeBytes(Account.code.begin(),
-                                         Account.code.end());
-    const auto CodeHash = host::evm::crypto::keccak256(CodeBytes);
-    std::memcpy(Account.codehash.bytes, CodeHash.data(),
-                sizeof(Account.codehash.bytes));
-  }
-
-  void clearAccountCode(evmc::MockedAccount &Account) {
-    Account.code.clear();
-    Account.codehash = EMPTY_CODE_HASH;
-  }
-
-  void applySenderNonce(const evmc::address &Sender) {
-    auto &SenderAccount = accounts[Sender];
-    ensureAccountHasCodeHash(SenderAccount);
-    SenderAccount.nonce++;
   }
 
   void applyPrewarmedStorageKeys(const evmc::address &Addr,
@@ -933,13 +930,15 @@ private:
 
   bool applyPreExecutionState(const evmc_message &Msg,
                               TransactionExecutionResult &Result) {
+    auto &SenderAccount = accounts[Msg.sender];
+    ensureAccountHasCodeHash(SenderAccount);
+    SenderAccount.nonce++;
+
     intx::uint256 TransferValue = toUint256BE(Msg.value);
     if (TransferValue == 0) {
       return true;
     }
 
-    auto &SenderAccount = accounts[Msg.sender];
-    ensureAccountHasCodeHash(SenderAccount);
     auto &RecipientAccount = accounts[Msg.recipient];
     ensureAccountHasCodeHash(RecipientAccount);
     applyPrewarmedStorageKeys(Msg.recipient, RecipientAccount);
@@ -959,55 +958,6 @@ private:
     SenderAccount.balance = toBytes32(SenderBalance);
     RecipientAccount.balance = toBytes32(RecipientBalance);
     return true;
-  }
-
-  void applyAuthorizationList(const TransactionExecutionConfig &Config,
-                              uint64_t &AuthorizationRefund) {
-    if (Revision < EVMC_PRAGUE || Config.AuthorizationList.empty()) {
-      return;
-    }
-
-    static constexpr evmc::address ZERO_ADDRESS{};
-    const intx::uint256 CurrentChainId = toUint256BE(tx_context.chain_id);
-    for (const auto &Entry : Config.AuthorizationList) {
-      if (!Entry.HasSigner) {
-        continue;
-      }
-
-      const intx::uint256 EntryChainId = toUint256BE(Entry.ChainId);
-      if (EntryChainId != 0 && EntryChainId != CurrentChainId) {
-        continue;
-      }
-      if (Entry.Nonce == std::numeric_limits<uint64_t>::max()) {
-        continue;
-      }
-
-      access_account(Entry.Signer);
-      auto &AuthorityAccount = accounts[Entry.Signer];
-      ensureAccountHasCodeHash(AuthorityAccount);
-
-      if (!AuthorityAccount.code.empty() &&
-          !isDelegationIndicatorCode(AuthorityAccount.code)) {
-        continue;
-      }
-      if (static_cast<uint64_t>(AuthorityAccount.nonce) != Entry.Nonce) {
-        continue;
-      }
-
-      const bool WasEmpty = !account_exists(Entry.Signer);
-      if (!WasEmpty) {
-        AuthorizationRefund += 12500;
-      }
-
-      if (std::memcmp(Entry.Address.bytes, ZERO_ADDRESS.bytes,
-                      sizeof(Entry.Address.bytes)) == 0) {
-        clearAccountCode(AuthorityAccount);
-      } else {
-        updateAccountCode(AuthorityAccount,
-                          makeDelegationIndicatorCode(Entry.Address));
-      }
-      AuthorityAccount.nonce++;
-    }
   }
 
   bool applyCallValueTransfer(const evmc_message &Msg) {
@@ -1037,10 +987,57 @@ private:
     return true;
   }
 
-  void settleGasCharges(uint64_t GasCharged,
+  bool prepayGasAndBlobFees(uint64_t GasLimit,
+                            const TransactionExecutionConfig &Config,
+                            const evmc_message &Msg,
+                            TransactionExecutionResult &Result) {
+    intx::uint256 GasPrice = toUint256BE(tx_context.tx_gas_price);
+    intx::uint256 BaseFee = toUint256BE(tx_context.block_base_fee);
+    intx::uint256 PriorityFee =
+        GasPrice > BaseFee ? GasPrice - BaseFee : intx::uint256{0};
+    intx::uint256 EffectiveGasPrice = GasPrice;
+
+    if (Config.MaxPriorityFeePerGas) {
+      intx::uint256 MaxPriority = toUint256BE(*Config.MaxPriorityFeePerGas);
+      intx::uint256 MaxFeeMinusBase =
+          GasPrice > BaseFee ? GasPrice - BaseFee : intx::uint256{0};
+      PriorityFee =
+          MaxPriority < MaxFeeMinusBase ? MaxPriority : MaxFeeMinusBase;
+      EffectiveGasPrice = BaseFee + PriorityFee;
+    }
+
+    intx::uint256 UpfrontGasCost = intx::uint256(GasLimit) * EffectiveGasPrice;
+    intx::uint256 BlobFee = 0;
+    if (Config.MaxFeePerBlobGas && tx_context.blob_hashes_count > 0) {
+      constexpr uint64_t BlobGasPerBlob = 131072;
+      intx::uint256 BlobBaseFee = toUint256BE(tx_context.blob_base_fee);
+      intx::uint256 MaxFeePerBlobGas = toUint256BE(*Config.MaxFeePerBlobGas);
+      intx::uint256 EffectiveBlobFee =
+          BlobBaseFee <= MaxFeePerBlobGas ? BlobBaseFee : MaxFeePerBlobGas;
+      intx::uint256 BlobGasUsed = intx::uint256(tx_context.blob_hashes_count) *
+                                  intx::uint256(BlobGasPerBlob);
+      BlobFee = BlobGasUsed * EffectiveBlobFee;
+    }
+
+    auto &SenderAccount = accounts[Msg.sender];
+    ensureAccountHasCodeHash(SenderAccount);
+    intx::uint256 SenderBalance = toUint256Bytes(SenderAccount.balance);
+    const intx::uint256 TotalCost = UpfrontGasCost + BlobFee;
+    if (SenderBalance < TotalCost) {
+      Result.Success = false;
+      Result.Status = EVMC_INSUFFICIENT_BALANCE;
+      Result.ErrorMessage = "Sender balance insufficient for upfront gas";
+      return false;
+    }
+    SenderBalance -= TotalCost;
+    SenderAccount.balance = toBytes32(SenderBalance);
+    return true;
+  }
+
+  void settleGasCharges(uint64_t GasCharged, uint64_t GasLimit,
                         const TransactionExecutionConfig &Config,
                         const evmc_message &Msg,
-                        TransactionExecutionResult &Result) {
+                        TransactionExecutionResult &Result, bool FeesPrepaid) {
     intx::uint256 GasPrice = toUint256BE(tx_context.tx_gas_price);
     intx::uint256 BaseFee = toUint256BE(tx_context.block_base_fee);
     intx::uint256 PriorityFee =
@@ -1057,31 +1054,44 @@ private:
     }
 
     intx::uint256 GasCharged256 = intx::uint256(GasCharged);
-    intx::uint256 TotalGasCost = GasCharged256 * EffectiveGasPrice;
     intx::uint256 CoinbaseReward = GasCharged256 * PriorityFee;
-    intx::uint256 BlobFee = 0;
-    if (Config.MaxFeePerBlobGas && tx_context.blob_hashes_count > 0) {
-      constexpr uint64_t BlobGasPerBlob = 131072;
-      intx::uint256 BlobBaseFee = toUint256BE(tx_context.blob_base_fee);
-      intx::uint256 MaxFeePerBlobGas = toUint256BE(*Config.MaxFeePerBlobGas);
-      intx::uint256 EffectiveBlobFee =
-          BlobBaseFee <= MaxFeePerBlobGas ? BlobBaseFee : MaxFeePerBlobGas;
-      intx::uint256 BlobGasUsed = intx::uint256(tx_context.blob_hashes_count) *
-                                  intx::uint256(BlobGasPerBlob);
-      BlobFee = BlobGasUsed * EffectiveBlobFee;
-    }
+    if (FeesPrepaid) {
+      if (GasLimit > GasCharged) {
+        intx::uint256 Refund =
+            intx::uint256(GasLimit - GasCharged) * EffectiveGasPrice;
+        auto &SenderAccount = accounts[Msg.sender];
+        ensureAccountHasCodeHash(SenderAccount);
+        intx::uint256 SenderBalance = toUint256Bytes(SenderAccount.balance);
+        SenderBalance += Refund;
+        SenderAccount.balance = toBytes32(SenderBalance);
+      }
+    } else {
+      intx::uint256 TotalGasCost = GasCharged256 * EffectiveGasPrice;
+      intx::uint256 BlobFee = 0;
+      if (Config.MaxFeePerBlobGas && tx_context.blob_hashes_count > 0) {
+        constexpr uint64_t BlobGasPerBlob = 131072;
+        intx::uint256 BlobBaseFee = toUint256BE(tx_context.blob_base_fee);
+        intx::uint256 MaxFeePerBlobGas = toUint256BE(*Config.MaxFeePerBlobGas);
+        intx::uint256 EffectiveBlobFee =
+            BlobBaseFee <= MaxFeePerBlobGas ? BlobBaseFee : MaxFeePerBlobGas;
+        intx::uint256 BlobGasUsed =
+            intx::uint256(tx_context.blob_hashes_count) *
+            intx::uint256(BlobGasPerBlob);
+        BlobFee = BlobGasUsed * EffectiveBlobFee;
+      }
 
-    auto &SenderAccount = accounts[Msg.sender];
-    ensureAccountHasCodeHash(SenderAccount);
-    intx::uint256 SenderBalance = toUint256Bytes(SenderAccount.balance);
-    const intx::uint256 TotalCost = TotalGasCost + BlobFee;
-    if (SenderBalance < TotalCost) {
-      Result.Success = false;
-      Result.ErrorMessage = "Sender balance insufficient for gas settlement";
-      return;
+      auto &SenderAccount = accounts[Msg.sender];
+      ensureAccountHasCodeHash(SenderAccount);
+      intx::uint256 SenderBalance = toUint256Bytes(SenderAccount.balance);
+      const intx::uint256 TotalCost = TotalGasCost + BlobFee;
+      if (SenderBalance < TotalCost) {
+        Result.Success = false;
+        Result.ErrorMessage = "Sender balance insufficient for gas settlement";
+        return;
+      }
+      SenderBalance -= TotalCost;
+      SenderAccount.balance = toBytes32(SenderBalance);
     }
-    SenderBalance -= TotalCost;
-    SenderAccount.balance = toBytes32(SenderBalance);
 
     if (CoinbaseReward != 0 ||
         accounts.find(tx_context.block_coinbase) != accounts.end()) {
@@ -1091,16 +1101,6 @@ private:
       CoinbaseBalance += CoinbaseReward;
       CoinbaseAccount.balance = toBytes32(CoinbaseBalance);
     }
-  }
-
-  void applyMinimumChargedGas(const TransactionExecutionConfig &Config,
-                              TransactionExecutionResult &Result) const {
-    if (Config.MinimumChargedGas == 0) {
-      return;
-    }
-
-    Result.GasUsed = std::max(Result.GasUsed, Config.MinimumChargedGas);
-    Result.GasCharged = std::max(Result.GasCharged, Config.MinimumChargedGas);
   }
 
   void finalizeSelfdestructs() {

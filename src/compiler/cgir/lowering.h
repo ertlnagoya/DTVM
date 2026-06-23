@@ -103,6 +103,9 @@ protected:
 
   void lowerStmt(const MInstruction &Inst) {
     switch (Inst.getKind()) {
+    case MInstruction::PHI:
+      lowerPhiStmt(llvm::cast<PhiInstruction>(Inst));
+      break;
     case MInstruction::DASSIGN:
       lowerDassignStmt(llvm::cast<DassignInstruction>(Inst));
       break;
@@ -183,8 +186,35 @@ protected:
       ResultReg = SELF.lowerWasmOverflowI128BinaryExpr(
           llvm::cast<WasmOverflowI128BinaryInstruction>(Inst));
       break;
+    case MInstruction::EVM_UMUL128:
+      ResultReg =
+          SELF.lowerEvmUmul128Expr(llvm::cast<EvmUmul128Instruction>(Inst));
+      break;
+    case MInstruction::EVM_UMUL128_HI:
+      ResultReg =
+          SELF.lowerEvmUmul128HiExpr(llvm::cast<EvmUmul128HiInstruction>(Inst));
+      break;
+    case MInstruction::EVM_U256_MUL:
+      ResultReg =
+          SELF.lowerEvmU256MulExpr(llvm::cast<EvmU256MulInstruction>(Inst));
+      break;
+    case MInstruction::EVM_U256_MUL_RESULT:
+      ResultReg = SELF.lowerEvmU256MulResultExpr(
+          llvm::cast<EvmU256MulResultInstruction>(Inst));
+      break;
+    case MInstruction::EVM_UDIV128_BY64:
+      ResultReg = SELF.lowerEvmUdiv128By64Expr(
+          llvm::cast<EvmUdiv128By64Instruction>(Inst));
+      break;
+    case MInstruction::EVM_UREM128_BY64:
+      ResultReg = SELF.lowerEvmUrem128By64Expr(
+          llvm::cast<EvmUrem128By64Instruction>(Inst));
+      break;
     case MInstruction::ADC:
       ResultReg = SELF.lowerAdcExpr(llvm::cast<AdcInstruction>(Inst));
+      break;
+    case MInstruction::SBB:
+      ResultReg = SELF.lowerSbbExpr(llvm::cast<SbbInstruction>(Inst));
       break;
     case MInstruction::CMP:
       ResultReg = SELF.lowerCmpExpr(llvm::cast<CmpInstruction>(Inst));
@@ -194,6 +224,11 @@ protected:
       break;
     case MInstruction::SELECT:
       ResultReg = SELF.lowerSelectExpr(llvm::cast<SelectInstruction>(Inst));
+      break;
+    case MInstruction::PHI:
+      ZEN_ASSERT(_expr_reg_map.count(&Inst) &&
+                 "phi must be lowered before it is used");
+      ResultReg = _expr_reg_map[&Inst];
       break;
     case MInstruction::DREAD:
       ResultReg = lowerDreadExpr(llvm::cast<DreadInstruction>(Inst));
@@ -219,6 +254,29 @@ protected:
     auto var_reg = getOrCreateVarReg(inst.getVarIdx(), reg_class);
     MF->createCgInstruction(*CurBB, TII.get(llvm::TargetOpcode::COPY), reg_op,
                             var_reg);
+  }
+
+  void lowerPhiStmt(const PhiInstruction &Inst) {
+    llvm::MVT VT = getMVT(*Inst.getType());
+    CgRegister ResultReg = createReg(TLI.getRegClassFor(VT));
+    std::vector<CgOperand> Operands;
+    Operands.reserve(1 + Inst.getNumIncoming() * 2);
+    Operands.push_back(CgOperand::createRegOperand(ResultReg, true));
+
+    for (size_t Index = 0; Index < Inst.getNumIncoming(); ++Index) {
+      const MInstruction *IncomingValue = Inst.getIncomingValue(Index);
+      const MBasicBlock *IncomingBB = Inst.getIncomingBlock(Index);
+      ZEN_ASSERT(IncomingValue != nullptr);
+      ZEN_ASSERT(IncomingBB != nullptr);
+      CgRegister IncomingReg = lowerExpr(*IncomingValue);
+      Operands.push_back(CgOperand::createRegOperand(IncomingReg, false));
+      Operands.push_back(CgOperand::createMBB(getOrCreateCgBB(IncomingBB)));
+    }
+
+    llvm::MutableArrayRef<CgOperand> OperandRef(Operands);
+    MF->createCgInstruction(*CurBB, TII.get(llvm::TargetOpcode::PHI),
+                            OperandRef);
+    _expr_reg_map[&Inst] = ResultReg;
   }
 
   CgRegister lowerDreadExpr(const DreadInstruction &inst) {

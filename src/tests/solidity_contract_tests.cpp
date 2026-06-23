@@ -530,6 +530,8 @@ GTEST_API_ int main(int argc, char **argv) {
   uint64_t GasLimit = zen::utils::defaultEvmGasLimit();
   LoggerLevel LogLevel = LoggerLevel::Info;
   RuntimeConfig Config;
+  Config.Format = InputFormat::EVM;
+  Config.Mode = RunMode::InterpMode;
 
   const std::unordered_map<std::string, InputFormat> FormatMap = {
       {"wasm", InputFormat::WASM},
@@ -572,8 +574,24 @@ GTEST_API_ int main(int argc, char **argv) {
                   "Number of threads for multipass JIT(set 0 for automatic "
                   "determination)")
       ->excludes(DMMOption);
-  CLIParser.add_flag("--enable-multipass-lazy", Config.EnableMultipassLazy,
-                     "Enable multipass lazy mode(on request compile)");
+  CLIParser.add_flag("--enable-profile-guided-jit",
+                     Config.EnableProfileGuidedJIT,
+                     "Enable profile-guided JIT mode");
+  CLIParser.add_option("--jit-trigger-calls", Config.JITTriggerCallCount,
+                       "PGJ: call count threshold to trigger JIT");
+  CLIParser.add_option("--jit-trigger-gas", Config.JITTriggerTotalGas,
+                       "PGJ: gas usage threshold to trigger JIT");
+  CLIParser.add_option("--ring-buffer-capacity", Config.RingBufferCapacity,
+                       "PGJ: sliding window ring buffer capacity");
+  // Deprecated compatibility flag: kept for parity with other multipass JIT
+  // CLIs/test binaries so existing CI scripts that pass
+  // --enable-multipass-lazy do not fail argument parsing. The flag has no
+  // effect on solidity contract tests.
+  bool EnableMultipassLazyCompatibility = false;
+  CLIParser.add_flag(
+      "--enable-multipass-lazy", EnableMultipassLazyCompatibility,
+      "Deprecated compatibility flag accepted for parity with other "
+      "multipass JIT CLIs; ignored by solidity contract tests");
 #endif // ZEN_ENABLE_MULTIPASS_JIT
   CLI11_PARSE(CLIParser, argc, argv);
 

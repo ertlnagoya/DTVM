@@ -5,6 +5,20 @@ cmake_minimum_required(VERSION 3.16)
 
 project(ZetaEngine LANGUAGES C CXX ASM)
 
+# Honor FETCHCONTENT_BASE_DIR from environment when not set on cmd line. Enables
+# a shared FetchContent cache across worktrees, CI jobs, and local builds. CI
+# workflows export this env to `/github/home/.fetchcontent` (paired with
+# actions/cache); local developers can export `~/.cache/cmake-fetchcontent` per
+# `docs/start.md` "Build dependency cache".
+if(DEFINED ENV{FETCHCONTENT_BASE_DIR} AND NOT DEFINED
+                                          CACHE{FETCHCONTENT_BASE_DIR}
+)
+  set(FETCHCONTENT_BASE_DIR
+      "$ENV{FETCHCONTENT_BASE_DIR}"
+      CACHE PATH "Shared FetchContent cache (from env)"
+  )
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -24,11 +38,19 @@ option(ZEN_ENABLE_BUILTIN_LIBC "Enable builtin libc (partial)" ON)
 option(ZEN_ENABLE_LIBEVM "Enable evmc library build" OFF)
 
 # Feature options
+option(
+  ZEN_ENABLE_JIT_PRECOMPILE_FALLBACK
+  "Enable interpreter fallback before JIT compilation for bytecode estimated to be too expensive"
+  OFF
+)
 option(ZEN_ENABLE_CPU_EXCEPTION "Enable cpu trap to implement wasm trap" ON)
 option(ZEN_ENABLE_VIRTUAL_STACK "Enable virtual stack(no system stack)" OFF)
 option(ZEN_ENABLE_DUMP_CALL_STACK "Enable exception call stack dump" OFF)
 option(ZEN_ENABLE_EVM_GAS_REGISTER
        "Enable gas register optimization for x86_64 multipass JIT" OFF
+)
+option(ZEN_ENABLE_EVM_STACK_SSA_LIFT
+       "Enable conservative EVM stack lifting in multipass frontend" OFF
 )
 
 # Blockchain options
@@ -47,6 +69,11 @@ option(ZEN_ENABLE_DEBUG_GREEDY_RA "Enable debug greedy ra" OFF)
 # Profiling options
 option(ZEN_ENABLE_PROFILER "Enable profiler" OFF)
 option(ZEN_ENABLE_LINUX_PERF "Enable linux perf" OFF)
+option(
+  ZEN_EVM_CACHE_PROFILE
+  "Enable per-phase wall-clock instrumentation in EVM bytecode-cache build (stderr CSV)"
+  OFF
+)
 
 # Test options
 option(ZEN_ENABLE_SPEC_TEST "Enable spec test" OFF)
@@ -54,6 +81,9 @@ option(ZEN_ENABLE_ASSEMBLYSCRIPT_TEST "Enable AssemblyScript test" OFF)
 option(ZEN_ENABLE_MOCK_CHAIN_TEST "Enable mock chain hostapis for test" OFF)
 option(ZEN_ENABLE_EVMABI_TEST "Enable evmabi test" OFF)
 option(ZEN_ENABLE_COVERAGE "Enable coverage test" OFF)
+option(ZEN_ENABLE_JIT_FALLBACK_TEST
+       "Enable JIT fallback testing with undefined opcodes" OFF
+)
 
 if(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
   set(ZEN_BUILD_TARGET_X86_64 ON)
@@ -119,6 +149,21 @@ endif()
 
 if(ZEN_ENABLE_EVM AND ZEN_ENABLE_SINGLEPASS_JIT)
   message(FATAL_ERROR "EVM does not support singlepass JIT mode.")
+endif()
+
+if(ZEN_ENABLE_JIT_PRECOMPILE_FALLBACK AND NOT ZEN_ENABLE_MULTIPASS_JIT)
+  message(
+    WARNING
+      "ZEN_ENABLE_JIT_PRECOMPILE_FALLBACK requires ZEN_ENABLE_MULTIPASS_JIT=ON. "
+      "Automatically disabling ZEN_ENABLE_JIT_PRECOMPILE_FALLBACK."
+  )
+  set(ZEN_ENABLE_JIT_PRECOMPILE_FALLBACK
+      OFF
+      CACHE
+        BOOL
+        "Enable interpreter fallback before JIT compilation for bytecode estimated to be too expensive"
+        FORCE
+  )
 endif()
 
 if(ZEN_ENABLE_LIBEVM)

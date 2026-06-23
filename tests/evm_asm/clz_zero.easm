@@ -1,0 +1,8 @@
+// CLZ(0) = 256 (all 256 bits are zero)
+PUSH1 0x00
+CLZ
+PUSH1 0x00
+MSTORE
+PUSH1 0x20
+PUSH1 0x00
+RETURN

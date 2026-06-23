@@ -7,7 +7,10 @@
 #include "evm_test_host.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <gtest/gtest.h>
+#include <intx/intx.hpp>
 
 using namespace zen::evm;
 using namespace zen::utils;
@@ -15,8 +18,6 @@ using namespace zen::evm_test_utils;
 
 namespace {
 
-constexpr bool DEBUG = true;
-constexpr bool PRINT_FAILURE_DETAILS = true;
 // TODO: RunMode selection logic will be refactored in the future.
 constexpr auto STATE_TEST_RUN_MODE = common::RunMode::InterpMode;
 
@@ -63,8 +64,9 @@ TxIntrinsicCost computeTxIntrinsicCost(const evmc_revision Revision,
   }
 
   const int64_t AuthListCost =
-      static_cast<int64_t>(PT.AuthorizationList.size()) *
-      AuthorizationEmptyAccountCost;
+      Revision >= EVMC_PRAGUE ? static_cast<int64_t>(PT.AuthorizationListSize) *
+                                    AuthorizationEmptyAccountCost
+                              : 0;
 
   int64_t InitcodeCost = 0;
   if (IsCreateTx && Revision >= EVMC_SHANGHAI) {
@@ -130,9 +132,11 @@ RuntimeConfig buildRuntimeConfig() {
 
   if (STATE_TEST_RUN_MODE == common::RunMode::MultipassMode &&
       !MultipassSupported) {
+#ifndef NDEBUG
     std::cerr << "Multipass requested but not built, falling back to "
                  "interpreter"
               << std::endl;
+#endif // NDEBUG
     Config.Mode = common::RunMode::InterpMode;
   } else {
     Config.Mode = STATE_TEST_RUN_MODE;
@@ -151,6 +155,10 @@ RuntimeConfig buildRuntimeConfig() {
 }
 
 std::string getDefaultTestDir() {
+  const char *EnvTestDir = std::getenv("DTVM_TEST_DIR");
+  if (EnvTestDir != nullptr && std::strlen(EnvTestDir) > 0) {
+    return std::string(EnvTestDir);
+  }
   std::filesystem::path DirPath =
       std::filesystem::path(__FILE__).parent_path() /
       std::filesystem::path("../../tests/evm_spec_test/state_tests");
@@ -174,10 +182,28 @@ ExecutionResult executeStateTest(const StateTestFixture &Fixture,
     return Result;
   };
 
+  auto MaybeReturnInvalid = [&](const std::string &Reason) {
+    if (!ExpectedResult.ExpectedException.empty()) {
+      return ExecutionResult{true, {}};
+    }
+    return MakeFailure(Reason + " for " + Fixture.TestName + " (" + Fork + ")");
+  };
+
   try {
     ParsedTransaction PT =
         createTransactionFromIndex(*Fixture.Transaction, ExpectedResult);
     const evmc_revision Revision = mapForkToRevision(Fork);
+
+    const bool HasAuthorizationListField =
+        Fixture.Transaction &&
+        Fixture.Transaction->HasMember("authorizationList") &&
+        (*Fixture.Transaction)["authorizationList"].IsArray();
+    const bool IsType4Tx = !ExpectedResult.ExpectedTxBytes.empty() &&
+                           ExpectedResult.ExpectedTxBytes[0] == 0x04;
+    if (Revision < EVMC_PRAGUE && (HasAuthorizationListField || IsType4Tx)) {
+      return MaybeReturnInvalid("Type 4 transaction pre-fork");
+    }
+
     const TxIntrinsicCost IntrinsicCost = computeTxIntrinsicCost(Revision, PT);
 
     const bool IsCreateTx =
@@ -202,41 +228,127 @@ ExecutionResult executeStateTest(const StateTestFixture &Fixture,
                          " (" + Fork + ")");
     }
 
-    const int64_t MinimumChargedGas = IntrinsicCost.Min;
+    // Validate EIP-1559/4844 transaction constraints before execution.
+    std::optional<evmc::uint256be> MaxFeePerGas;
+    std::optional<evmc::uint256be> MaxPriorityFeePerGas;
+    if (Fixture.Transaction) {
+      const auto &Tx = *Fixture.Transaction;
+      if (Tx.HasMember("gasPrice") && Tx["gasPrice"].IsString()) {
+        MaxFeePerGas = parseUint256(Tx["gasPrice"].GetString());
+      } else if (Tx.HasMember("maxFeePerGas") &&
+                 Tx["maxFeePerGas"].IsString()) {
+        MaxFeePerGas = parseUint256(Tx["maxFeePerGas"].GetString());
+      }
+      if (Tx.HasMember("maxPriorityFeePerGas") &&
+          Tx["maxPriorityFeePerGas"].IsString()) {
+        MaxPriorityFeePerGas =
+            parseUint256(Tx["maxPriorityFeePerGas"].GetString());
+      }
+    }
+
+    const intx::uint256 BaseFee =
+        intx::be::load<intx::uint256>(Fixture.Environment.block_base_fee);
+    if (MaxFeePerGas) {
+      const intx::uint256 MaxFee = intx::be::load<intx::uint256>(*MaxFeePerGas);
+      if (MaxFee < BaseFee) {
+        return MaybeReturnInvalid("Max fee per gas below base fee");
+      }
+      if (MaxPriorityFeePerGas) {
+        const intx::uint256 MaxPriority =
+            intx::be::load<intx::uint256>(*MaxPriorityFeePerGas);
+        if (MaxPriority > MaxFee) {
+          return MaybeReturnInvalid("Max priority fee exceeds max fee");
+        }
+      }
+    }
+
+    const bool HasBlobFields =
+        Fixture.Transaction &&
+        ((Fixture.Transaction->HasMember("maxFeePerBlobGas") &&
+          (*Fixture.Transaction)["maxFeePerBlobGas"].IsString()) ||
+         (Fixture.Transaction->HasMember("blobVersionedHashes") &&
+          (*Fixture.Transaction)["blobVersionedHashes"].IsArray()));
+    if (HasBlobFields) {
+      const size_t BlobCount = PT.BlobHashes.size();
+      if (BlobCount == 0) {
+        return MaybeReturnInvalid("Blob transaction has zero blobs");
+      }
+      const size_t MaxBlobs = (Revision >= EVMC_PRAGUE)
+                                  ? static_cast<size_t>(9)
+                                  : static_cast<size_t>(6);
+      if (BlobCount > MaxBlobs) {
+        return MaybeReturnInvalid("Blob transaction has too many blobs");
+      }
+      for (const auto &Hash : PT.BlobHashes) {
+        if (Hash.bytes[0] != 0x01) {
+          return MaybeReturnInvalid("Invalid blob versioned hash");
+        }
+      }
+      if (!PT.MaxFeePerBlobGas) {
+        return MaybeReturnInvalid("Missing max fee per blob gas");
+      }
+      const intx::uint256 MaxBlobFee =
+          intx::be::load<intx::uint256>(*PT.MaxFeePerBlobGas);
+      const intx::uint256 BlobBaseFee =
+          intx::be::load<intx::uint256>(Fixture.Environment.blob_base_fee);
+      if (MaxBlobFee < BlobBaseFee) {
+        return MaybeReturnInvalid("Max fee per blob gas below base fee");
+      }
+    }
+
+    if (MaxFeePerGas) {
+      intx::uint256 SenderBalance = 0;
+      for (const auto &PA : Fixture.PreState) {
+        if (std::memcmp(PA.Address.bytes, PT.Message->sender.bytes, 20) == 0) {
+          SenderBalance = intx::be::load<intx::uint256>(PA.Account.balance);
+          break;
+        }
+      }
+
+      const intx::uint256 GasLimit = intx::uint256(TxGasLimit);
+      const intx::uint256 MaxFee = intx::be::load<intx::uint256>(*MaxFeePerGas);
+      const intx::uint256 Value =
+          intx::be::load<intx::uint256>(PT.Message->value);
+      intx::uint256 TotalCost = GasLimit * MaxFee + Value;
+
+      if (HasBlobFields && PT.MaxFeePerBlobGas) {
+        constexpr uint64_t BlobGasPerBlob = 131072;
+        const intx::uint256 BlobGas =
+            intx::uint256(PT.BlobHashes.size()) * intx::uint256(BlobGasPerBlob);
+        const intx::uint256 MaxBlobFee =
+            intx::be::load<intx::uint256>(*PT.MaxFeePerBlobGas);
+        TotalCost += BlobGas * MaxBlobFee;
+      }
+
+      if (SenderBalance < TotalCost) {
+        return MaybeReturnInvalid(
+            "Sender balance insufficient for upfront cost");
+      }
+    }
+
     const int64_t ExecutionGasLimit = TxGasLimit - IntrinsicCost.Intrinsic;
     PT.Message->gas = ExecutionGasLimit;
 
-    // Find the target account (contract to call)
+    const evmc::address &PrecompileAddr =
+        (PT.Message->kind == EVMC_CALLCODE ||
+         PT.Message->kind == EVMC_DELEGATECALL)
+            ? PT.Message->code_address
+            : PT.Message->recipient;
+    const bool IsPrecompile =
+        precompile::isModExpPrecompile(PrecompileAddr) ||
+        precompile::isBlake2bPrecompile(PrecompileAddr, Revision) ||
+        precompile::isIdentityPrecompile(PrecompileAddr) ||
+        precompile::isBnAddPrecompile(PrecompileAddr, Revision) ||
+        precompile::isBnMulPrecompile(PrecompileAddr, Revision) ||
+        precompile::isBnPairingPrecompile(PrecompileAddr, Revision);
+
+    // Find the target account (contract to call) if present.
     const ParsedAccount *TargetAccount = nullptr;
     for (const auto &PA : Fixture.PreState) {
       if (std::memcmp(PA.Address.bytes, PT.Message->recipient.bytes, 20) == 0) {
         TargetAccount = &PA;
         break;
       }
-    }
-
-    if (!TargetAccount && !IsCreateTx) {
-      if (!ExpectedResult.ExpectedException.empty()) {
-        return {true, {}};
-      }
-      if (DEBUG) {
-        std::cout << "No target account found for test: " << Fixture.TestName
-                  << std::endl;
-      }
-      return MakeFailure(
-          "Target account " +
-          evmc::hex(evmc::bytes_view(PT.Message->recipient.bytes, 20)) +
-          " not present in pre-state for " + Fixture.TestName + " (" + Fork +
-          ")");
-    }
-
-    // Skip if no code to execute
-    if (!IsCreateTx && TargetAccount->Account.code.empty()) {
-      if (DEBUG) {
-        std::cout << "No code to execute for test: " << Fixture.TestName
-                  << std::endl;
-      }
-      return {true, {}};
     }
 
     RuntimeConfig Config = buildRuntimeConfig();
@@ -252,15 +364,12 @@ ExecutionResult executeStateTest(const StateTestFixture &Fixture,
       InitialAccounts.push_back(Entry);
     }
     evmc_tx_context TxContext = Fixture.Environment;
+    TxContext.tx_origin = PT.Message->sender;
     if (!PT.BlobHashes.empty()) {
       TxContext.blob_hashes = PT.BlobHashes.data();
       TxContext.blob_hashes_count = PT.BlobHashes.size();
     }
     HostPtr->loadInitialState(TxContext, InitialAccounts, true);
-
-    // Warm sender and recipient (required by EIP-2929)
-    HostPtr->access_account(PT.Message->sender);
-    HostPtr->access_account(PT.Message->recipient);
 
     auto RT = Runtime::newEVMRuntime(Config, HostPtr.get());
     if (!RT) {
@@ -276,14 +385,19 @@ ExecutionResult executeStateTest(const StateTestFixture &Fixture,
     if (IsCreateTx) {
       ExecConfig.Bytecode = PT.CallData.data();
       ExecConfig.BytecodeSize = PT.CallData.size();
-    } else {
+    } else if (IsPrecompile) {
+      ExecConfig.Bytecode = nullptr;
+      ExecConfig.BytecodeSize = 0;
+    } else if (TargetAccount) {
       ExecConfig.Bytecode = TargetAccount->Account.code.data();
       ExecConfig.BytecodeSize = TargetAccount->Account.code.size();
+    } else {
+      ExecConfig.Bytecode = nullptr;
+      ExecConfig.BytecodeSize = 0;
     }
     ExecConfig.Message = *PT.Message;
     ExecConfig.Revision = Revision;
     ExecConfig.IntrinsicGas = static_cast<uint64_t>(IntrinsicCost.Intrinsic);
-    ExecConfig.MinimumChargedGas = static_cast<uint64_t>(MinimumChargedGas);
 
     // Convert AccessList from ParsedTransaction to TransactionExecutionConfig
     for (const auto &Entry : PT.AccessList) {
@@ -291,16 +405,6 @@ ExecutionResult executeStateTest(const StateTestFixture &Fixture,
       ALE.Address = Entry.Address;
       ALE.StorageKeys = Entry.StorageKeys;
       ExecConfig.AccessList.push_back(std::move(ALE));
-    }
-
-    for (const auto &Entry : PT.AuthorizationList) {
-      ZenMockedEVMHost::AuthorizationListEntry ALE;
-      ALE.ChainId = Entry.ChainId;
-      ALE.Address = Entry.Address;
-      ALE.Nonce = Entry.Nonce;
-      ALE.Signer = Entry.Signer;
-      ALE.HasSigner = Entry.HasSigner;
-      ExecConfig.AuthorizationList.push_back(std::move(ALE));
     }
 
     ExecConfig.GasLimit = static_cast<uint64_t>(PT.Message->gas);
@@ -315,16 +419,15 @@ ExecutionResult executeStateTest(const StateTestFixture &Fixture,
 
     auto ExecResult = MockedHost->executeTransaction(ExecConfig);
 
-    if (DEBUG) {
-      std::cout << "ExecutionSucceeded: " << ExecResult.Success << std::endl;
-      std::cout << "ExecutionGasUsed: " << ExecResult.GasUsed << std::endl;
-      std::cout << "ExecutionGasCharged: " << ExecResult.GasCharged
-                << std::endl;
-      std::cout << "ExecutionStatus: " << ExecResult.Status << std::endl;
-      if (!ExecResult.ErrorMessage.empty()) {
-        std::cout << "ExecutionError: " << ExecResult.ErrorMessage << std::endl;
-      }
+#ifndef NDEBUG
+    std::cout << "ExecutionSucceeded: " << ExecResult.Success << std::endl;
+    std::cout << "ExecutionGasUsed: " << ExecResult.GasUsed << std::endl;
+    std::cout << "ExecutionGasCharged: " << ExecResult.GasCharged << std::endl;
+    std::cout << "ExecutionStatus: " << ExecResult.Status << std::endl;
+    if (!ExecResult.ErrorMessage.empty()) {
+      std::cout << "ExecutionError: " << ExecResult.ErrorMessage << std::endl;
     }
+#endif // NDEBUG
 
     if (!ExpectedResult.ExpectedException.empty()) {
       if (ExecResult.Status == EVMC_SUCCESS) {
@@ -398,24 +501,32 @@ const std::vector<StateTestFixture> &getStateFixtures() {
   static std::vector<StateTestFixture> Fixtures = [] {
     std::vector<StateTestFixture> Loaded;
     auto JsonFiles = findJsonFiles(DEFAULT_TEST_DIR);
-    if (DEBUG) {
-      std::cout << "Found " << JsonFiles.size() << " JSON test files in "
-                << DEFAULT_TEST_DIR << std::endl;
-    }
-
+#ifndef NDEBUG
+    std::cout << "Found " << JsonFiles.size() << " JSON test files in "
+              << DEFAULT_TEST_DIR << std::endl;
+#endif // NDEBUG
+    int LoadErrors = 0;
     for (const auto &FilePath : JsonFiles) {
-      auto FixturesFromFile = parseStateTestFile(FilePath);
-      for (auto &Fixture : FixturesFromFile) {
-        if (DEBUG) {
+      try {
+        auto FixturesFromFile = parseStateTestFile(FilePath);
+        for (auto &Fixture : FixturesFromFile) {
+#ifndef NDEBUG
           std::cout << "Loaded fixture: " << Fixture.TestName << std::endl;
+#endif // NDEBUG
+          Loaded.push_back(std::move(Fixture));
         }
-        Loaded.push_back(std::move(Fixture));
+      } catch (const std::exception &E) {
+        ++LoadErrors;
+        std::cerr << "ERROR loading " << FilePath << ": " << E.what()
+                  << std::endl;
       }
     }
 
-    if (DEBUG) {
-      std::cout << "Total fixtures loaded: " << Loaded.size() << std::endl;
+    std::cout << "Total fixtures loaded: " << Loaded.size();
+    if (LoadErrors > 0) {
+      std::cout << " (" << LoadErrors << " files failed to load)";
     }
+    std::cout << std::endl;
 
     return Loaded;
   }();
@@ -495,10 +606,10 @@ const std::vector<StateTestCaseParam> &getStateTestParams() {
       }
     }
 
-    if (DEBUG) {
-      std::cout << "Generated " << Cases.size() << " state test cases"
-                << std::endl;
-    }
+#ifndef NDEBUG
+    std::cout << "Generated " << Cases.size() << " state test cases"
+              << std::endl;
+#endif // NDEBUG
 
     return Cases;
   }();
@@ -527,209 +638,6 @@ std::string sanitizeTestName(const std::string &Name) {
 
 class EVMStateTest : public testing::TestWithParam<StateTestCaseParam> {};
 
-void assertFocusedFixturePasses(const std::string &FixturePath,
-                                const std::string &FixtureName,
-                                const std::string &ForkName,
-                                const std::string &FailureLabel) {
-  auto Fixtures = parseStateTestFile(FixturePath);
-  auto FixtureIt = std::find_if(Fixtures.begin(), Fixtures.end(),
-                                [&](const StateTestFixture &Fixture) {
-                                  return Fixture.TestName == FixtureName;
-                                });
-
-  ASSERT_NE(FixtureIt, Fixtures.end())
-      << "Focused fixture not found in " << FixturePath;
-  ASSERT_NE(FixtureIt->Post, nullptr)
-      << "Focused fixture is missing post state";
-
-  const auto ForkIt = FixtureIt->Post->FindMember(ForkName.c_str());
-  ASSERT_NE(ForkIt, FixtureIt->Post->MemberEnd())
-      << "Fork " << ForkName << " not found in focused fixture";
-  ASSERT_TRUE(ForkIt->value.IsArray())
-      << "Fork " << ForkName << " does not contain a result array";
-  ASSERT_GT(ForkIt->value.Size(), 0u)
-      << "Fork " << ForkName << " result array is empty";
-
-  ForkPostResult ExpectedResult = parseForkPostResult(ForkIt->value[0]);
-  ExecutionResult Result =
-      executeStateTest(*FixtureIt, ForkName, ExpectedResult);
-
-  if (!Result.Passed) {
-    std::string CombinedErrors = "\n";
-    CombinedErrors += "=================================================\n";
-    CombinedErrors +=
-        FailureLabel + " failed with " +
-        std::to_string(Result.ErrorMessages.size()) +
-        (Result.ErrorMessages.size() == 1 ? " error:" : " errors:") + "\n";
-    CombinedErrors += "=================================================\n";
-    for (size_t I = 0; I < Result.ErrorMessages.size(); ++I) {
-      CombinedErrors += "\n[Error " + std::to_string(I + 1) + "]\n";
-      CombinedErrors += Result.ErrorMessages[I];
-      CombinedErrors += "\n";
-    }
-    CombinedErrors += "=================================================\n";
-    FAIL() << CombinedErrors;
-  }
-}
-
-TEST(EVMStateFocused, Blake2PrecompileDelegatecallBerlin) {
-  const evmc_revision TargetRevision = getTargetRevision();
-  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_BERLIN) {
-    GTEST_SKIP() << "Focused Berlin regression skipped for requested revision";
-  }
-
-  const std::string FixturePath =
-      DEFAULT_TEST_DIR +
-      "/istanbul/eip152_blake2/test_blake2_precompile_delegatecall.json";
-  const std::string FixtureName =
-      "tests/istanbul/eip152_blake2/test_blake2_delegatecall.py::"
-      "test_blake2_precompile_delegatecall[fork_Berlin-state_test]";
-  const std::string ForkName = "Berlin";
-
-  assertFocusedFixturePasses(FixturePath, FixtureName, ForkName,
-                             "Focused Berlin blake2 delegatecall regression");
-}
-
-TEST(EVMStateFocused, ChainIdTypedTransaction4Prague) {
-  const evmc_revision TargetRevision = getTargetRevision();
-  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_PRAGUE) {
-    GTEST_SKIP() << "Focused Prague regression skipped for requested revision";
-  }
-
-  const std::string FixturePath =
-      DEFAULT_TEST_DIR + "/istanbul/eip1344_chainid/test_chainid.json";
-  const std::string FixtureName =
-      "tests/istanbul/eip1344_chainid/test_chainid.py::"
-      "test_chainid[fork_Prague-typed_transaction_4-state_test]";
-  const std::string ForkName = "Prague";
-
-  assertFocusedFixturePasses(
-      FixturePath, FixtureName, ForkName,
-      "Focused Prague CHAINID typed_transaction_4 regression");
-}
-
-TEST(EVMStateFocused, ContractCreatingTxMaxSizeOnesPrague) {
-  const evmc_revision TargetRevision = getTargetRevision();
-  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_PRAGUE) {
-    GTEST_SKIP() << "Focused Prague regression skipped for requested revision";
-  }
-
-  const std::string FixturePath =
-      DEFAULT_TEST_DIR +
-      "/shanghai/eip3860_initcode/test_contract_creating_tx.json";
-  const std::string FixtureName =
-      "tests/shanghai/eip3860_initcode/test_initcode.py::"
-      "test_contract_creating_tx[fork_Prague-state_test-max_size_ones]";
-  const std::string ForkName = "Prague";
-
-  assertFocusedFixturePasses(
-      FixturePath, FixtureName, ForkName,
-      "Focused Prague max_size_ones contract-creation regression");
-}
-
-TEST(EVMStateFocused, ReentrancySelfdestructRevertCallCancun) {
-  const evmc_revision TargetRevision = getTargetRevision();
-  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_CANCUN) {
-    GTEST_SKIP() << "Focused Cancun regression skipped for requested revision";
-  }
-
-  const std::string FixturePath =
-      DEFAULT_TEST_DIR +
-      "/cancun/eip6780_selfdestruct/test_reentrancy_selfdestruct_revert.json";
-  const std::string FixtureName =
-      "tests/cancun/eip6780_selfdestruct/test_reentrancy_selfdestruct_revert."
-      "py::test_reentrancy_selfdestruct_revert[fork_Cancun-state_test-"
-      "second_suicide_CALL-first_suicide_CALL]";
-  const std::string ForkName = "Cancun";
-
-  assertFocusedFixturePasses(
-      FixturePath, FixtureName, ForkName,
-      "Focused Cancun reentrancy selfdestruct revert CALL regression");
-}
-
-TEST(EVMStateFocused, ReentrancySelfdestructRevertDelegatecallCancun) {
-  const evmc_revision TargetRevision = getTargetRevision();
-  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_CANCUN) {
-    GTEST_SKIP() << "Focused Cancun regression skipped for requested revision";
-  }
-
-  const std::string FixturePath =
-      DEFAULT_TEST_DIR +
-      "/cancun/eip6780_selfdestruct/test_reentrancy_selfdestruct_revert.json";
-  const std::string FixtureName =
-      "tests/cancun/eip6780_selfdestruct/test_reentrancy_selfdestruct_revert."
-      "py::test_reentrancy_selfdestruct_revert[fork_Cancun-state_test-"
-      "second_suicide_DELEGATECALL-first_suicide_DELEGATECALL]";
-  const std::string ForkName = "Cancun";
-
-  assertFocusedFixturePasses(
-      FixturePath, FixtureName, ForkName,
-      "Focused Cancun reentrancy selfdestruct revert DELEGATECALL regression");
-}
-
-TEST(EVMStateFocused, WarmCoinbaseCallSufficientGasShanghai) {
-  const evmc_revision TargetRevision = getTargetRevision();
-  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_SHANGHAI) {
-    GTEST_SKIP()
-        << "Focused Shanghai regression skipped for requested revision";
-  }
-
-  const std::string FixturePath =
-      DEFAULT_TEST_DIR +
-      "/shanghai/eip3651_warm_coinbase/test_warm_coinbase_call_out_of_gas.json";
-  const std::string FixtureName =
-      "tests/shanghai/eip3651_warm_coinbase/test_warm_coinbase.py::"
-      "test_warm_coinbase_call_out_of_gas[fork_Shanghai-state_test-CALL-"
-      "sufficient_gas]";
-  const std::string ForkName = "Shanghai";
-
-  assertFocusedFixturePasses(
-      FixturePath, FixtureName, ForkName,
-      "Focused Shanghai warm coinbase CALL sufficient-gas regression");
-}
-
-TEST(EVMStateFocused, WarmCoinbaseDelegatecallSufficientGasShanghai) {
-  const evmc_revision TargetRevision = getTargetRevision();
-  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_SHANGHAI) {
-    GTEST_SKIP()
-        << "Focused Shanghai regression skipped for requested revision";
-  }
-
-  const std::string FixturePath =
-      DEFAULT_TEST_DIR +
-      "/shanghai/eip3651_warm_coinbase/test_warm_coinbase_call_out_of_gas.json";
-  const std::string FixtureName =
-      "tests/shanghai/eip3651_warm_coinbase/test_warm_coinbase.py::"
-      "test_warm_coinbase_call_out_of_gas[fork_Shanghai-state_test-"
-      "DELEGATECALL-sufficient_gas]";
-  const std::string ForkName = "Shanghai";
-
-  assertFocusedFixturePasses(
-      FixturePath, FixtureName, ForkName,
-      "Focused Shanghai warm coinbase DELEGATECALL sufficient-gas regression");
-}
-
-TEST(EVMStateFocused, WarmCoinbaseStaticcallSufficientGasShanghai) {
-  const evmc_revision TargetRevision = getTargetRevision();
-  if (TargetRevision != EVMC_MAX_REVISION && TargetRevision != EVMC_SHANGHAI) {
-    GTEST_SKIP()
-        << "Focused Shanghai regression skipped for requested revision";
-  }
-
-  const std::string FixturePath =
-      DEFAULT_TEST_DIR +
-      "/shanghai/eip3651_warm_coinbase/test_warm_coinbase_call_out_of_gas.json";
-  const std::string FixtureName =
-      "tests/shanghai/eip3651_warm_coinbase/test_warm_coinbase.py::"
-      "test_warm_coinbase_call_out_of_gas[fork_Shanghai-state_test-"
-      "STATICCALL-sufficient_gas]";
-  const std::string ForkName = "Shanghai";
-
-  assertFocusedFixturePasses(
-      FixturePath, FixtureName, ForkName,
-      "Focused Shanghai warm coinbase STATICCALL sufficient-gas regression");
-}
-
 TEST_P(EVMStateTest, ExecutesStateTest) {
   const auto &Param = GetParam();
 
@@ -744,11 +652,6 @@ TEST_P(EVMStateTest, ExecutesStateTest) {
       executeStateTest(*Param.Fixture, Param.ForkName, Param.Expected);
 
   if (!Result.Passed) {
-    if (!PRINT_FAILURE_DETAILS) {
-      EXPECT_TRUE(Result.Passed);
-      return;
-    }
-
     std::string CombinedErrors = "\n";
     CombinedErrors += "=================================================\n";
     CombinedErrors +=

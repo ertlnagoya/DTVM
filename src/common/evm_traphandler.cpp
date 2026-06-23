@@ -16,7 +16,7 @@ namespace evm_traphandler {
 void EVMCallThreadState::setJITTraces() {
   void *FrameAddr = TrapFrameAddr;
   void *StartAddr = StartFrame.FrameAddr;
-  if (Inst) {
+  if (!Inst) {
     return;
   }
   if (!FrameAddr || !StartAddr) {
@@ -34,6 +34,23 @@ void EVMCallThreadState::setJITTraces() {
 }
 
 bool initEVMPlatformTrapHandler() {
+#ifdef ZEN_ENABLE_VIRTUAL_STACK
+  // SA_ONSTACK requires an alternate signal stack; configure it so signal
+  // handlers can run safely when the virtual stack is exhausted.
+  static constexpr size_t SIG_STACK_SIZE = 64 * 1024; // 64 KB
+  static thread_local std::unique_ptr<uint8_t[]> SigStackMem;
+  if (!SigStackMem) {
+    SigStackMem = std::make_unique<uint8_t[]>(SIG_STACK_SIZE);
+    stack_t SS{};
+    SS.ss_sp = SigStackMem.get();
+    SS.ss_size = SIG_STACK_SIZE;
+    SS.ss_flags = 0;
+    if (sigaltstack(&SS, nullptr) != 0) {
+      ZEN_LOG_ERROR("failed to set sigaltstack\n");
+    }
+  }
+#endif // ZEN_ENABLE_VIRTUAL_STACK
+
   static struct sigaction PrevSigill;
   static struct sigaction PrevSigfpe;
   static struct sigaction PrevSigsegv;
@@ -103,6 +120,14 @@ bool initEVMPlatformTrapHandler() {
       // it. It will either crash synchronously, fix up the instruction
       // so that execution can continue and return, or trigger a crash by
       // returning the signal to it's original disposition and returning.
+
+      // Unblock the signal before forwarding to the previous handler,
+      // preserving the same semantics as when SA_NODEFER was used.
+      sigset_t SignalSet;
+      sigemptyset(&SignalSet);
+      sigaddset(&SignalSet, SigNum);
+      int UnblockResult = sigprocmask(SIG_UNBLOCK, &SignalSet, nullptr);
+      ZEN_ASSERT(UnblockResult == 0);
       if ((PrevSigAction->sa_flags & SA_SIGINFO) != 0) {
         PrevSigAction->sa_sigaction(SigNum, SigInfo, Ctx);
       } else if ((void (*)(int))PrevSigAction->sa_sigaction == SIG_DFL ||
@@ -134,9 +159,9 @@ bool initEVMPlatformTrapHandler() {
     struct sigaction Handler;
     memset(&Handler, 0x0, sizeof(struct sigaction));
 #ifdef ZEN_ENABLE_VIRTUAL_STACK
-    Handler.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
+    Handler.sa_flags = SA_SIGINFO | SA_ONSTACK;
 #else
-    Handler.sa_flags = SA_SIGINFO | SA_NODEFER;
+    Handler.sa_flags = SA_SIGINFO;
 #endif // ZEN_ENABLE_VIRTUAL_STACK
     Handler.sa_sigaction = TrapHandler;
     sigemptyset(&Handler.sa_mask);

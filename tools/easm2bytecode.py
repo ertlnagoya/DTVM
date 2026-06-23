@@ -43,6 +43,7 @@ def evm_to_bytecode(input_file_path, output_file_path):
         "SHL": "1B",
         "SHR": "1C",
         "SAR": "1D",
+        "CLZ": "1E",
 
         # 2x: cryptographic operations
         "KECCAK256": "20",

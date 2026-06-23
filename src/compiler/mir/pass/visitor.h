@@ -41,15 +41,43 @@ public:
     case MInstruction::ADC:
       visitAdcInstruction(static_cast<AdcInstruction &>(I));
       break;
+    case MInstruction::SBB:
+      visitSbbInstruction(static_cast<SbbInstruction &>(I));
+      break;
     case MInstruction::OVERFLOW_I128_BINARY:
       visitWasmOverflowI128BinaryInstruction(
           static_cast<WasmOverflowI128BinaryInstruction &>(I));
+      break;
+    case MInstruction::EVM_UMUL128:
+      visitEvmUmul128Instruction(static_cast<EvmUmul128Instruction &>(I));
+      break;
+    case MInstruction::EVM_UMUL128_HI:
+      visitEvmUmul128HiInstruction(static_cast<EvmUmul128HiInstruction &>(I));
+      break;
+    case MInstruction::EVM_U256_MUL:
+      visitEvmU256MulInstruction(static_cast<EvmU256MulInstruction &>(I));
+      break;
+    case MInstruction::EVM_U256_MUL_RESULT:
+      visitEvmU256MulResultInstruction(
+          static_cast<EvmU256MulResultInstruction &>(I));
+      break;
+    case MInstruction::EVM_UDIV128_BY64:
+      visitEvmUdiv128By64Instruction(
+          static_cast<EvmUdiv128By64Instruction &>(I));
+      break;
+    case MInstruction::EVM_UREM128_BY64:
+      visitEvmUrem128By64Instruction(
+          static_cast<EvmUrem128By64Instruction &>(I));
+
       break;
     case MInstruction::CMP:
       visitCmpInstruction(static_cast<CmpInstruction &>(I));
       break;
     case MInstruction::SELECT:
       visitSelectInstruction(static_cast<SelectInstruction &>(I));
+      break;
+    case MInstruction::PHI:
+      visitPhiInstruction(static_cast<PhiInstruction &>(I));
       break;
     case MInstruction::DASSIGN:
       visitDassignInstruction(static_cast<DassignInstruction &>(I));
@@ -126,7 +154,9 @@ public:
   virtual void visitBinaryInstruction(BinaryInstruction &I) { VISIT_OPERAND_2 }
   virtual void visitCmpInstruction(CmpInstruction &I) { VISIT_OPERAND_2 }
   virtual void visitAdcInstruction(AdcInstruction &I) { VISIT_OPERAND_3 }
+  virtual void visitSbbInstruction(SbbInstruction &I) { VISIT_OPERAND_3 }
   virtual void visitSelectInstruction(SelectInstruction &I) { VISIT_OPERAND_3 }
+  virtual void visitPhiInstruction(PhiInstruction &I) {}
   virtual void visitDassignInstruction(DassignInstruction &I) {
     VISIT_OPERAND_1
   }
@@ -168,6 +198,25 @@ public:
   virtual void
   visitWasmOverflowI128BinaryInstruction(WasmOverflowI128BinaryInstruction &I) {
     VISIT_OPERANDS
+  }
+  virtual void visitEvmUmul128Instruction(EvmUmul128Instruction &I) {
+    VISIT_OPERAND_2
+  }
+  virtual void visitEvmUmul128HiInstruction(EvmUmul128HiInstruction &I) {
+    VISIT_OPERAND_1
+  }
+  virtual void visitEvmU256MulInstruction(EvmU256MulInstruction &I) {
+    VISIT_OPERANDS
+  }
+  virtual void
+  visitEvmU256MulResultInstruction(EvmU256MulResultInstruction &I) {
+    VISIT_OPERAND_1
+  }
+  virtual void visitEvmUdiv128By64Instruction(EvmUdiv128By64Instruction &I) {
+    VISIT_OPERAND_3
+  }
+  virtual void visitEvmUrem128By64Instruction(EvmUrem128By64Instruction &I) {
+    VISIT_OPERAND_1
   }
 
 protected:

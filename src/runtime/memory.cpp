@@ -6,6 +6,7 @@
 #include "runtime/module.h"
 #include "utils/logging.h"
 #include "utils/others.h"
+#include <cinttypes>
 #include <cstdio>
 
 namespace zen::runtime {
@@ -86,17 +87,35 @@ WasmMemoryAllocator::WasmMemoryAllocator(
         PathIdBegin++;
       }
 #ifdef ZEN_BUILD_PLATFORM_DARWIN
-      ::sprintf((char *)Path,
-                "/Volumes/RAMDisk/zetaengine_init_memory_%ld_%d.memory",
-                PathIdBegin, Options->MemoryIndex);
+      std::snprintf(Path, sizeof(Path),
+                    "/Volumes/RAMDisk/zetaengine_init_memory_%" PRIu64
+                    "_%d.memory",
+                    PathIdBegin, Options->MemoryIndex);
 #else
-      ::sprintf(Path, "/dev/shm/zetaengine_init_memory_%ld_%d.memory",
-                PathIdBegin, Options->MemoryIndex);
+      std::snprintf(Path, sizeof(Path),
+                    "/dev/shm/zetaengine_init_memory_%" PRIu64 "_%d.memory",
+                    PathIdBegin, Options->MemoryIndex);
 #endif // ZEN_BUILD_PLATFORM_DARWIN
-      MmapFileFd = ::open(Path, O_RDWR | O_CREAT, 644);
+      MmapFileFd = ::open(Path, O_RDWR | O_CREAT, 0644);
       if (MmapFileFd < 0) {
         ZEN_LOG_WARN("failed to create mmap memory file due to '%s'", Path,
                      std::strerror(errno));
+        UseMmapBucket = false;
+        Stats.revertRecord(Timer);
+        goto try_use_mmap_init;
+      }
+      // Remove the directory entry while keeping the fd open. On POSIX,
+      // remove() on a regular file is equivalent to unlink(): it deletes the
+      // name from the filesystem but the file data remains accessible through
+      // any open fd or mmap. The kernel reclaims the storage automatically
+      // when the last fd/mmap reference is closed — even on abnormal exit
+      // (SIGKILL, crash). This prevents /dev/shm file accumulation.
+      if (::remove(Path) != 0) {
+        ZEN_LOG_WARN("failed to early-unlink mmap file %s due to '%s', "
+                     "disabling mmap-bucket for this module",
+                     Path, std::strerror(errno));
+        ::close(MmapFileFd);
+        MmapFileFd = -1;
         UseMmapBucket = false;
         Stats.revertRecord(Timer);
         goto try_use_mmap_init;
@@ -181,14 +200,8 @@ WasmMemoryAllocator::~WasmMemoryAllocator() {
       }
       delete MmapAddresses;
     }
-    if (MmapMemoryInitFd > 0) {
+    if (MmapMemoryInitFd >= 0) {
       ::close(MmapMemoryInitFd);
-      // delete the memory file forcely
-      int Status = ::remove(MmapMemoryFilepath);
-      if (Status != 0) {
-        ZEN_LOG_WARN("failed to remove mmap tmp memory file %s due to '%s'",
-                     MmapMemoryFilepath, std::strerror(errno));
-      }
     }
     if (MmapMemoryFilepath) {
       ::free(MmapMemoryFilepath);
@@ -206,7 +219,7 @@ bool WasmMemoryAllocator::checkWasmMemoryCanUseMmap() {
   bool CanUseMmap = false;
   if (UseMmap) {
     if (DefaultMemoryType == WM_MEMORY_DATA_TYPE_BUCKET_MMAP &&
-        MmapMemoryInitFd > 0) {
+        MmapMemoryInitFd >= 0) {
       CanUseMmap = true;
     }
   }
@@ -320,7 +333,7 @@ void WasmMemoryAllocator::mprotectReadWriteWasmMemoryData(
     }
   }
   if (0 !=
-      ::mprotect(Data.MemoryData, Data.MemorySize, PROT_WRITE | PROT_WRITE)) {
+      ::mprotect(Data.MemoryData, Data.MemorySize, PROT_READ | PROT_WRITE)) {
     ZEN_ABORT();
   }
 }
@@ -408,7 +421,7 @@ WasmMemoryData WasmMemoryAllocator::reallocateNonBucketMemoryAndFillZerosToNew(
   ZEN_ASSERT(NewMemoryAddr);
   if (OldMemoryData.MemoryData) {
     std::memset(NewMemoryAddr + OldMemoryData.MemorySize, 0x0,
-                (uint32_t)NewMemorySize - OldMemoryData.MemorySize);
+                NewMemorySize - OldMemoryData.MemorySize);
   }
   return WasmMemoryData{
       .Type = WM_MEMORY_DATA_TYPE_MALLOC,
@@ -471,12 +484,13 @@ WasmMemoryData WasmMemoryAllocator::allocInitWasmMemory(
 
 void WasmMemoryAllocator::internalFreeWasmMemory(const WasmMemoryData &Data) {
   if (Data.Type == WM_MEMORY_DATA_TYPE_SINGLE_MMAP) {
-    if (0 != ::munmap(Data.MemoryData, Data.MemorySize)) {
+    if (0 != ::munmap(Data.MemoryData, WasmMemoryAllocatorMmapSize)) {
       ZEN_ABORT();
     }
   } else if (Data.Type == WM_MEMORY_DATA_TYPE_MALLOC) {
     CurRuntime->deallocate(Data.MemoryData);
   } else if (Data.Type == WM_MEMORY_DATA_TYPE_BUCKET_MMAP) {
+    common::LockGuard<common::Mutex> _(BucketLock);
     auto MmapBucketIt = MemoryAddrToMmapAddr->find(Data.MemoryData);
     ZEN_ASSERT(MmapBucketIt != MemoryAddrToMmapAddr->end());
     auto *MmapBucket = MmapBucketIt->second;

@@ -13,333 +13,50 @@ on:
       - 'resources/**'
       - '*.md'
       - '.gitignore'
-  workflow_dispatch:
-    inputs:
-      job_scope:
-        description: "Manual run scope"
-        required: true
-        default: "all"
-        type: choice
-        options:
-          - all
-          - focused_regressions
-      focused_revision:
-        description: "Revision for focused regressions"
-        required: true
-        default: "ALL"
-        type: choice
-        options:
-          - ALL
-          - Berlin
-          - Prague
 permissions:
     contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Shared FetchContent cache root for all container jobs. The hook in
+# CMakeLists.txt (commit 96707a2 lines 8-18) picks this up as the base
+# dir for FetchContent populations. The cache key includes the generator
+# namespace because CMake writes generator-specific FetchContent subbuilds.
+env:
+  FETCHCONTENT_BASE_DIR: /github/home/.fetchcontent
+  SCCACHE_GHA_ENABLED: "true"
+  SCCACHE_GHA_VERSION: dtvm-ci-sccache-v2-gcc11-llvm15-ninja
+  SCCACHE_BASEDIRS: ${{ github.workspace }}
+  SCCACHE_IDLE_TIMEOUT: "0"
+  DTVM_CI_USE_NINJA: "1"
+  DTVM_CI_USE_SCCACHE: "1"
+  EVMONE_REPO: https://github.com/DTVMStack/evmone.git
+  EVMONE_REF: for_test
+  EVMONE_BENCH_CACHE_VERSION: v1
+
 jobs:
-  build_test_evm_state_cancun_subset_x86:
-    name: Test DTVM-EVM Cancun parameterized subset on x86-64
-    if: github.event_name != 'workflow_dispatch' || inputs.job_scope == 'all'
-    runs-on: ubuntu-latest
-    container:
-      image: dtvmdev1/dtvm-dev-x64:main
-    steps:
-      - name: Check out code
-        run: |
-          git config --global --add safe.directory "$PWD"
-          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
-          git init .
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --detach FETCH_HEAD
-          git submodule update --init --recursive
-      - name: Code Format Check
-        run: |
-          ./tools/format.sh check
-      - name: Build and Run Cancun parameterized subset
-        run: |
-          echo "current home is $HOME"
-          export LLVM_SYS_150_PREFIX=/opt/llvm15
-          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
-          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
-          export CMAKE_BUILD_TARGET=Debug
-          export ENABLE_ASAN=true
-          export RUN_MODE=interpreter
-          export INPUT_FORMAT=evm
-          export ENABLE_LAZY=true
-          export ENABLE_MULTITHREAD=true
-          export TestSuite=evmstatesubset
-          export CPU_EXCEPTION_TYPE='check'
-          export ENABLE_GAS_METER=false
-          export DTVM_TEST_REVISION=Cancun
-          export EVM_GTEST_FILTER='ExecuteAllStateTests/*'
-
-          bash .ci/run_test_suite.sh
-
-  build_test_evm_state_shanghai_subset_x86:
-    name: Test DTVM-EVM Shanghai parameterized subset on x86-64
-    if: github.event_name != 'workflow_dispatch' || inputs.job_scope == 'all'
-    runs-on: ubuntu-latest
-    container:
-      image: dtvmdev1/dtvm-dev-x64:main
-    steps:
-      - name: Check out code
-        run: |
-          git config --global --add safe.directory "$PWD"
-          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
-          git init .
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --detach FETCH_HEAD
-          git submodule update --init --recursive
-      - name: Code Format Check
-        run: |
-          ./tools/format.sh check
-      - name: Build and Run Shanghai parameterized subset
-        run: |
-          echo "current home is $HOME"
-          export LLVM_SYS_150_PREFIX=/opt/llvm15
-          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
-          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
-          export CMAKE_BUILD_TARGET=Debug
-          export ENABLE_ASAN=true
-          export RUN_MODE=interpreter
-          export INPUT_FORMAT=evm
-          export ENABLE_LAZY=true
-          export ENABLE_MULTITHREAD=true
-          export TestSuite=evmstatesubset
-          export CPU_EXCEPTION_TYPE='check'
-          export ENABLE_GAS_METER=false
-          export DTVM_TEST_REVISION=Shanghai
-          export EVM_GTEST_FILTER='ExecuteAllStateTests/*'
-
-          bash .ci/run_test_suite.sh
-
-  build_test_evm_state_berlin_subset_x86:
-    name: Test DTVM-EVM Berlin parameterized subset on x86-64
-    if: github.event_name != 'workflow_dispatch' || inputs.job_scope == 'all'
-    runs-on: ubuntu-latest
-    container:
-      image: dtvmdev1/dtvm-dev-x64:main
-    steps:
-      - name: Check out code
-        run: |
-          git config --global --add safe.directory "$PWD"
-          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
-          git init .
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --detach FETCH_HEAD
-          git submodule update --init --recursive
-      - name: Code Format Check
-        run: |
-          ./tools/format.sh check
-      - name: Build and Run Berlin parameterized subset
-        run: |
-          echo "current home is $HOME"
-          export LLVM_SYS_150_PREFIX=/opt/llvm15
-          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
-          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
-          export CMAKE_BUILD_TARGET=Debug
-          export ENABLE_ASAN=true
-          export RUN_MODE=interpreter
-          export INPUT_FORMAT=evm
-          export ENABLE_LAZY=true
-          export ENABLE_MULTITHREAD=true
-          export TestSuite=evmstatesubset
-          export CPU_EXCEPTION_TYPE='check'
-          export ENABLE_GAS_METER=false
-          export DTVM_TEST_REVISION=Berlin
-          export EVM_GTEST_FILTER='ExecuteAllStateTests/*'
-
-          bash .ci/run_test_suite.sh
-
-  build_test_evm_state_roundtrip_x86:
-    name: Test DTVM-EVM state roundtrip on x86-64
-    if: github.event_name != 'workflow_dispatch' || inputs.job_scope == 'all'
-    runs-on: ubuntu-latest
-    container:
-      image: dtvmdev1/dtvm-dev-x64:main
-    steps:
-      - name: Check out code
-        run: |
-          git config --global --add safe.directory "$PWD"
-          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
-          git init .
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --detach FETCH_HEAD
-          git submodule update --init --recursive
-      - name: Code Format Check
-        run: |
-          ./tools/format.sh check
-      - name: Build and Run state roundtrip and host gas settlement tests
-        run: |
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y libssl-dev
-
-          export LLVM_SYS_150_PREFIX=/opt/llvm15
-          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
-          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
-
-          cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DZEN_ENABLE_ASAN=ON \
-            -DZEN_ENABLE_SPEC_TEST=ON \
-            -DZEN_ENABLE_EVM=ON \
-            -DZEN_ENABLE_CPU_EXCEPTION=OFF \
-            -DZEN_ENABLE_SINGLEPASS_JIT=OFF \
-            -DZEN_ENABLE_MULTIPASS_JIT=OFF
-
-          cmake --build build -j 16 --target solidityContractTests evmHostTests
-
-          ./build/solidityContractTests \
-            --gtest_filter=SolidityStatePersistence.SaveLoadRoundTripPreservesContractState \
-            --log-level error \
-            --mode interpreter \
-            --format evm
-
-          ./build/evmHostTests --gtest_brief=1
-
-  build_test_evm_call_semantics_x86:
-    name: Test DTVM-EVM call semantics regressions on x86-64
-    if: github.event_name != 'workflow_dispatch' || inputs.job_scope == 'all'
-    runs-on: ubuntu-latest
-    container:
-      image: dtvmdev1/dtvm-dev-x64:main
-    steps:
-      - name: Check out code
-        run: |
-          git config --global --add safe.directory "$PWD"
-          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
-          git init .
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --detach FETCH_HEAD
-          git submodule update --init --recursive
-      - name: Code Format Check
-        run: |
-          ./tools/format.sh check
-      - name: Build and Run call semantics regressions
-        run: |
-          export LLVM_SYS_150_PREFIX=/opt/llvm15
-          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
-          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
-          export CMAKE_BUILD_TARGET=Debug
-          export ENABLE_ASAN=true
-          export RUN_MODE=interpreter
-          export INPUT_FORMAT=evm
-          export ENABLE_LAZY=true
-          export ENABLE_MULTITHREAD=true
-          export TestSuite=evmfocusedregressions
-          export CPU_EXCEPTION_TYPE='check'
-          export ENABLE_GAS_METER=false
-          export DTVM_TEST_REVISION=ALL
-          export EVM_GTEST_FILTER='EVMStateFocused.ReentrancySelfdestructRevertCallCancun:EVMStateFocused.ReentrancySelfdestructRevertDelegatecallCancun:EVMStateFocused.WarmCoinbaseCallSufficientGasShanghai:EVMStateFocused.WarmCoinbaseDelegatecallSufficientGasShanghai:EVMStateFocused.WarmCoinbaseStaticcallSufficientGasShanghai'
-
-          bash .ci/run_test_suite.sh
-
-  build_test_evm_state_revision_subset_x86:
-    name: Test DTVM-EVM state revision subset on x86-64 (${{ matrix.revision }})
-    if: github.event_name == 'workflow_dispatch' && inputs.job_scope == 'all'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        revision: [Cancun, Shanghai, Berlin]
-    container:
-      image: dtvmdev1/dtvm-dev-x64:main
-    steps:
-      - name: Check out code
-        run: |
-          git config --global --add safe.directory "$PWD"
-          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
-          git init .
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --detach FETCH_HEAD
-          git submodule update --init --recursive
-      - name: Code Format Check
-        run: |
-          ./tools/format.sh check
-      - name: Build and Run evmStateTests subset
-        run: |
-          export LLVM_SYS_150_PREFIX=/opt/llvm15
-          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
-          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
-
-          cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DZEN_ENABLE_ASAN=ON \
-            -DZEN_ENABLE_SPEC_TEST=ON \
-            -DZEN_ENABLE_EVM=ON \
-            -DZEN_ENABLE_CPU_EXCEPTION=OFF \
-            -DZEN_ENABLE_SINGLEPASS_JIT=OFF \
-            -DZEN_ENABLE_MULTIPASS_JIT=OFF
-
-          cmake --build build -j 16 --target evmStateTests
-
-          export DTVM_TEST_REVISION=${{ matrix.revision }}
-          ./build/evmStateTests --gtest_brief=1
-
-  build_test_evm_focused_regressions_all_x86:
-    name: Test DTVM-EVM focused regressions on x86-64 (${{ inputs.focused_revision }})
-    if: github.event_name == 'workflow_dispatch' && (inputs.job_scope == 'all' || inputs.job_scope == 'focused_regressions')
-    runs-on: ubuntu-latest
-    container:
-      image: dtvmdev1/dtvm-dev-x64:main
-    steps:
-      - name: Check out code
-        run: |
-          git config --global --add safe.directory "$PWD"
-          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
-          git init .
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --detach FETCH_HEAD
-          git submodule update --init --recursive
-      - name: Code Format Check
-        run: |
-          ./tools/format.sh check
-      - name: Build and Run focused regressions
-        run: |
-          export LLVM_SYS_150_PREFIX=/opt/llvm15
-          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
-          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
-
-          cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DZEN_ENABLE_ASAN=ON \
-            -DZEN_ENABLE_SPEC_TEST=ON \
-            -DZEN_ENABLE_EVM=ON \
-            -DZEN_ENABLE_CPU_EXCEPTION=OFF \
-            -DZEN_ENABLE_SINGLEPASS_JIT=OFF \
-            -DZEN_ENABLE_MULTIPASS_JIT=OFF
-
-          cmake --build build -j 16 --target evmStateTests
-
-          export DTVM_TEST_REVISION=${{ inputs.focused_revision }}
-          ./build/evmStateTests --gtest_filter="EVMStateFocused.*" --gtest_brief=1
-
   build_test_evm_interpreter_x86_ctest:
     name: Test DTVM-EVM interpreter with ctest on x86-64
-    if: github.event_name != 'workflow_dispatch' || inputs.job_scope == 'all'
     runs-on: ubuntu-latest
     container:
       image: dtvmdev1/dtvm-dev-x64:main
     steps:
       - name: Check out code
-        run: |
-          git config --global --add safe.directory "$PWD"
-          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
-          git init .
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --detach FETCH_HEAD
-          git submodule update --init --recursive
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+      - name: Cache FetchContent deps
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.fetchcontent
+          key: ${{ runner.os }}-fc-${{ github.workflow }}-ninja-v2-${{ hashFiles('third_party/AddDeps.cmake') }}
       - name: Code Format Check
         run: |
           ./tools/format.sh check
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Clone asmjit
         run: |
           git clone https://github.com/asmjit/asmjit.git
@@ -363,23 +80,24 @@ jobs:
 
   build_test_release_multipass_lazy_evmtestsuite_on_x86_ctest:
     name: Test DTVM-EVM multipass in release mode with ctest on x86-64
-    if: github.event_name != 'workflow_dispatch' || inputs.job_scope == 'all'
     runs-on: ubuntu-latest
     container:
       image: dtvmdev1/dtvm-dev-x64:main
     steps:
       - name: Check out code
-        run: |
-          git config --global --add safe.directory "$PWD"
-          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
-          git init .
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --detach FETCH_HEAD
-          git submodule update --init --recursive
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+      - name: Cache FetchContent deps
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.fetchcontent
+          key: ${{ runner.os }}-fc-${{ github.workflow }}-ninja-v2-${{ hashFiles('third_party/AddDeps.cmake') }}
       - name: Code Format Check
         run: |
           ./tools/format.sh check
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Build and Test
         run: |
           echo "current home is $HOME"
@@ -393,6 +111,7 @@ jobs:
           export ENABLE_LAZY=false
           export ENABLE_MULTITHREAD=true
           export TestSuite=evmtestsuite
+          export ENABLE_PROFILE_GUIDED_JIT=true
           export CPU_EXCEPTION_TYPE='check'
           export ENABLE_GAS_METER=true
 
@@ -400,23 +119,24 @@ jobs:
 
   build_test_evm_interpreter_x86_cli:
     name: Test DTVM-EVM interpreter with CLI on x86-64
-    if: github.event_name != 'workflow_dispatch' || inputs.job_scope == 'all'
     runs-on: ubuntu-latest
     container:
       image: dtvmdev1/dtvm-dev-x64:main
     steps:
       - name: Check out code
-        run: |
-          git config --global --add safe.directory "$PWD"
-          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
-          git init .
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --detach FETCH_HEAD
-          git submodule update --init --recursive
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+      - name: Cache FetchContent deps
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.fetchcontent
+          key: ${{ runner.os }}-fc-${{ github.workflow }}-ninja-v2-${{ hashFiles('third_party/AddDeps.cmake') }}
       - name: Code Format Check
         run: |
           ./tools/format.sh check
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Build and Test
         run: |
           echo "current home is $HOME"
@@ -433,27 +153,39 @@ jobs:
           export CPU_EXCEPTION_TYPE='check'
           export ENABLE_GAS_METER=false
 
-          bash .ci/run_test_suite.sh
+          for attempt in 1 2 3; do
+            echo "run_test_suite attempt ${attempt}/3"
+            if bash .ci/run_test_suite.sh; then
+              break
+            fi
+            if [ "${attempt}" -eq 3 ]; then
+              echo "run_test_suite failed after 3 attempts"
+              exit 1
+            fi
+            echo "transient failure detected, retrying in 15s..."
+            sleep 15
+          done
 
   build_test_debug_multipass_lazy_evmtestsuite_on_x86:
     name: Test DTVM-EVM multipass in debug mode on x86-64
-    if: github.event_name != 'workflow_dispatch' || inputs.job_scope == 'all'
     runs-on: ubuntu-latest
     container:
       image: dtvmdev1/dtvm-dev-x64:main
     steps:
       - name: Check out code
-        run: |
-          git config --global --add safe.directory "$PWD"
-          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
-          git init .
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --detach FETCH_HEAD
-          git submodule update --init --recursive
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+      - name: Cache FetchContent deps
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.fetchcontent
+          key: ${{ runner.os }}-fc-${{ github.workflow }}-ninja-v2-${{ hashFiles('third_party/AddDeps.cmake') }}
       - name: Code Format Check
         run: |
           ./tools/format.sh check
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Build and Test
         run: |
           echo "current home is $HOME"
@@ -471,25 +203,27 @@ jobs:
           export ENABLE_GAS_METER=true
 
           bash .ci/run_test_suite.sh
-  build_test_release_evmone_unittests_on_x86:
-    name: Test DTVM-EVM multipass and interpreter using evmone unit tests in release mode on x86-64
-    if: github.event_name != 'workflow_dispatch' || inputs.job_scope == 'all'
+
+  build_test_release_multipass_gas_register_on_x86:
+    name: Test DTVM-EVM multipass with gas register in release mode on x86-64
     runs-on: ubuntu-latest
     container:
       image: dtvmdev1/dtvm-dev-x64:main
     steps:
       - name: Check out code
-        run: |
-          git config --global --add safe.directory "$PWD"
-          git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
-          git init .
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --detach FETCH_HEAD
-          git submodule update --init --recursive
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+      - name: Cache FetchContent deps
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.fetchcontent
+          key: ${{ runner.os }}-fc-${{ github.workflow }}-ninja-v2-${{ hashFiles('third_party/AddDeps.cmake') }}
       - name: Code Format Check
         run: |
           ./tools/format.sh check
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
       - name: Build and Test
         run: |
           echo "current home is $HOME"
@@ -499,7 +233,438 @@ jobs:
           export CMAKE_BUILD_TARGET=Release
           export ENABLE_ASAN=true
           export RUN_MODE=multipass
-          export CPU_EXCEPTION_TYPE='cpu'
-          export TestSuite=evmonetestsuite
+          export INPUT_FORMAT=evm
+          export ENABLE_LAZY=false
+          export ENABLE_MULTITHREAD=true
+          export TestSuite=evmrealsuite
+          export CPU_EXCEPTION_TYPE='check'
+          export ENABLE_GAS_METER=true
+          export ENABLE_GAS_REGISTER=true
 
           bash .ci/run_test_suite.sh
+
+  build_test_multipass_gas_register_evmtestsuite_on_x86_ctest:
+    name: Test DTVM-EVM multipass evmtestsuite with gas register in release mode with ctest on x86-64
+    runs-on: ubuntu-latest
+    container:
+      image: dtvmdev1/dtvm-dev-x64:main
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+      - name: Cache FetchContent deps
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.fetchcontent
+          key: ${{ runner.os }}-fc-${{ github.workflow }}-ninja-v2-${{ hashFiles('third_party/AddDeps.cmake') }}
+      - name: Code Format Check
+        run: |
+          ./tools/format.sh check
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Build and Test
+        run: |
+          echo "current home is $HOME"
+          export LLVM_SYS_150_PREFIX=/opt/llvm15
+          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
+          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
+          export CMAKE_BUILD_TARGET=Release
+          export ENABLE_ASAN=true
+          export RUN_MODE=multipass
+          export INPUT_FORMAT=evm
+          export ENABLE_LAZY=false
+          export ENABLE_MULTITHREAD=true
+          export TestSuite=evmtestsuite
+          export CPU_EXCEPTION_TYPE='check'
+          export ENABLE_GAS_METER=true
+          export ENABLE_GAS_REGISTER=true
+
+          bash .ci/run_test_suite.sh
+
+  build_test_release_evmone_unittests_on_x86:
+    name: Test DTVM-EVM multipass and interpreter using evmone unit tests in release mode on x86-64
+    runs-on: ubuntu-latest
+    container:
+      image: dtvmdev1/dtvm-dev-x64:main
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+      - name: Cache FetchContent deps
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.fetchcontent
+          key: ${{ runner.os }}-fc-${{ github.workflow }}-ninja-v2-${{ hashFiles('third_party/AddDeps.cmake') }}
+      - name: Cache Hunter
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.hunter
+          key: ${{ runner.os }}-hunter-evmone-v1-${{ hashFiles('.ci/run_test_suite.sh', '.github/workflows/dtvm_evm_test_x86.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-hunter-evmone-v1-
+      - name: Code Format Check
+        run: |
+          ./tools/format.sh check
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Build and Test
+        env:
+          LLVM_SYS_150_PREFIX: /opt/llvm15
+          CMAKE_BUILD_TARGET: Release
+          ENABLE_ASAN: "true"
+          RUN_MODE: multipass
+          INPUT_FORMAT: evm
+          CPU_EXCEPTION_TYPE: cpu
+          TestSuite: evmonetestsuite
+          ENABLE_PROFILE_GUIDED_JIT: "true"
+        run: |
+          echo "current home is $HOME"
+          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
+          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
+
+          bash .ci/run_test_suite.sh
+
+  build_test_release_evmone_statetests_on_x86:
+    name: Test DTVM-EVM multipass and interpreter using evmone statetests in release mode on x86-64
+    timeout-minutes: 90
+    runs-on: ubuntu-latest
+    container:
+      image: dtvmdev1/dtvm-dev-x64:main
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+      - name: Cache FetchContent deps
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.fetchcontent
+          key: ${{ runner.os }}-fc-${{ github.workflow }}-ninja-v2-${{ hashFiles('third_party/AddDeps.cmake') }}
+      - name: Cache Hunter
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.hunter
+          key: ${{ runner.os }}-hunter-evmone-v1-${{ hashFiles('.ci/run_test_suite.sh', '.github/workflows/dtvm_evm_test_x86.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-hunter-evmone-v1-
+      - name: Code Format Check
+        run: |
+          ./tools/format.sh check
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Build and Test
+        env:
+          LLVM_SYS_150_PREFIX: /opt/llvm15
+          CMAKE_BUILD_TARGET: Release
+          ENABLE_ASAN: "false"
+          RUN_MODE: multipass
+          INPUT_FORMAT: evm
+          ENABLE_LAZY: "false"
+          ENABLE_MULTITHREAD: "true"
+          ENABLE_GAS_METER: "true"
+          CPU_EXCEPTION_TYPE: cpu
+          TestSuite: evmonestatetestsuite
+          ENABLE_PROFILE_GUIDED_JIT: "true"
+          EVMONE_STATETEST_FILTER: fork_Cancun
+          EVMONE_MODE_TIMEOUT_SECONDS: "3600"
+        run: |
+          echo "current home is $HOME"
+          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
+          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
+
+          bash .ci/run_test_suite.sh
+
+  build_test_release_multipass_evmpgj_on_x86:
+    name: Test DTVM-EVM profile-guided JIT on x86-64
+    runs-on: ubuntu-latest
+    container:
+      image: dtvmdev1/dtvm-dev-x64:main
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+      - name: Cache FetchContent deps
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.fetchcontent
+          key: ${{ runner.os }}-fc-${{ github.workflow }}-ninja-v2-${{ hashFiles('third_party/AddDeps.cmake') }}
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Build and Test
+        env:
+          LLVM_SYS_150_PREFIX: /opt/llvm15
+          CMAKE_BUILD_TARGET: Release
+          ENABLE_ASAN: "true"
+          RUN_MODE: multipass
+          INPUT_FORMAT: evm
+          ENABLE_LAZY: "false"
+          ENABLE_MULTITHREAD: "true"
+          ENABLE_GAS_METER: "true"
+          CPU_EXCEPTION_TYPE: check
+          TestSuite: evmpgjsuite
+        run: |
+          echo "current home is $HOME"
+          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
+          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
+
+          bash .ci/run_test_suite.sh
+
+  build_test_release_multipass_evmjitfallback_on_x86_ctest:
+    name: Test DTVM-EVM JIT fallback in release mode with ctest on x86-64
+    runs-on: ubuntu-latest
+    container:
+      image: dtvmdev1/dtvm-dev-x64:main
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+      - name: Cache FetchContent deps
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.fetchcontent
+          key: ${{ runner.os }}-fc-${{ github.workflow }}-ninja-v2-${{ hashFiles('third_party/AddDeps.cmake') }}
+      - name: Code Format Check
+        run: |
+          ./tools/format.sh check
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+      - name: Build and Test
+        run: |
+          echo "current home is $HOME"
+          export LLVM_SYS_150_PREFIX=/opt/llvm15
+          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
+          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
+          export CMAKE_BUILD_TARGET=Release
+          export ENABLE_ASAN=true
+          export RUN_MODE=multipass
+          export INPUT_FORMAT=evm
+          export ENABLE_LAZY=false
+          export ENABLE_MULTITHREAD=true
+          export TestSuite=evmfallbacksuite
+          export CPU_EXCEPTION_TYPE='check'
+          export ENABLE_GAS_METER=true
+
+          bash .ci/run_test_suite.sh
+
+  performance_regression_check:
+    name: Performance Regression Check (${{ matrix.mode }})
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [interpreter, multipass]
+    container:
+      image: dtvmdev1/dtvm-dev-x64:main
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          submodules: "true"
+          fetch-depth: 0
+
+      - name: Cache FetchContent deps
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.fetchcontent
+          key: ${{ runner.os }}-fc-${{ github.workflow }}-ninja-v2-${{ hashFiles('third_party/AddDeps.cmake') }}
+
+      - name: Cache Hunter
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.hunter
+          key: ${{ runner.os }}-hunter-evmone-v1-${{ hashFiles('.ci/run_test_suite.sh', '.github/workflows/dtvm_evm_test_x86.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-hunter-evmone-v1-
+
+      - name: Setup git safe directory
+        run: |
+          echo "Configuring git safe directory: ${{ github.workspace }}"
+          git config --global --add safe.directory /__w/DTVM/DTVM
+
+      - name: Code Format Check
+        run: |
+          ./tools/format.sh check
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      # Cache the BUILT baseline libdtvmapi.so (a deterministic function of
+      # base.sha), not the bench output JSON (a function of source + host +
+      # load). Forces every PR to re-run baseline benchmarks on the same
+      # runner as the PR benchmarks via the `elif` dispatch branch in
+      # .ci/run_test_suite.sh.
+      - name: Restore baseline lib cache
+        id: baseline-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/baseline_lib
+          key: perf-baseline-lib-${{ matrix.mode }}-${{ github.event.pull_request.base.sha }}
+
+      - name: Build baseline library (${{ github.base_ref }})
+        if: steps.baseline-cache.outputs.cache-hit != 'true'
+        run: |
+          echo "Building baseline library from branch: ${{ github.base_ref }}"
+
+          export LLVM_SYS_150_PREFIX=/opt/llvm15
+          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
+          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
+
+          git stash push -u -m "perf-check-stash"
+          git checkout ${{ github.base_ref }}
+
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DZEN_ENABLE_SINGLEPASS_JIT=OFF \
+            -DZEN_ENABLE_MULTIPASS_JIT=ON \
+            -DZEN_ENABLE_EVM=ON \
+            -DZEN_ENABLE_LIBEVM=ON \
+            -DZEN_ENABLE_JIT_PRECOMPILE_FALLBACK=ON \
+            -DZEN_ENABLE_CPU_EXCEPTION=ON \
+            -DZEN_ENABLE_VIRTUAL_STACK=ON
+          cmake --build build -j 16
+
+          mkdir -p /tmp/baseline_lib
+          # Resolve SONAME chain (libdtvmapi.so -> .0.1 -> .0.1.0) and copy
+          # the real file only. Plain `cp build/lib/*` dereferences each
+          # symlink and produces 3 full copies (~105 MB) plus any
+          # libgtest*.a present. The dispatcher at .ci/run_test_suite.sh
+          # consumes the bare name `libdtvmapi.so` only.
+          cp "$(readlink -f build/lib/libdtvmapi.so)" /tmp/baseline_lib/libdtvmapi.so
+
+          rm -rf build
+          git checkout ${{ github.sha }}
+          git stash pop || true
+
+      - name: Resolve evmone benchmark commit
+        id: evmone
+        run: |
+          EVMONE_COMMIT=$(git ls-remote "$EVMONE_REPO" "refs/heads/$EVMONE_REF" | awk '{print $1}')
+          if [ -z "$EVMONE_COMMIT" ]; then
+            echo "Unable to resolve $EVMONE_REPO refs/heads/$EVMONE_REF" >&2
+            exit 1
+          fi
+          echo "commit=$EVMONE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "Resolved evmone $EVMONE_REF to $EVMONE_COMMIT"
+
+      - name: Cache evmone-bench
+        uses: actions/cache@v4
+        with:
+          path: evmone
+          key: ${{ runner.os }}-evmone-bench-${{ env.EVMONE_BENCH_CACHE_VERSION }}-${{ steps.evmone.outputs.commit }}-${{ hashFiles('.ci/run_test_suite.sh', '.github/workflows/dtvm_evm_test_x86.yml') }}
+
+      - name: Build current PR and check regression
+        id: perf-check
+        run: |
+          echo "Building PR branch: ${{ github.sha }}"
+
+          export LLVM_SYS_150_PREFIX=/opt/llvm15
+          export LLVM_DIR=$LLVM_SYS_150_PREFIX/lib/cmake/llvm
+          export PATH=$LLVM_SYS_150_PREFIX/bin:$PATH
+
+          rm -rf build
+
+          export CMAKE_BUILD_TARGET=Release
+          export ENABLE_ASAN=false
+          export RUN_MODE=multipass
+          export ENABLE_LAZY=false
+          export ENABLE_MULTITHREAD=true
+          export TestSuite=benchmarksuite
+          export CPU_EXCEPTION_TYPE='cpu'
+          export BENCHMARK_MODE=${{ matrix.mode }}
+          export BENCHMARK_THRESHOLD=0.25
+          export BENCHMARK_BASELINE_LIB=/tmp/baseline_lib
+          export BENCHMARK_SUMMARY_FILE=/tmp/perf_summary_${{ matrix.mode }}.md
+          export BENCHMARK_REPETITIONS=5
+          export BENCHMARK_JOBS=3
+          export EVMONE_COMMIT=${{ steps.evmone.outputs.commit }}
+
+          bash .ci/run_test_suite.sh
+        continue-on-error: true
+
+      - name: Clean evmone cache inputs
+        if: always()
+        run: |
+          rm -f evmone/libdtvmapi.so evmone/libdtvmapi.so.* evmone/check_performance_regression.py
+
+      - name: Write Performance Summary
+        if: always()
+        run: |
+          MODE="${{ matrix.mode }}"
+          OUTCOME="${{ steps.perf-check.outcome }}"
+          SUMMARY_FILE="/tmp/perf_summary_${MODE}.md"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "✅ **Performance Check Passed (${MODE})**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ **Performance Regression Detected (${MODE})**" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f "$SUMMARY_FILE" ]; then
+            cat "$SUMMARY_FILE" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "_No benchmark summary available._" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Save performance artifacts
+        if: always()
+        run: |
+          mkdir -p /tmp/perf-artifacts
+          echo "${{ github.event.pull_request.number }}" > /tmp/perf-artifacts/pr_number
+          echo "${{ steps.perf-check.outcome }}" > /tmp/perf-artifacts/outcome
+          cp "/tmp/perf_summary_${{ matrix.mode }}.md" /tmp/perf-artifacts/summary.md 2>/dev/null || \
+            echo "_No benchmark summary available._" > /tmp/perf-artifacts/summary.md
+
+      - name: Upload performance results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results-${{ matrix.mode }}
+          path: /tmp/perf-artifacts/
+          retention-days: 7
+
+      - name: Comment on PR
+        if: always()
+        uses: actions/github-script@v6
+        continue-on-error: true
+        with:
+          script: |
+            const fs = require('fs');
+            const mode = '${{ matrix.mode }}';
+            const passed = '${{ steps.perf-check.outcome }}' === 'success';
+            let summary = '';
+            try {
+              summary = fs.readFileSync(`/tmp/perf_summary_${mode}.md`, 'utf8');
+            } catch (e) {
+              summary = '_No benchmark summary available._';
+            }
+            const icon = passed ? '✅' : '⚠️';
+            const title = passed
+              ? `Performance Check Passed (${mode})`
+              : `Performance Regression Detected (${mode})`;
+            const body = `${icon} **${title}**\n\n${summary}`;
+            try {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              });
+            } catch (error) {
+              core.warning(`Could not comment on PR (expected for fork PRs): ${error.message}. Results are available in the job summary above.`);
+            }
+
+      - name: Fail on regression
+        if: steps.perf-check.outcome == 'failure'
+        run: |
+          echo "::error::Performance regression detected in ${{ matrix.mode }} mode. See logs for details."
+          exit 1

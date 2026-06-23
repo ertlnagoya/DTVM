@@ -1,0 +1,830 @@
+#!/usr/bin/env python3
+"""
+Performance regression checker for evmone benchmarks.
+
+Usage:
+  # Save baseline results
+  python check_performance_regression.py --save-baseline baseline.json
+
+  # Check for regressions against baseline
+  python check_performance_regression.py --baseline baseline.json
+
+  # Check with custom threshold (default 10%)
+  python check_performance_regression.py --baseline baseline.json --threshold 0.15
+
+Exit codes:
+  0 - No significant regression detected
+  1 - Performance regression detected (> threshold)
+  2 - Script error (execution failed, file not found, etc.)
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from collections import Counter
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+
+@dataclass
+class BenchmarkResult:
+    name: str
+    time_ns: float  # Time in nanoseconds
+    cpu_time_ns: float
+    iterations: int
+
+
+def benchmark_env(lib_path: str, mode: str) -> Dict[str, str]:
+    return {**os.environ, "EVMONE_EXTERNAL_OPTIONS": f"{lib_path},mode={mode}"}
+
+
+def available_cpus() -> List[int]:
+    if hasattr(os, "sched_getaffinity"):
+        return sorted(os.sched_getaffinity(0))
+    cpu_count = os.cpu_count() or 1
+    return list(range(cpu_count))
+
+
+def split_benchmark_args(extra_args: Optional[List[str]]) -> Tuple[str, List[str]]:
+    benchmark_filter = "external/total/*"
+    remaining_args: List[str] = []
+
+    for arg in extra_args or []:
+        if arg.startswith("--benchmark_filter="):
+            benchmark_filter = arg.split("=", 1)[1]
+        else:
+            remaining_args.append(arg)
+
+    return benchmark_filter, remaining_args
+
+
+def build_benchmark_cmd(
+    benchmark_dir: str,
+    json_out_path: str,
+    benchmark_filter: str,
+    repetitions: int,
+    benchmark_min_time: Optional[str],
+    extra_args: List[str],
+    cpu: Optional[int],
+) -> List[str]:
+    cmd: List[str] = []
+
+    if cpu is not None and shutil.which("taskset"):
+        cmd.extend(["taskset", "-c", str(cpu)])
+
+    cmd.extend([
+        "./build/bin/evmone-bench",
+        benchmark_dir,
+        f"--benchmark_out={json_out_path}",
+        "--benchmark_out_format=json",
+    ])
+
+    if repetitions > 1:
+        cmd.append(f"--benchmark_repetitions={repetitions}")
+        cmd.append("--benchmark_report_aggregates_only=true")
+        cmd.append("--benchmark_enable_random_interleaving=true")
+
+    if benchmark_min_time:
+        cmd.append(f"--benchmark_min_time={benchmark_min_time}")
+
+    cmd.extend(extra_args)
+    cmd.append(f"--benchmark_filter={benchmark_filter}")
+    return cmd
+
+
+def list_benchmark_names(
+    lib_path: str,
+    mode: str,
+    benchmark_dir: str,
+    benchmark_filter: str,
+    extra_args: List[str],
+) -> List[str]:
+    cmd = [
+        "./build/bin/evmone-bench",
+        benchmark_dir,
+        "--benchmark_list_tests",
+        f"--benchmark_filter={benchmark_filter}",
+    ]
+    cmd.extend(extra_args)
+
+    print(f"Listing benchmarks: {' '.join(cmd)}")
+    sys.stdout.flush()
+
+    result = subprocess.run(
+        cmd,
+        env=benchmark_env(lib_path, mode),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if result.returncode != 0:
+        print(result.stdout, end="")
+        print(f"Benchmark listing failed with code {result.returncode}")
+        sys.exit(2)
+
+    names: List[str] = []
+    for line in result.stdout.splitlines():
+        name = line.strip()
+        if not name or any(ch.isspace() for ch in name):
+            continue
+        names.append(name)
+
+    if not names:
+        print(f"::error::No benchmarks matched filter: {benchmark_filter}")
+        sys.exit(2)
+
+    return names
+
+
+def exact_filter(names: List[str]) -> str:
+    return "^(" + "|".join(re.escape(name) for name in names) + ")$"
+
+
+def parse_benchmark_json_file(json_out_path: str) -> List[BenchmarkResult]:
+    with open(json_out_path, "r") as f:
+        json_data = f.read()
+    return parse_benchmark_json(json_data)
+
+
+def stop_processes(processes: List[subprocess.Popen], timeout: float = 5.0) -> None:
+    running = [process for process in processes if process.poll() is None]
+    if not running:
+        return
+
+    for process in running:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+
+    deadline = time.monotonic() + timeout
+    for process in running:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            pass
+
+    still_running = [process for process in running if process.poll() is None]
+    for process in still_running:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+    for process in still_running:
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            print(
+                f"::warning::Benchmark shard process {process.pid} did not exit after kill"
+            )
+
+
+def run_benchmark_shard(
+    lib_path: str,
+    mode: str,
+    benchmark_dir: str,
+    benchmark_filter: str,
+    extra_args: List[str],
+    repetitions: int,
+    benchmark_min_time: Optional[str],
+    cpu: Optional[int],
+) -> List[BenchmarkResult]:
+    fd, json_out_path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+
+    try:
+        cmd = build_benchmark_cmd(
+            benchmark_dir,
+            json_out_path,
+            benchmark_filter,
+            repetitions,
+            benchmark_min_time,
+            extra_args,
+            cpu,
+        )
+
+        print(f"Running: {' '.join(cmd)}")
+        print(f"Environment: EVMONE_EXTERNAL_OPTIONS={lib_path},mode={mode}")
+        sys.stdout.flush()
+
+        result = subprocess.run(cmd, env=benchmark_env(lib_path, mode))
+
+        if result.returncode != 0:
+            print(f"Benchmark execution failed with code {result.returncode}")
+            sys.exit(2)
+
+        return parse_benchmark_json_file(json_out_path)
+    finally:
+        try:
+            os.unlink(json_out_path)
+        except OSError:
+            pass
+
+
+def run_benchmark_parallel(
+    lib_path: str,
+    mode: str,
+    benchmark_dir: str,
+    extra_args: Optional[List[str]],
+    repetitions: int,
+    benchmark_min_time: Optional[str],
+    benchmark_jobs: int,
+) -> List[BenchmarkResult]:
+    benchmark_filter, remaining_args = split_benchmark_args(extra_args)
+
+    if benchmark_jobs <= 1:
+        cpus = available_cpus()
+        cpu = cpus[0] if cpus else None
+        return run_benchmark_shard(
+            lib_path,
+            mode,
+            benchmark_dir,
+            benchmark_filter,
+            remaining_args,
+            repetitions,
+            benchmark_min_time,
+            cpu,
+        )
+
+    names = list_benchmark_names(
+        lib_path, mode, benchmark_dir, benchmark_filter, remaining_args
+    )
+    cpus = available_cpus()
+    jobs = min(benchmark_jobs, len(names), len(cpus) if cpus else benchmark_jobs)
+
+    if jobs < benchmark_jobs:
+        print(f"::notice::Reduced benchmark jobs from {benchmark_jobs} to {jobs}")
+
+    shards = [names[i::jobs] for i in range(jobs)]
+    temp_paths: List[str] = []
+    processes: List[subprocess.Popen] = []
+
+    try:
+        for index, shard_names in enumerate(shards):
+            fd, json_out_path = tempfile.mkstemp(suffix=".json")
+            os.close(fd)
+            temp_paths.append(json_out_path)
+
+            cpu = cpus[index % len(cpus)] if cpus else None
+            cmd = build_benchmark_cmd(
+                benchmark_dir,
+                json_out_path,
+                exact_filter(shard_names),
+                repetitions,
+                benchmark_min_time,
+                remaining_args,
+                cpu,
+            )
+
+            cpu_msg = f" on CPU {cpu}" if cpu is not None else ""
+            print(
+                f"Starting benchmark shard {index + 1}/{jobs}"
+                f" ({len(shard_names)} benchmarks){cpu_msg}: {' '.join(cmd)}"
+            )
+            sys.stdout.flush()
+
+            processes.append(
+                subprocess.Popen(cmd, env=benchmark_env(lib_path, mode))
+            )
+
+        failures = []
+        for index, process in enumerate(processes):
+            return_code = process.wait()
+            if return_code != 0:
+                failures.append((index + 1, return_code))
+
+        if failures:
+            for shard, return_code in failures:
+                print(
+                    f"Benchmark shard {shard} failed with code {return_code}"
+                )
+            sys.exit(2)
+
+        results: List[BenchmarkResult] = []
+        for json_out_path in temp_paths:
+            results.extend(parse_benchmark_json_file(json_out_path))
+
+        name_counts = Counter(result.name for result in results)
+        duplicate_names = sorted(
+            name for name, count in name_counts.items() if count > 1
+        )
+        if duplicate_names:
+            print(f"::error::Duplicate benchmark results: {duplicate_names}")
+            sys.exit(2)
+
+        return sorted(results, key=lambda result: result.name)
+    finally:
+        stop_processes(processes)
+        for json_out_path in temp_paths:
+            try:
+                os.unlink(json_out_path)
+            except OSError:
+                pass
+
+
+def run_benchmark(
+    lib_path: str,
+    mode: str,
+    benchmark_dir: str,
+    extra_args: Optional[List[str]] = None,
+    repetitions: int = 3,
+    benchmark_min_time: Optional[str] = None,
+    benchmark_jobs: int = 1,
+) -> List[BenchmarkResult]:
+    """Run benchmark and parse JSON output.
+
+    Uses --benchmark_out to write JSON results to a temporary file so that
+    the human-readable benchmark progress streams to stdout/stderr in real
+    time (important for CI visibility).
+
+    When *repetitions* > 1, each benchmark runs N times and only the
+    median aggregate is kept, significantly reducing noise from ASLR and
+    shared-runner contention.
+    """
+    if benchmark_jobs < 1:
+        print("::error::--benchmark-jobs must be >= 1")
+        sys.exit(2)
+
+    return run_benchmark_parallel(
+        lib_path,
+        mode,
+        benchmark_dir,
+        extra_args,
+        repetitions,
+        benchmark_min_time,
+        benchmark_jobs,
+    )
+
+
+def parse_benchmark_json(json_output: str) -> List[BenchmarkResult]:
+    """Parse Google Benchmark JSON output.
+
+    When the output contains aggregate entries (from ``--benchmark_repetitions``),
+    only the **median** aggregate is kept and the ``_median`` suffix is stripped
+    from names so they match the non-repetition format.  Otherwise individual
+    iteration results are returned.
+    """
+    try:
+        data = json.loads(json_output)
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse JSON: {e}")
+        sys.exit(2)
+
+    benchmarks = data.get("benchmarks", [])
+    has_aggregates = any(b.get("run_type") == "aggregate" for b in benchmarks)
+
+    results = []
+    for benchmark in benchmarks:
+        if has_aggregates:
+            if benchmark.get("aggregate_name") != "median":
+                continue
+            name = benchmark["name"]
+            if name.endswith("_median"):
+                name = name[:-len("_median")]
+        else:
+            if benchmark.get("run_type") != "iteration":
+                continue
+            name = benchmark["name"]
+
+        results.append(
+            BenchmarkResult(
+                name=name,
+                time_ns=benchmark.get("real_time", 0),
+                cpu_time_ns=benchmark.get("cpu_time", 0),
+                iterations=benchmark.get("iterations", 1),
+            )
+        )
+
+    return results
+
+
+def load_baseline(path: str) -> List[BenchmarkResult]:
+    """Load baseline results from JSON file."""
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print(f"::error::Baseline file not found: {path}")
+        sys.exit(2)
+    except json.JSONDecodeError as e:
+        print(f"::error::Failed to parse baseline JSON: {e}")
+        sys.exit(2)
+
+    results = []
+    for item in data:
+        results.append(
+            BenchmarkResult(
+                name=item["name"],
+                time_ns=item["time_ns"],
+                cpu_time_ns=item["cpu_time_ns"],
+                iterations=item["iterations"],
+            )
+        )
+
+    return results
+
+
+def save_baseline(results: List[BenchmarkResult], path: str) -> None:
+    """Save baseline results to JSON file."""
+    data = []
+    for r in results:
+        data.append({
+            "name": r.name,
+            "time_ns": r.time_ns,
+            "cpu_time_ns": r.cpu_time_ns,
+            "iterations": r.iterations,
+        })
+
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+    print(f"Saved {len(results)} benchmark results to {path}")
+
+
+def compare_benchmarks(
+    current: List[BenchmarkResult],
+    baseline: List[BenchmarkResult],
+    threshold: float,
+    min_regressions: int = 5,
+    min_time_ns: float = 5000.0,
+) -> Tuple[bool, List[dict]]:
+    """
+    Compare current results against baseline.
+
+    A regression is only flagged if at least ``min_regressions`` individual
+    benchmarks exceed the threshold.  This prevents CI noise on shared
+    runners from causing false positives when a single outlier spikes.
+
+    Benchmarks whose baseline time is below ``min_time_ns`` are excluded
+    from regression counting because percentage changes on sub-microsecond
+    timings are dominated by measurement overhead and ASLR noise.
+
+    Returns:
+        (has_regression, comparison_details)
+    """
+    baseline_map = {b.name: b for b in baseline}
+    current_map = {c.name: c for c in current}
+
+    baseline_names = set(baseline_map.keys())
+    current_names = set(current_map.keys())
+
+    missing = baseline_names - current_names
+    new = current_names - baseline_names
+
+    if missing:
+        print(f"::warning::Missing benchmarks (in baseline but not in current): {missing}")
+    if new:
+        print(f"::notice::New benchmarks (in current but not in baseline): {new}")
+
+    comparisons = []
+    regression_count = 0
+    skipped_small = 0
+
+    for name in sorted(baseline_names & current_names):
+        b = baseline_map[name]
+        c = current_map[name]
+
+        time_change = (c.time_ns - b.time_ns) / b.time_ns
+        cpu_change = (c.cpu_time_ns - b.cpu_time_ns) / b.cpu_time_ns
+
+        max_change = max(time_change, cpu_change)
+
+        too_small = b.time_ns < min_time_ns
+        is_regression = max_change > threshold and not too_small
+        if is_regression:
+            regression_count += 1
+        if too_small and max_change > threshold:
+            skipped_small += 1
+
+        comparisons.append({
+            "name": name,
+            "baseline_time_ns": b.time_ns,
+            "current_time_ns": c.time_ns,
+            "time_change": time_change,
+            "cpu_change": cpu_change,
+            "max_change": max_change,
+            "is_regression": is_regression,
+        })
+
+    has_regression = regression_count >= min_regressions
+
+    if skipped_small > 0:
+        print(
+            f"::notice::{skipped_small} micro-benchmark(s) exceeded threshold but "
+            f"excluded (baseline < {min_time_ns/1000:.1f}us)."
+        )
+    if regression_count > 0 and not has_regression:
+        print(
+            f"::notice::{regression_count} benchmark(s) exceeded threshold but "
+            f"below min_regressions={min_regressions}; treating as noise."
+        )
+
+    return has_regression, comparisons
+
+
+def print_comparison_table(comparisons: List[dict], threshold: float) -> None:
+    """Print a formatted comparison table."""
+    if not comparisons:
+        print("No benchmarks to compare.")
+        return
+
+    # GitHub Actions annotation messages
+    print("\n" + "=" * 100)
+    print(f"{'Benchmark':<60} {'Baseline(μs)':<15} {'Current(μs)':<15} {'Change':<12} {'Status'}")
+    print("=" * 100)
+
+    regression_count = 0
+    for comp in comparisons:
+        name = comp["name"]
+        baseline_us = comp["baseline_time_ns"] / 1000
+        current_us = comp["current_time_ns"] / 1000
+        change_pct = comp["max_change"] * 100
+        status = "✓ PASS" if not comp["is_regression"] else "✗ FAIL"
+
+        # Truncate long names
+        display_name = name if len(name) < 60 else name[:57] + "..."
+
+        print(f"{display_name:<60} {baseline_us:<15.2f} {current_us:<15.2f} {change_pct:>+10.1f}%  {status}")
+
+        if comp["is_regression"]:
+            regression_count += 1
+            # GitHub Actions warning annotation
+            print(f"::warning title=Performance Regression::{name} regressed by {change_pct:.1f}% (threshold: {threshold*100:.0f}%)")
+
+    print("=" * 100)
+    print(f"\nTotal benchmarks: {len(comparisons)}")
+    print(f"Regressions (> {threshold*100:.0f}%): {regression_count}")
+
+
+def _short_name(name: str) -> str:
+    """Extract a short display name from the full benchmark name.
+
+    Benchmark names typically look like 'external/some_case/variant'.
+    We strip the leading 'external/' prefix to keep the table compact.
+    """
+    if name.startswith("external/"):
+        return name[len("external/"):]
+    return name
+
+
+def generate_markdown_summary(
+    comparisons: List[dict],
+    threshold: float,
+    has_regression: bool,
+) -> str:
+    """Generate a concise Markdown summary of benchmark comparison results."""
+    lines: List[str] = []
+
+    regression_count = sum(1 for c in comparisons if c["is_regression"])
+
+    lines.append(
+        f"**Performance Benchmark Results** (threshold: {threshold*100:.0f}%)"
+    )
+    lines.append("")
+
+    if not comparisons:
+        lines.append("_No benchmarks to compare._")
+        return "\n".join(lines)
+
+    # Markdown table header
+    lines.append("| Benchmark | Baseline (us) | Current (us) | Change | Status |")
+    lines.append("|-----------|--------------|-------------|--------|--------|")
+
+    for comp in comparisons:
+        name = _short_name(comp["name"])
+        baseline_us = comp["baseline_time_ns"] / 1000
+        current_us = comp["current_time_ns"] / 1000
+        change_pct = comp["max_change"] * 100
+        status = "PASS" if not comp["is_regression"] else "**REGRESSED**"
+
+        lines.append(
+            f"| {name} | {baseline_us:.2f} | {current_us:.2f} "
+            f"| {change_pct:+.1f}% | {status} |"
+        )
+
+    lines.append("")
+    lines.append(
+        f"**Summary**: {len(comparisons)} benchmarks, "
+        f"{regression_count} regressions"
+    )
+
+    return "\n".join(lines)
+
+
+def generate_baseline_summary(results: List[BenchmarkResult]) -> str:
+    """Generate a concise Markdown summary for a baseline-save run."""
+    lines: List[str] = []
+    lines.append("**Baseline Benchmark Results**")
+    lines.append("")
+    lines.append("| Benchmark | Time (us) |")
+    lines.append("|-----------|----------|")
+
+    for r in results:
+        name = _short_name(r.name)
+        time_us = r.time_ns / 1000
+        lines.append(f"| {name} | {time_us:.2f} |")
+
+    lines.append("")
+    lines.append(f"**Total**: {len(results)} benchmarks collected")
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Check for performance regressions in evmone benchmarks",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Save baseline after a known-good commit
+  python check_performance_regression.py --save-baseline baseline.json
+
+  # Check current commit against baseline in CI
+  python check_performance_regression.py --baseline baseline.json
+
+  # Check with custom threshold (15% instead of default 10%)
+  python check_performance_regression.py --baseline baseline.json --threshold 0.15
+
+  # Specify different library or benchmark directory
+  python check_performance_regression.py --baseline baseline.json --lib ./other.so --mode jit
+""",
+    )
+
+    parser.add_argument(
+        "--baseline",
+        metavar="PATH",
+        help="Path to baseline JSON file for comparison",
+    )
+    parser.add_argument(
+        "--save-baseline",
+        metavar="PATH",
+        help="Run benchmarks and save results to file (use this to create baseline)",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.15,
+        help="Regression threshold as ratio (default: 0.15 = 15%%)",
+    )
+    parser.add_argument(
+        "--lib",
+        default="./libdtvmapi.so",
+        help="Path to the library to benchmark (default: ./libdtvmapi.so)",
+    )
+    parser.add_argument(
+        "--mode",
+        default="interpreter",
+        help="Mode for the library (default: interpreter)",
+    )
+    parser.add_argument(
+        "--benchmark-dir",
+        default="test/evm-benchmarks/benchmarks",
+        help="Path to benchmark directory (default: test/evm-benchmarks/benchmarks)",
+    )
+    parser.add_argument(
+        "--output-summary",
+        metavar="PATH",
+        help="Write a concise Markdown summary to the given file (for PR comments)",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Verbose output",
+    )
+    parser.add_argument(
+        "--benchmark-filter",
+        default=None,
+        help="Custom regex filter forwarded to evmone-bench --benchmark_filter (default: external/*)",
+    )
+    parser.add_argument(
+        "--min-regressions",
+        type=int,
+        default=5,
+        help="Minimum number of regressed benchmarks before flagging overall failure (default: 5). "
+             "Prevents CI noise from causing false positives.",
+    )
+    parser.add_argument(
+        "--min-time-ns",
+        type=float,
+        default=5000.0,
+        help="Exclude benchmarks whose baseline time is below this value (in nanoseconds) "
+             "from regression counting. Sub-microsecond timings are dominated by "
+             "measurement noise. (default: 5000 = 5us)",
+    )
+    parser.add_argument(
+        "--benchmark-repetitions",
+        type=int,
+        default=3,
+        help="Run each benchmark N times and use the median. "
+             "Reduces ASLR and shared-runner noise. (default: 3)",
+    )
+    parser.add_argument(
+        "--benchmark-min-time",
+        type=str,
+        default=None,
+        help="Minimum execution time per benchmark (e.g., '1s' or '2.0'). Forwarded to evmone-bench.",
+    )
+    parser.add_argument(
+        "--benchmark-jobs",
+        type=int,
+        default=1,
+        help="Run benchmark shards in parallel across CPUs (default: 1).",
+    )
+
+    args = parser.parse_args()
+
+    if not args.baseline and not args.save_baseline:
+        parser.error("Either --baseline or --save-baseline must be specified")
+
+    bench_extra = None
+    if args.benchmark_filter:
+        bench_extra = [f"--benchmark_filter={args.benchmark_filter}"]
+
+    # Run benchmarks
+    try:
+        current_results = run_benchmark(
+            lib_path=args.lib,
+            mode=args.mode,
+            benchmark_dir=args.benchmark_dir,
+            extra_args=bench_extra,
+            repetitions=args.benchmark_repetitions,
+            benchmark_min_time=args.benchmark_min_time,
+            benchmark_jobs=args.benchmark_jobs,
+        )
+    except Exception as e:
+        print(f"::error::Failed to run benchmarks: {e}")
+        sys.exit(2)
+
+    if not current_results:
+        print("::error::No benchmark results found")
+        sys.exit(2)
+
+    print(f"Collected {len(current_results)} benchmark results")
+
+    # Save baseline mode
+    if args.save_baseline:
+        save_baseline(current_results, args.save_baseline)
+        if args.output_summary:
+            summary_md = generate_baseline_summary(current_results)
+            with open(args.output_summary, "w") as f:
+                f.write(summary_md)
+            print(f"Wrote baseline summary to {args.output_summary}")
+        return 0
+
+    # Compare mode
+    baseline_results = load_baseline(args.baseline)
+    print(f"Loaded {len(baseline_results)} baseline results from {args.baseline}")
+
+    has_regression, comparisons = compare_benchmarks(
+        current_results,
+        baseline_results,
+        args.threshold,
+        min_regressions=args.min_regressions,
+        min_time_ns=args.min_time_ns,
+    )
+
+    print_comparison_table(comparisons, args.threshold)
+
+    # Write Markdown summary for PR comments
+    if args.output_summary:
+        summary_md = generate_markdown_summary(
+            comparisons, args.threshold, has_regression
+        )
+        with open(args.output_summary, "w") as f:
+            f.write(summary_md)
+        print(f"Wrote comparison summary to {args.output_summary}")
+
+    regression_count = sum(1 for c in comparisons if c["is_regression"])
+
+    print("\n" + "=" * 100)
+    if has_regression:
+        print(
+            f"::error::Performance regression detected! "
+            f"{regression_count} benchmarks exceeded {args.threshold*100:.0f}% threshold "
+            f"(min required: {args.min_regressions})."
+        )
+        print("RESULT: FAIL")
+        return 1
+    else:
+        if regression_count > 0:
+            print(
+                f"::notice::{regression_count} benchmark(s) exceeded threshold "
+                f"but below minimum of {args.min_regressions}; treated as CI noise."
+            )
+        print("::notice::No significant performance regression detected.")
+        print("RESULT: PASS")
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

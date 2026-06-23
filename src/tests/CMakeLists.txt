@@ -1,10 +1,6 @@
 # Copyright (C) 2021-2025 the DTVM authors. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-if(ZEN_ENABLE_EVM)
-  find_package(OpenSSL REQUIRED)
-endif()
-
 function(PROCESS_SPEC_FILES SPEC_CATEGORY_DIR)
   get_filename_component(CATEGORY ${SPEC_CATEGORY_DIR} NAME)
   file(GLOB SPEC_FILE_PATHS "${SPEC_CATEGORY_DIR}/*.wast")
@@ -64,7 +60,15 @@ if(ZEN_ENABLE_SPEC_TEST)
   if(ZEN_ENABLE_EVM)
     add_subdirectory(mpt)
     add_executable(evmInterpTests evm_interp_tests.cpp)
-    add_executable(evmHostTests evm_host_tests.cpp)
+    add_executable(evmCacheTests evm_cache_tests.cpp)
+    # Build-only target: never receives ASan even in ASan builds so its
+    # wall-clock measurement is not distorted by sanitizer overhead.
+    add_executable(evmCacheComplexityDemo evm_cache_complexity_demo.cpp)
+    target_link_libraries(evmCacheComplexityDemo PRIVATE dtvmcore)
+    if(ZEN_ENABLE_MULTIPASS_JIT)
+      add_executable(evmJitFrontendTests evm_jit_frontend_tests.cpp)
+      add_executable(evmRangeAnalyzerTests evm_range_analyzer_tests.cpp)
+    endif()
     add_executable(
       solidityContractTests evm_precompiles.hpp solidity_contract_tests.cpp
                             solidity_test_helpers.cpp
@@ -73,32 +77,13 @@ if(ZEN_ENABLE_SPEC_TEST)
       evmStateTests evm_precompiles.hpp evm_state_tests.cpp
                     evm_test_fixtures.cpp evm_test_helpers.cpp
     )
+    # Only build evmFallbackExecutionTests if dtvmapi library is available
+    if(ZEN_ENABLE_LIBEVM)
+      add_executable(evmFallbackExecutionTests evm_fallback_execution_tests.cpp)
+      add_executable(evmModuleCacheTests evm_module_cache_tests.cpp)
+      add_executable(evmProfileGuidedJITTests evm_profile_guided_jit_tests.cpp)
+    endif()
     add_executable(mptCompareCpp mpt_compare_cpp.cpp)
-    set(ZEN_EVM_TEST_OPTIONAL_LIBS)
-    if(TARGET mcl::mclbn256)
-      list(APPEND ZEN_EVM_TEST_OPTIONAL_LIBS mcl::mclbn256)
-      target_compile_definitions(evmHostTests PRIVATE ZEN_HAS_BN254=1)
-      target_compile_definitions(solidityContractTests PRIVATE ZEN_HAS_BN254=1)
-      target_compile_definitions(evmStateTests PRIVATE ZEN_HAS_BN254=1)
-    endif()
-    if(TARGET c_kzg_4844)
-      list(APPEND ZEN_EVM_TEST_OPTIONAL_LIBS c_kzg_4844)
-      target_compile_definitions(evmHostTests PRIVATE ZEN_HAS_C_KZG=1)
-      target_compile_definitions(solidityContractTests PRIVATE ZEN_HAS_C_KZG=1)
-      target_compile_definitions(evmStateTests PRIVATE ZEN_HAS_C_KZG=1)
-    endif()
-    target_compile_definitions(
-      evmHostTests
-      PRIVATE ZEN_C_KZG_TRUSTED_SETUP_PATH="${ZEN_C_KZG_TRUSTED_SETUP_PATH}"
-    )
-    target_compile_definitions(
-      solidityContractTests
-      PRIVATE ZEN_C_KZG_TRUSTED_SETUP_PATH="${ZEN_C_KZG_TRUSTED_SETUP_PATH}"
-    )
-    target_compile_definitions(
-      evmStateTests
-      PRIVATE ZEN_C_KZG_TRUSTED_SETUP_PATH="${ZEN_C_KZG_TRUSTED_SETUP_PATH}"
-    )
   else()
     add_executable(
       specUnitTests spec_unit_tests.cpp spectest.cpp test_utils.cpp
@@ -121,7 +106,11 @@ if(ZEN_ENABLE_SPEC_TEST)
 
     if(ZEN_ENABLE_EVM)
       target_compile_options(evmInterpTests PRIVATE -fsanitize=address)
-      target_compile_options(evmHostTests PRIVATE -fsanitize=address)
+      target_compile_options(evmCacheTests PRIVATE -fsanitize=address)
+      if(ZEN_ENABLE_MULTIPASS_JIT)
+        target_compile_options(evmJitFrontendTests PRIVATE -fsanitize=address)
+        target_compile_options(evmRangeAnalyzerTests PRIVATE -fsanitize=address)
+      endif()
       target_compile_options(solidityContractTests PRIVATE -fsanitize=address)
       target_compile_options(mptCompareCpp PRIVATE -fsanitize=address)
     endif()
@@ -141,47 +130,53 @@ if(ZEN_ENABLE_SPEC_TEST)
       if(ZEN_ENABLE_EVM)
         target_link_libraries(
           evmInterpTests
-          PRIVATE dtvmcore
-                  rapidjson
-                  yaml-cpp
-                  gtest_main
-                  OpenSSL::Crypto
-                  -fsanitize=address
+          PRIVATE dtvmcore rapidjson yaml-cpp gtest_main -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
         target_link_libraries(
-          evmHostTests
-          PRIVATE dtvmcore
-                  rapidjson
-                  yaml-cpp
-                  gtest_main
-                  OpenSSL::Crypto
-                  ${ZEN_EVM_TEST_OPTIONAL_LIBS}
-                  -fsanitize=address
+          evmCacheTests
+          PRIVATE dtvmcore gtest_main -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
+        if(ZEN_ENABLE_MULTIPASS_JIT)
+          target_link_libraries(
+            evmJitFrontendTests
+            PRIVATE compiler dtvmcore gtest_main -fsanitize=address
+            PUBLIC ${GTEST_BOTH_LIBRARIES}
+          )
+          target_link_libraries(
+            evmRangeAnalyzerTests
+            PRIVATE compiler dtvmcore gtest_main -fsanitize=address
+            PUBLIC ${GTEST_BOTH_LIBRARIES}
+          )
+        endif()
         target_link_libraries(
           solidityContractTests
-          PRIVATE dtvmcore
-                  rapidjson
-                  mpt
-                  gtest_main
-                  OpenSSL::Crypto
-                  ${ZEN_EVM_TEST_OPTIONAL_LIBS}
-                  -fsanitize=address
+          PRIVATE dtvmcore rapidjson mpt gtest_main -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
         target_link_libraries(
           evmStateTests
-          PRIVATE dtvmcore
-                  rapidjson
-                  mpt
-                  gtest_main
-                  OpenSSL::Crypto
-                  ${ZEN_EVM_TEST_OPTIONAL_LIBS}
-                  -fsanitize=address
+          PRIVATE dtvmcore rapidjson mpt gtest_main -fsanitize=address
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
+        if(ZEN_ENABLE_LIBEVM)
+          target_link_libraries(
+            evmFallbackExecutionTests
+            PRIVATE dtvmapi gtest_main -fsanitize=address
+            PUBLIC ${GTEST_BOTH_LIBRARIES}
+          )
+          target_link_libraries(
+            evmModuleCacheTests
+            PRIVATE dtvmapi gtest_main -fsanitize=address
+            PUBLIC ${GTEST_BOTH_LIBRARIES}
+          )
+          target_link_libraries(
+            evmProfileGuidedJITTests
+            PRIVATE dtvmapi gtest_main -fsanitize=address
+            PUBLIC ${GTEST_BOTH_LIBRARIES}
+          )
+        endif()
         target_link_libraries(
           mptCompareCpp PRIVATE dtvmcore rapidjson mpt -fsanitize=address
         )
@@ -205,23 +200,29 @@ if(ZEN_ENABLE_SPEC_TEST)
                   rapidjson
                   yaml-cpp
                   gtest_main
-                  OpenSSL::Crypto
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
         target_link_libraries(
-          evmHostTests
-          PRIVATE dtvmcore
-                  rapidjson
-                  yaml-cpp
-                  gtest_main
-                  OpenSSL::Crypto
-                  ${ZEN_EVM_TEST_OPTIONAL_LIBS}
-                  -fsanitize=address
-                  -static-libasan
+          evmCacheTests
+          PRIVATE dtvmcore gtest_main -fsanitize=address -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
+        if(ZEN_ENABLE_MULTIPASS_JIT)
+          target_link_libraries(
+            evmJitFrontendTests
+            PRIVATE compiler dtvmcore gtest_main -fsanitize=address
+                    -static-libasan
+            PUBLIC ${GTEST_BOTH_LIBRARIES}
+          )
+          target_link_libraries(
+            evmRangeAnalyzerTests
+            PRIVATE compiler dtvmcore gtest_main -fsanitize=address
+                    -static-libasan
+            PUBLIC ${GTEST_BOTH_LIBRARIES}
+          )
+        endif()
         target_link_libraries(
           solidityContractTests
           PRIVATE dtvmcore
@@ -229,8 +230,6 @@ if(ZEN_ENABLE_SPEC_TEST)
                   mpt
                   gtest_main
                   CLI11::CLI11
-                  OpenSSL::Crypto
-                  ${ZEN_EVM_TEST_OPTIONAL_LIBS}
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
@@ -241,12 +240,27 @@ if(ZEN_ENABLE_SPEC_TEST)
                   rapidjson
                   mpt
                   gtest_main
-                  OpenSSL::Crypto
-                  ${ZEN_EVM_TEST_OPTIONAL_LIBS}
                   -fsanitize=address
                   -static-libasan
           PUBLIC ${GTEST_BOTH_LIBRARIES}
         )
+        if(ZEN_ENABLE_LIBEVM)
+          target_link_libraries(
+            evmFallbackExecutionTests
+            PRIVATE dtvmapi gtest_main -fsanitize=address -static-libasan
+            PUBLIC ${GTEST_BOTH_LIBRARIES}
+          )
+          target_link_libraries(
+            evmModuleCacheTests
+            PRIVATE dtvmapi gtest_main -fsanitize=address -static-libasan
+            PUBLIC ${GTEST_BOTH_LIBRARIES}
+          )
+          target_link_libraries(
+            evmProfileGuidedJITTests
+            PRIVATE dtvmapi gtest_main -fsanitize=address -static-libasan
+            PUBLIC ${GTEST_BOTH_LIBRARIES}
+          )
+        endif()
         target_link_libraries(
           mptCompareCpp PRIVATE dtvmcore rapidjson mpt -fsanitize=address
                                 -static-libasan
@@ -268,40 +282,53 @@ if(ZEN_ENABLE_SPEC_TEST)
     if(ZEN_ENABLE_EVM)
       target_link_libraries(
         evmInterpTests
-        PRIVATE dtvmcore rapidjson yaml-cpp gtest_main OpenSSL::Crypto
+        PRIVATE dtvmcore rapidjson yaml-cpp gtest_main
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(
-        evmHostTests
-        PRIVATE dtvmcore
-                rapidjson
-                yaml-cpp
-                gtest_main
-                OpenSSL::Crypto
-                ${ZEN_EVM_TEST_OPTIONAL_LIBS}
+        evmCacheTests
+        PRIVATE dtvmcore gtest_main
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
+      if(ZEN_ENABLE_MULTIPASS_JIT)
+        target_link_libraries(
+          evmJitFrontendTests
+          PRIVATE compiler dtvmcore gtest_main
+          PUBLIC ${GTEST_BOTH_LIBRARIES}
+        )
+        target_link_libraries(
+          evmRangeAnalyzerTests
+          PRIVATE compiler dtvmcore gtest_main
+          PUBLIC ${GTEST_BOTH_LIBRARIES}
+        )
+      endif()
       target_link_libraries(
         solidityContractTests
-        PRIVATE dtvmcore
-                rapidjson
-                mpt
-                gtest_main
-                CLI11::CLI11
-                OpenSSL::Crypto
-                ${ZEN_EVM_TEST_OPTIONAL_LIBS}
+        PRIVATE dtvmcore rapidjson mpt gtest_main CLI11::CLI11
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
       target_link_libraries(
         evmStateTests
-        PRIVATE dtvmcore
-                rapidjson
-                mpt
-                gtest_main
-                OpenSSL::Crypto
-                ${ZEN_EVM_TEST_OPTIONAL_LIBS}
+        PRIVATE dtvmcore rapidjson mpt gtest_main
         PUBLIC ${GTEST_BOTH_LIBRARIES}
       )
+      if(ZEN_ENABLE_LIBEVM)
+        target_link_libraries(
+          evmFallbackExecutionTests
+          PRIVATE dtvmapi gtest_main
+          PUBLIC ${GTEST_BOTH_LIBRARIES}
+        )
+        target_link_libraries(
+          evmModuleCacheTests
+          PRIVATE dtvmapi gtest_main
+          PUBLIC ${GTEST_BOTH_LIBRARIES}
+        )
+        target_link_libraries(
+          evmProfileGuidedJITTests
+          PRIVATE dtvmapi gtest_main
+          PUBLIC ${GTEST_BOTH_LIBRARIES}
+        )
+      endif()
       target_link_libraries(mptCompareCpp PRIVATE dtvmcore rapidjson mpt)
     endif()
   endif()
@@ -320,7 +347,11 @@ if(ZEN_ENABLE_SPEC_TEST)
 
   if(ZEN_ENABLE_EVM)
     add_test(NAME evmInterpTests COMMAND evmInterpTests)
-    add_test(NAME evmHostTests COMMAND evmHostTests)
+    add_test(NAME evmCacheTests COMMAND evmCacheTests)
+    if(ZEN_ENABLE_MULTIPASS_JIT)
+      add_test(NAME evmJitFrontendTests COMMAND evmJitFrontendTests)
+      add_test(NAME evmRangeAnalyzerTests COMMAND evmRangeAnalyzerTests)
+    endif()
     add_test(
       NAME solidityContractTests
       COMMAND
@@ -328,5 +359,10 @@ if(ZEN_ENABLE_SPEC_TEST)
         -P ${CMAKE_CURRENT_SOURCE_DIR}/RunSpecTests.cmake
     )
     add_test(NAME evmStateTests COMMAND evmStateTests)
+    if(ZEN_ENABLE_LIBEVM)
+      add_test(NAME evmFallbackExecutionTests COMMAND evmFallbackExecutionTests)
+      add_test(NAME evmModuleCacheTests COMMAND evmModuleCacheTests)
+      add_test(NAME evmProfileGuidedJITTests COMMAND evmProfileGuidedJITTests)
+    endif()
   endif()
 endif()

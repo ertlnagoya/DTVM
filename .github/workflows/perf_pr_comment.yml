@@ -1,0 +1,96 @@
+name: Post Performance Check Results
+
+on:
+  workflow_run:
+    workflows: ["DTVM-EVM test CI in x86-64"]
+    types:
+      - completed
+
+permissions:
+  pull-requests: write
+  actions: read
+
+jobs:
+  comment:
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download interpreter results
+        uses: actions/download-artifact@v4
+        with:
+          name: perf-results-interpreter
+          path: /tmp/perf-interpreter
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+        continue-on-error: true
+
+      - name: Download multipass results
+        uses: actions/download-artifact@v4
+        with:
+          name: perf-results-multipass
+          path: /tmp/perf-multipass
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+        continue-on-error: true
+
+      - name: Post PR comment
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            let prNumber = null;
+            let body = '<!-- perf-check-results -->\n## ⚡ Performance Regression Check Results\n\n';
+            let hasResults = false;
+
+            for (const mode of ['interpreter', 'multipass']) {
+              const dir = `/tmp/perf-${mode}`;
+              try {
+                if (!prNumber) {
+                  prNumber = parseInt(fs.readFileSync(`${dir}/pr_number`, 'utf8').trim());
+                }
+                const outcome = fs.readFileSync(`${dir}/outcome`, 'utf8').trim();
+                const summary = fs.readFileSync(`${dir}/summary.md`, 'utf8');
+                const passed = outcome === 'success';
+                const icon = passed ? '✅' : '⚠️';
+                const title = passed
+                  ? `Performance Check Passed (${mode})`
+                  : `Performance Regression Detected (${mode})`;
+                body += `### ${icon} ${title}\n\n${summary}\n\n---\n\n`;
+                hasResults = true;
+              } catch (e) {
+                core.info(`No results for ${mode}: ${e.message}`);
+              }
+            }
+
+            if (!prNumber || !hasResults) {
+              core.info('No performance results to post');
+              return;
+            }
+
+            const { data: comments } = await github.rest.issues.listComments({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+
+            const existing = comments.find(c =>
+              c.body && c.body.includes('<!-- perf-check-results -->')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                comment_id: existing.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body.trim()
+              });
+              core.info(`Updated existing comment ${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: prNumber,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body.trim()
+              });
+              core.info('Created new PR comment');
+            }

@@ -146,14 +146,14 @@ inline std::string decimalToHex(const std::string &DecimalStr) {
     return "0";
   }
   if (TrimmedStr[0] == '-') {
-    ZEN_LOG_ERROR("Negative values are not supported. Value: {}",
+    ZEN_LOG_ERROR("Negative values are not supported. Value: %s",
                   DecimalStr.c_str());
     return "0";
   }
   for (char C : TrimmedStr) {
     if (!std::isdigit(C)) {
       ZEN_LOG_ERROR(
-          "Invalid decimal string (contains non-digit characters). Value: {}",
+          "Invalid decimal string (contains non-digit characters). Value: %s",
           DecimalStr.c_str());
       return "0";
     }
@@ -162,11 +162,11 @@ inline std::string decimalToHex(const std::string &DecimalStr) {
   try {
     Value = std::stoull(TrimmedStr);
   } catch (const std::out_of_range &E) {
-    ZEN_LOG_ERROR("Value exceeds uint64_t range. Value: {}",
+    ZEN_LOG_ERROR("Value exceeds uint64_t range. Value: %s",
                   DecimalStr.c_str());
     return "0";
   } catch (const std::invalid_argument &E) {
-    ZEN_LOG_ERROR("Invalid decimal string (parsing failed). Value: {}",
+    ZEN_LOG_ERROR("Invalid decimal string (parsing failed). Value: %s",
                   DecimalStr.c_str());
     return "0";
   }
@@ -175,7 +175,7 @@ inline std::string decimalToHex(const std::string &DecimalStr) {
   std::string HexStr = S.str();
   if (HexStr.size() > 64) {
     ZEN_LOG_ERROR(
-        "Hex value exceeds 64 characters (uint256 max). Length: {}, Value: {}",
+        "Hex value exceeds 64 characters (uint256 max). Length: %zu, Value: %s",
         HexStr.size(), HexStr.c_str());
     HexStr = HexStr.substr(HexStr.size() - 64);
   }

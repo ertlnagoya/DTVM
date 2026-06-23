@@ -172,6 +172,14 @@ public:
     return Inst;
   }
 
+  template <class T, typename... Arguments>
+  T *createInstructionBeforeFirstNonPhi(MBasicBlock &BB, Arguments &&...Args) {
+    T *Inst = T::create(Ctx.MemPool, std::forward<Arguments>(Args)...);
+    Instructions.emplace_back(Inst);
+    BB.addStatementBeforeFirstNonPhi(Inst);
+    return Inst;
+  }
+
   void freeInstruction(MInstruction *Inst) {
     Inst->~MInstruction();
     MInstruction::freeMem(Ctx.MemPool, Inst);

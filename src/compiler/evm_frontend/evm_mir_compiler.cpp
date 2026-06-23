@@ -4,12 +4,18 @@
 #include "compiler/evm_frontend/evm_mir_compiler.h"
 #include "action/evm_bytecode_visitor.h"
 #include "compiler/evm_frontend/evm_imported.h"
+#include "compiler/mir/constants.h"
 #include "compiler/mir/module.h"
 #include "evm/gas_storage_cost.h"
 #include "runtime/evm_instance.h"
 #include "utils/hash_utils.h"
+#include "utils/logging.h"
+#include "llvm/Support/Casting.h"
+#include <cstdio>
 #include <cstring>
-#include <unordered_set>
+#include <optional>
+#include <queue>
+#include <set>
 
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
 #include "compiler/llvm-prebuild/Target/X86/X86Subtarget.h"
@@ -21,6 +27,7 @@ namespace COMPILER {
 constexpr uint64_t HashMultiplier = 0x9E3779B97F4A7C15ULL;
 constexpr uint64_t MinHashSize = 5;
 constexpr uint64_t MaxHashSize = 1024;
+constexpr uint32_t InvalidJumpDestRunPC = 0xFFFFFFFFu;
 
 zen::common::EVMU256Type *EVMFrontendContext::getEVMU256Type() {
   static zen::common::EVMU256Type U256Type;
@@ -71,7 +78,10 @@ EVMFrontendContext::EVMFrontendContext(const EVMFrontendContext &OtherCtx)
       BytecodeSize(OtherCtx.BytecodeSize),
       GasMeteringEnabled(OtherCtx.GasMeteringEnabled),
       GasChunkEnd(OtherCtx.GasChunkEnd), GasChunkCost(OtherCtx.GasChunkCost),
-      GasChunkSize(OtherCtx.GasChunkSize), Revision(OtherCtx.Revision)
+      GasChunkCostSPP(OtherCtx.GasChunkCostSPP),
+      GasChunkSize(OtherCtx.GasChunkSize), Revision(OtherCtx.Revision),
+      MemoryLinearStrideSkipLeadingZeroLimbStores(
+          OtherCtx.MemoryLinearStrideSkipLeadingZeroLimbStores)
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
       ,
       GasRegisterEnabled(OtherCtx.GasRegisterEnabled)
@@ -87,6 +97,161 @@ EVMMirBuilder::EVMMirBuilder(CompilerContext &Context, MFunction &MFunc)
 bool EVMMirBuilder::compile(CompilerContext *Context) {
   EVMByteCodeVisitor<EVMMirBuilder> Visitor(*this, Context);
   return Visitor.compile();
+}
+
+void EVMMirBuilder::registerDynamicJumpPhiIncomingBlock(uint64_t TargetBlockPC,
+                                                        uint64_t PredBlockPC,
+                                                        MBasicBlock *PredBB) {
+  registerPhiIncomingBlock(TargetBlockPC, PredBlockPC, PredBB);
+}
+
+void EVMMirBuilder::registerPhiIncomingBlock(uint64_t TargetBlockPC,
+                                             uint64_t PredBlockPC,
+                                             MBasicBlock *PredBB) {
+  const uint64_t CanonicalTargetPC = getCanonicalJumpDestPC(TargetBlockPC);
+  DynamicPhiIncomingBlockTable[CanonicalTargetPC][PredBlockPC] =
+      resolvePhiIncomingPredecessorBB(TargetBlockPC, PredBB);
+}
+
+MBasicBlock *EVMMirBuilder::getPhiIncomingBlock(uint64_t TargetBlockPC,
+                                                uint64_t PredBlockPC) const {
+  auto DynamicTargetIt =
+      DynamicPhiIncomingBlockTable.find(getCanonicalJumpDestPC(TargetBlockPC));
+  if (DynamicTargetIt != DynamicPhiIncomingBlockTable.end()) {
+    auto DynamicPredIt = DynamicTargetIt->second.find(PredBlockPC);
+    if (DynamicPredIt != DynamicTargetIt->second.end()) {
+      return resolveReachablePhiIncomingPredecessorBB(TargetBlockPC,
+                                                      DynamicPredIt->second);
+    }
+  }
+
+  auto BlockIt = BlockEntryTable.find(PredBlockPC);
+  if (BlockIt == BlockEntryTable.end()) {
+    return nullptr;
+  }
+  return resolveReachablePhiIncomingPredecessorBB(TargetBlockPC,
+                                                  BlockIt->second);
+}
+
+uint64_t EVMMirBuilder::getCanonicalJumpDestPC(uint64_t TargetBlockPC) const {
+  auto It = JumpDestCanonicalPCTable.find(TargetBlockPC);
+  return It == JumpDestCanonicalPCTable.end() ? TargetBlockPC : It->second;
+}
+
+MBasicBlock *EVMMirBuilder::resolvePhiIncomingPredecessorBB(
+    uint64_t TargetBlockPC, MBasicBlock *DirectPredBB) const {
+  const uint64_t CanonicalTargetPC = getCanonicalJumpDestPC(TargetBlockPC);
+  auto BodyIt = JumpDestBodyTable.find(CanonicalTargetPC);
+  if (BodyIt == JumpDestBodyTable.end()) {
+    return DirectPredBB;
+  }
+
+  auto EntryIt = JumpDestTable.find(TargetBlockPC);
+  if (EntryIt == JumpDestTable.end()) {
+    return DirectPredBB;
+  }
+
+  return EntryIt->second == BodyIt->second ? DirectPredBB : EntryIt->second;
+}
+
+MBasicBlock *EVMMirBuilder::resolveReachablePhiIncomingPredecessorBB(
+    uint64_t TargetBlockPC, MBasicBlock *CandidateBB) const {
+  if (CandidateBB == nullptr) {
+    return nullptr;
+  }
+
+  auto TargetIt = BlockEntryTable.find(TargetBlockPC);
+  if (TargetIt == BlockEntryTable.end()) {
+    return CandidateBB;
+  }
+
+  return resolveReachablePredecessorBB(TargetIt->second, CandidateBB);
+}
+
+// Resolve CandidateBB to a real predecessor of TargetBB. If CandidateBB is
+// already a predecessor it is returned unchanged; otherwise the CFG is walked
+// forward from CandidateBB to the first reachable block that is a predecessor
+// of TargetBB. Returns CandidateBB when no such block is found, so callers can
+// detect failure by checking predecessor membership of the result.
+MBasicBlock *
+EVMMirBuilder::resolveReachablePredecessorBB(MBasicBlock *TargetBB,
+                                             MBasicBlock *CandidateBB) const {
+  if (TargetBB == nullptr || CandidateBB == nullptr) {
+    return CandidateBB;
+  }
+
+  auto PredRange = TargetBB->predecessors();
+  if (std::find(PredRange.begin(), PredRange.end(), CandidateBB) !=
+      PredRange.end()) {
+    return CandidateBB;
+  }
+
+  std::queue<MBasicBlock *> Worklist;
+  std::set<MBasicBlock *> Visited;
+  Worklist.push(CandidateBB);
+  Visited.insert(CandidateBB);
+
+  while (!Worklist.empty()) {
+    MBasicBlock *CurrentBB = Worklist.front();
+    Worklist.pop();
+
+    for (MBasicBlock *SuccBB : CurrentBB->successors()) {
+      if (SuccBB == nullptr || !Visited.insert(SuccBB).second) {
+        continue;
+      }
+      if (std::find(PredRange.begin(), PredRange.end(), SuccBB) !=
+          PredRange.end()) {
+        return SuccBB;
+      }
+      Worklist.push(SuccBB);
+    }
+  }
+
+  return CandidateBB;
+}
+
+void EVMMirBuilder::finalizeStackMergePhiIncomingBlocks() {
+  // Stack-merge phi incoming blocks are resolved eagerly at the time each
+  // predecessor edge's stack state is assigned. For a loop back-edge that
+  // assignment runs before the predecessor block's terminator wires the real
+  // CFG edge into the loop header, so the recorded incoming block can be the
+  // predecessor EVM block's entry MIR block instead of the MIR block that
+  // actually branches into the loop header. Now that the full CFG is built,
+  // walk forward from each recorded incoming block to the real predecessor of
+  // the phi's owning block. Only the incoming-block pointer is corrected; the
+  // incoming value is preserved.
+  for (const auto &[Phi, OwnerBB] : StackMergePhiBlocks) {
+    if (Phi == nullptr || OwnerBB == nullptr) {
+      continue;
+    }
+    auto PredRange = OwnerBB->predecessors();
+    for (size_t Index = 0; Index < Phi->getNumIncoming(); ++Index) {
+      MBasicBlock *IncomingBB = Phi->getIncomingBlock(Index);
+      if (IncomingBB == nullptr) {
+        continue;
+      }
+      // Already a real predecessor: nothing to fix.
+      if (std::find(PredRange.begin(), PredRange.end(), IncomingBB) !=
+          PredRange.end()) {
+        continue;
+      }
+      // Walk forward from the recorded block to the actual predecessor of the
+      // phi's owning block, reusing the shared reachability resolver.
+      MBasicBlock *ResolvedBB =
+          resolveReachablePredecessorBB(OwnerBB, IncomingBB);
+      // The walk must land on a real predecessor; otherwise the phi would keep
+      // an incoming block that is not a predecessor and the verifier would
+      // reject it. Make that failure explicit in debug builds.
+      ZEN_ASSERT(std::find(PredRange.begin(), PredRange.end(), ResolvedBB) !=
+                     PredRange.end() &&
+                 "stack-merge phi incoming block did not resolve to a real "
+                 "predecessor");
+      if (ResolvedBB != IncomingBB) {
+        // Only the incoming-block pointer changes; the value is preserved.
+        Phi->setIncomingBlock(Index, ResolvedBB);
+      }
+    }
+  }
 }
 
 void EVMMirBuilder::loadEVMInstanceAttr() {
@@ -135,13 +300,15 @@ void EVMMirBuilder::loadEVMInstanceAttr() {
   ExceptionReturnBB = CurFunc->createExceptionReturnBB();
 }
 
-MBasicBlock *EVMMirBuilder::getOrCreateIndirectJumpBB() {
-  if (IndirectJumpBB) {
-    return IndirectJumpBB;
+MBasicBlock *EVMMirBuilder::getOrCreateIndirectJumpBB(uint64_t SourceBlockPC) {
+  auto ExistingIt = IndirectJumpBBs.find(SourceBlockPC);
+  if (ExistingIt != IndirectJumpBBs.end()) {
+    return ExistingIt->second;
   }
 
   MBasicBlock *FromBB = CurBB;
-  IndirectJumpBB = CurFunc->createBasicBlock();
+  MBasicBlock *IndirectJumpBB = CurFunc->createBasicBlock();
+  IndirectJumpBBs[SourceBlockPC] = IndirectJumpBB;
   setInsertBlock(IndirectJumpBB);
 #ifdef ZEN_ENABLE_LINUX_PERF
   CurBB->setSourceOffset(CurPC);
@@ -186,9 +353,29 @@ MBasicBlock *EVMMirBuilder::getOrCreateIndirectJumpBB() {
         continue;
       }
       if (JumpHashTable[HashEntry].size() == 1) {
-        // JumpDest BB for no-conflict hash index
-        HashCases[HIndex].second = JumpHashTable[HashEntry][0];
-        addSuccessor(JumpHashTable[HashEntry][0]);
+        // Even for single-entry hash buckets, we must explicitly verify that
+        // the requested jump target matches the expected PC. Otherwise, any
+        // invalid PC that collides with this hash bucket would wrongly jump to
+        // this destination.
+        MBasicBlock *OutsideBB = CurBB;
+        MBasicBlock *CheckBB = createBasicBlock();
+        CheckBB->setJumpDestBB(true);
+        setInsertBlock(CheckBB);
+        MInstruction *ExpectedPC = createIntConstInstruction(
+            UInt64Type, JumpHashReverse[HashEntry][0]);
+        MInstruction *IsMatch = createInstruction<CmpInstruction>(
+            false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, JumpTarget,
+            ExpectedPC);
+        MBasicBlock *DestBB = JumpHashTable[HashEntry][0];
+        registerDynamicJumpPhiIncomingBlock(JumpHashReverse[HashEntry][0],
+                                            SourceBlockPC, CheckBB);
+        createInstruction<BrIfInstruction>(true, Ctx, IsMatch, DestBB,
+                                           FailureBB);
+        addSuccessor(DestBB);
+        addUniqueSuccessor(FailureBB);
+        setInsertBlock(OutsideBB);
+        HashCases[HIndex].second = CheckBB;
+        addSuccessor(CheckBB);
       } else {
         // Create switch for conflict hash items
         MBasicBlock *OutsideBB = CurBB;
@@ -204,6 +391,8 @@ MBasicBlock *EVMMirBuilder::getOrCreateIndirectJumpBB() {
           SubCases[I].first =
               createIntConstInstruction(UInt64Type, SubPCVec[I]);
           SubCases[I].second = SubDestBBVec[I];
+          registerDynamicJumpPhiIncomingBlock(SubPCVec[I], SourceBlockPC,
+                                              SubCaseBB);
           addSuccessor(SubDestBBVec[I]);
         }
         createInstruction<SwitchInstruction>(true, Ctx, JumpTarget, FailureBB,
@@ -229,6 +418,7 @@ MBasicBlock *EVMMirBuilder::getOrCreateIndirectJumpBB() {
   for (const auto &[DestPC, DestBB] : JumpDestTable) {
     Cases[Index].first = createIntConstInstruction(UInt64Type, DestPC);
     Cases[Index].second = DestBB;
+    registerDynamicJumpPhiIncomingBlock(DestPC, SourceBlockPC, IndirectJumpBB);
     addSuccessor(DestBB);
     Index++;
   }
@@ -257,17 +447,21 @@ void EVMMirBuilder::initEVM(CompilerContext *Context) {
         evmc_get_instruction_names_table(zen::evm::DEFAULT_REVISION);
   }
 
-  createJumpTable();
   ReturnBB = createBasicBlock();
   loadEVMInstanceAttr();
 
+  // Normal execution continues from here (bytecode at PC=0)
+
   GasChunkEnd = EvmCtx->getGasChunkEnd();
   GasChunkCost = EvmCtx->getGasChunkCost();
+  GasChunkCostSPP = EvmCtx->getGasChunkCostSPP();
   GasChunkSize = EvmCtx->getGasChunkSize();
 
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   initGasRegister();
 #endif
+
+  createJumpTable();
 
 #ifdef ZEN_ENABLE_LINUX_PERF
   CurBB->setSourceOffset(1);
@@ -365,6 +559,10 @@ void EVMMirBuilder::finalizeEVMBase() {
     CurFunc->deleteMBasicBlock(ReturnBB);
     ReturnBB = nullptr;
   }
+
+  // Correct loop back-edge merge phi incoming blocks against the now-complete
+  // CFG. No-op when no stack-merge phis were built (e.g. SSA stack-lift off).
+  finalizeStackMergePhiIncomingBlocks();
 }
 
 LoadInstruction *EVMMirBuilder::getInstanceElement(MType *ValueType,
@@ -395,13 +593,68 @@ void EVMMirBuilder::meterOpcode(evmc_opcode Opcode, uint64_t PC) {
   }
   if (GasChunkEnd && GasChunkCost && PC < GasChunkSize) {
     if (GasChunkEnd[PC] > PC) {
-      meterGas(GasChunkCost[PC]);
+      // Prefer SPP-shifted cost when available — it preserves per-path totals
+      // while reducing the number of non-zero entries the JIT must emit a
+      // gas check for.
+      const uint64_t Cost =
+          GasChunkCostSPP ? GasChunkCostSPP[PC] : GasChunkCost[PC];
+      meterGas(Cost);
     }
     return;
   }
   const uint8_t Index = static_cast<uint8_t>(Opcode);
   const auto &Metrics = InstructionMetrics[Index];
   meterGas(static_cast<uint64_t>(Metrics.gas_cost));
+}
+
+void EVMMirBuilder::meterOpcodeRange(uint64_t StartPC,
+                                     uint64_t EndPCExclusive) {
+  if (!Ctx.isGasMeteringEnabled() || StartPC >= EndPCExclusive) {
+    return;
+  }
+
+  // Fast path for merged consecutive JUMPDEST runs: the skipped cost for
+  // [StartPC, EndPCExclusive) is precomputed once when building the jump table.
+  if (StartPC < JumpDestRunLastPC.size()) {
+    const uint32_t RunLastPC = JumpDestRunLastPC[static_cast<size_t>(StartPC)];
+    if (RunLastPC != InvalidJumpDestRunPC &&
+        static_cast<uint64_t>(RunLastPC) == EndPCExclusive) {
+      meterGas(JumpDestRunSkipCost[static_cast<size_t>(StartPC)]);
+      return;
+    }
+  }
+
+  const auto *EvmCtx = static_cast<const EVMFrontendContext *>(&Ctx);
+  const Byte *Bytecode = EvmCtx->getBytecode();
+  if (!Bytecode) {
+    return;
+  }
+
+  const uint64_t CodeSize = static_cast<uint64_t>(EvmCtx->getBytecodeSize());
+  if (StartPC >= CodeSize) {
+    return;
+  }
+  EndPCExclusive = std::min(EndPCExclusive, CodeSize);
+
+  uint64_t TotalCost = 0;
+  for (uint64_t PC = StartPC; PC < EndPCExclusive; ++PC) {
+    uint64_t Cost = 0;
+    if (GasChunkEnd && GasChunkCost && PC < GasChunkSize &&
+        GasChunkEnd[PC] > PC) {
+      Cost = GasChunkCostSPP ? GasChunkCostSPP[PC] : GasChunkCost[PC];
+    } else {
+      const uint8_t Opcode = static_cast<uint8_t>(Bytecode[PC]);
+      Cost = static_cast<uint64_t>(InstructionMetrics[Opcode].gas_cost);
+    }
+
+    if (UINT64_MAX - TotalCost < Cost) {
+      TotalCost = UINT64_MAX;
+      break;
+    }
+    TotalCost += Cost;
+  }
+
+  meterGas(TotalCost);
 }
 
 bool EVMMirBuilder::isOpcodeDefined(evmc_opcode Opcode) const {
@@ -649,15 +902,25 @@ void EVMMirBuilder::createStackCheckBlock(int32_t MinSize, int32_t MaxSize) {
   // Check if StackSize greater than MaxSize
   MInstruction *IsOverflow = createInstruction<CmpInstruction>(
       false, CmpInstruction::ICMP_UGT, &Ctx.I64Type, StackSize, MaxSizeConst);
-  // Handle EVMStackOverflow in exception BB
+
+  // Use an intermediate SyncBB to avoid a critical edge (multi-successor →
+  // multi-predecessor) between this check and the shared StackOverflowBB.
+  // Also sync StackSize to Instance for accurate diagnostics on overflow.
+  MBasicBlock *SyncBB = createBasicBlock();
   MBasicBlock *StackOverflowBB =
       CurFunc->getOrCreateExceptionSetBB(common::ErrorCode::EVMStackOverflow);
-  // Handle EVMStackOverflow in exception BB
   MBasicBlock *FollowBB = createBasicBlock();
-  createInstruction<BrIfInstruction>(true, Ctx, IsOverflow, StackOverflowBB,
-                                     FollowBB);
-  addUniqueSuccessor(StackOverflowBB);
+  createInstruction<BrIfInstruction>(true, Ctx, IsOverflow, SyncBB, FollowBB);
+  addSuccessor(SyncBB);
   addSuccessor(FollowBB);
+
+  setInsertBlock(SyncBB);
+  const int32_t StackSizeOffset =
+      zen::runtime::EVMInstance::getEVMStackSizeOffset();
+  setInstanceElement(&Ctx.I64Type, StackSize, StackSizeOffset);
+  createInstruction<BrInstruction>(true, Ctx, StackOverflowBB);
+  addUniqueSuccessor(StackOverflowBB);
+
   setInsertBlock(FollowBB);
 }
 
@@ -797,6 +1060,191 @@ typename EVMMirBuilder::Operand EVMMirBuilder::stackGet(int32_t IndexFromTop) {
   return Operand(GetComponents, EVMType::UINT256);
 }
 
+void EVMMirBuilder::setTrackedStackDepth(uint32_t Depth) {
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  uint64_t StackBytes = static_cast<uint64_t>(Depth) * 32ULL;
+  MInstruction *StackSize = createIntConstInstruction(I64Type, StackBytes);
+  createInstruction<DassignInstruction>(true, &(Ctx.VoidType), StackSize,
+                                        StackSizeVar->getVarIdx());
+
+  MInstruction *StackPtrOffset = createIntConstInstruction(
+      &Ctx.I64Type, zen::runtime::EVMInstance::getEVMStackOffset());
+  MInstruction *StackBaseAddr = createInstruction<BinaryInstruction>(
+      false, OP_add, &Ctx.I64Type, InstanceAddr, StackPtrOffset);
+  MInstruction *StackTopAddr = createInstruction<BinaryInstruction>(
+      false, OP_add, &Ctx.I64Type, StackBaseAddr, StackSize);
+  createInstruction<DassignInstruction>(true, &(Ctx.VoidType), StackTopAddr,
+                                        StackTopVar->getVarIdx());
+}
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::createStackEntryOperand(ValueRange Range) {
+  U256Var Vars = {};
+  for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+    Vars[I] = CurFunc->createVariable(&Ctx.I64Type);
+  }
+  Operand Op(Vars, EVMType::UINT256);
+  Op.setRange(Range);
+  return Op;
+}
+
+void EVMMirBuilder::assignStackEntryOperand(const Operand &Dest,
+                                            const Operand &Value) {
+  ZEN_ASSERT(Dest.isU256MultiComponent() && "stack entry operand must be U256");
+  U256Var DestVars = Dest.getU256VarComponents();
+  U256Inst Src = extractU256Operand(Value);
+  for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+    ZEN_ASSERT(DestVars[I] != nullptr);
+    createInstruction<DassignInstruction>(true, &(Ctx.VoidType), Src[I],
+                                          DestVars[I]->getVarIdx());
+  }
+}
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::prepareStackPhiIncoming(const Operand &Value) {
+  U256Inst Prepared = {};
+  U256Inst Src = extractU256Operand(Value);
+  for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+    Prepared[I] = protectUnsafeValue(Src[I], &Ctx.I64Type);
+  }
+  return Operand(Prepared, EVMType::UINT256);
+}
+
+void EVMMirBuilder::registerCurrentBlockPC(uint64_t BlockPC) {
+  CurrentBlockPC = BlockPC;
+  BlockEntryTable[BlockPC] = CurBB;
+}
+
+typename EVMMirBuilder::Operand EVMMirBuilder::materializeStackMergeOperand(
+    const std::vector<uint64_t> &PredBlockPCs,
+    const std::vector<std::pair<uint64_t, Operand>> &IncomingValues) {
+  std::map<uint64_t, Operand> IncomingValueMap;
+  for (const auto &[PredBlockPC, Value] : IncomingValues) {
+    IncomingValueMap[PredBlockPC] = Value;
+  }
+
+  U256Inst PhiComponents = {};
+  U256Var PhiVars = {};
+  auto PredRange = CurBB->predecessors();
+  const size_t ActualPredCount =
+      static_cast<size_t>(std::distance(PredRange.begin(), PredRange.end()));
+  for (size_t ComponentIndex = 0; ComponentIndex < EVM_ELEMENTS_COUNT;
+       ++ComponentIndex) {
+    PhiInstruction *Phi = createPendingPhi(&Ctx.I64Type, PredBlockPCs.size());
+    auto &SlotMap = PhiIncomingSlotMap[Phi];
+    for (size_t IncomingIndex = 0; IncomingIndex < PredBlockPCs.size();
+         ++IncomingIndex) {
+      uint64_t PredBlockPC = PredBlockPCs[IncomingIndex];
+      SlotMap[PredBlockPC] = IncomingIndex;
+
+      auto IncomingIt = IncomingValueMap.find(PredBlockPC);
+      if (IncomingIt == IncomingValueMap.end()) {
+        continue;
+      }
+
+      MBasicBlock *IncomingBB =
+          getPhiIncomingBlock(CurrentBlockPC, PredBlockPC);
+      if ((IncomingBB == nullptr ||
+           std::find(PredRange.begin(), PredRange.end(), IncomingBB) ==
+               PredRange.end()) &&
+          IncomingIndex < ActualPredCount) {
+        IncomingBB = *(PredRange.begin() + IncomingIndex);
+      }
+      ZEN_ASSERT(
+          IncomingBB != nullptr &&
+          "phi incoming block must be registered before materialization");
+      U256Inst IncomingComponents = extractU256Operand(IncomingIt->second);
+      Phi->setIncoming(IncomingIndex, IncomingBB,
+                       IncomingComponents[ComponentIndex]);
+    }
+    PhiComponents[ComponentIndex] = Phi;
+    // Record the phi against its loop-header block so its incoming blocks can
+    // be re-resolved once the full CFG (including back-edge terminators) is
+    // built. See finalizeStackMergePhiIncomingBlocks().
+    StackMergePhiBlocks.emplace_back(Phi, CurBB);
+  }
+
+  for (size_t ComponentIndex = 0; ComponentIndex < EVM_ELEMENTS_COUNT;
+       ++ComponentIndex) {
+    Variable *PhiVar =
+        storeInstructionInTemp(PhiComponents[ComponentIndex], &Ctx.I64Type);
+    PhiVars[ComponentIndex] = PhiVar;
+    StackMergePhiVarMap[PhiVar->getVarIdx()] =
+        llvm::cast<PhiInstruction>(PhiComponents[ComponentIndex]);
+  }
+
+  return Operand(PhiVars, EVMType::UINT256);
+}
+
+void EVMMirBuilder::assignStackMergeOperand(const Operand &Dest,
+                                            uint64_t PredBlockPC,
+                                            const Operand &Value) {
+  U256Var DestVars = Dest.getU256VarComponents();
+  U256Inst IncomingComponents = extractU256Operand(Value);
+  MBasicBlock *IncomingBB = getPhiIncomingBlock(CurrentBlockPC, PredBlockPC);
+  auto PredRange = CurBB->predecessors();
+  const size_t ActualPredCount =
+      static_cast<size_t>(std::distance(PredRange.begin(), PredRange.end()));
+  for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+    ZEN_ASSERT(DestVars[I] != nullptr &&
+               "stack merge operand must be anchored in temp vars");
+    auto PhiIt = StackMergePhiVarMap.find(DestVars[I]->getVarIdx());
+    ZEN_ASSERT(PhiIt != StackMergePhiVarMap.end() &&
+               "phi temp var must resolve to pending phi");
+    PhiInstruction *Phi = PhiIt->second;
+    size_t IncomingSlot = getPhiIncomingSlot(Phi, PredBlockPC);
+    if ((IncomingBB == nullptr || std::find(PredRange.begin(), PredRange.end(),
+                                            IncomingBB) == PredRange.end()) &&
+        IncomingSlot < ActualPredCount) {
+      IncomingBB = *(PredRange.begin() + IncomingSlot);
+    }
+    ZEN_ASSERT(IncomingBB != nullptr &&
+               "phi incoming block must be registered before patching");
+    Phi->setIncoming(IncomingSlot, IncomingBB, IncomingComponents[I]);
+  }
+}
+
+void EVMMirBuilder::spillTrackedStack(
+    const std::vector<Operand> &TrackedStack) {
+  spillTrackedStackPreservingPrefix(TrackedStack, 0);
+}
+
+void EVMMirBuilder::spillTrackedStackPreservingPrefix(
+    const std::vector<Operand> &TrackedStack, uint32_t PrefixDepth) {
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MPointerType *U64PtrType = MPointerType::create(Ctx, Ctx.I64Type);
+  MInstruction *StackPtrOffset = createIntConstInstruction(
+      &Ctx.I64Type, zen::runtime::EVMInstance::getEVMStackOffset());
+  MInstruction *StackBaseAddr = createInstruction<BinaryInstruction>(
+      false, OP_add, &Ctx.I64Type, InstanceAddr, StackPtrOffset);
+
+  const int32_t InnerOffsets[EVM_ELEMENTS_COUNT] = {0, 8, 16, 24};
+  const uint64_t PrefixBytes = static_cast<uint64_t>(PrefixDepth) * 32ULL;
+  for (size_t Slot = 0; Slot < TrackedStack.size(); ++Slot) {
+    U256Inst Components = extractU256Operand(TrackedStack[Slot]);
+    uint64_t SlotOffset = PrefixBytes + static_cast<uint64_t>(Slot) * 32ULL;
+    MInstruction *SlotOffsetInst =
+        createIntConstInstruction(I64Type, SlotOffset);
+    MInstruction *SlotAddr = createInstruction<BinaryInstruction>(
+        false, OP_add, &Ctx.I64Type, StackBaseAddr, SlotOffsetInst);
+    MInstruction *SlotPtr = createInstruction<ConversionInstruction>(
+        false, OP_inttoptr, U64PtrType, SlotAddr);
+    for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+      createInstruction<StoreInstruction>(true, &Ctx.VoidType, Components[I],
+                                          SlotPtr, InnerOffsets[I]);
+    }
+  }
+
+  const uint32_t FinalDepth =
+      PrefixDepth + static_cast<uint32_t>(TrackedStack.size());
+  setTrackedStackDepth(FinalDepth);
+  const int32_t StackSizeOffset =
+      zen::runtime::EVMInstance::getEVMStackSizeOffset();
+  MInstruction *StackSize = createIntConstInstruction(
+      I64Type, static_cast<uint64_t>(FinalDepth) * 32ULL);
+  setInstanceElement(&Ctx.I64Type, StackSize, StackSizeOffset);
+}
+
 void EVMMirBuilder::handleStop() {
   auto Zero = createU256ConstOperand(intx::uint256{0});
   handleReturn(Zero, Zero);
@@ -880,18 +1328,109 @@ void EVMMirBuilder::createJumpTable() {
   const Byte *Bytecode = EvmCtx->getBytecode();
   size_t BytecodeSize = EvmCtx->getBytecodeSize();
 
+  JumpDestTable.clear();
+  JumpDestCanonicalPCTable.clear();
+  JumpDestBodyTable.clear();
+  JumpHashTable.clear();
+  JumpHashReverse.clear();
+  HashMask = 0;
+  if (Ctx.isGasMeteringEnabled()) {
+    JumpDestRunLastPC.assign(BytecodeSize, InvalidJumpDestRunPC);
+    JumpDestRunSkipCost.assign(BytecodeSize, 0);
+  } else {
+    JumpDestRunLastPC.clear();
+    JumpDestRunSkipCost.clear();
+  }
+
+  MBasicBlock *SavedInsertBB = CurBB;
+
   for (size_t PC = 0; PC < BytecodeSize; ++PC) {
     if (Bytecode[PC] == static_cast<Byte>(evmc_opcode::OP_JUMPDEST)) {
-      MBasicBlock *DestBB = createBasicBlock();
-      DestBB->setJumpDestBB(true);
-      JumpDestTable[PC] = DestBB;
-    } else if (static_cast<Byte>(evmc_opcode::OP_PUSH0) <= Bytecode[PC] &&
-               Bytecode[PC] <= static_cast<Byte>(evmc_opcode::OP_PUSH32)) {
-      uint8_t PushSize = static_cast<uint8_t>(Bytecode[PC]) + 1 -
-                         static_cast<uint8_t>(evmc_opcode::OP_PUSH1);
-      PC += PushSize; // Skip the immediate data
+      const size_t RangeStart = PC;
+      while (PC + 1 < BytecodeSize &&
+             Bytecode[PC + 1] == static_cast<Byte>(evmc_opcode::OP_JUMPDEST)) {
+        ++PC;
+      }
+      const size_t RangeEnd = PC;
+
+      // Share one canonical execution block for the whole run.
+      MBasicBlock *BodyBB = createBasicBlock();
+      BodyBB->setJumpDestBB(true);
+
+      for (size_t DestPC = RangeStart; DestPC <= RangeEnd; ++DestPC) {
+        JumpDestCanonicalPCTable[DestPC] = static_cast<uint64_t>(RangeEnd);
+        JumpDestBodyTable[DestPC] = BodyBB;
+      }
+
+      if (!Ctx.isGasMeteringEnabled() || RangeStart == RangeEnd) {
+        for (size_t DestPC = RangeStart; DestPC <= RangeEnd; ++DestPC) {
+          JumpDestTable[DestPC] = BodyBB;
+        }
+      } else {
+        // For merged runs, materialize per-target entry thunks that charge the
+        // exact skipped metering before entering the shared body.
+        //
+        // NOTE: We may create O(n) thunks for a run of length n. Avoid an
+        // O(n^2) compile-time cost by precomputing the suffix sums of skipped
+        // metering once for the run.
+        const size_t SkipCount = RangeEnd - RangeStart; // exclude RangeEnd
+        const uint64_t JumpDestBaseCost = static_cast<uint64_t>(
+            InstructionMetrics[static_cast<uint8_t>(evmc_opcode::OP_JUMPDEST)]
+                .gas_cost);
+        std::vector<uint64_t> SkipCostByOffset(SkipCount, 0);
+        if (SkipCount > 0) {
+          uint64_t Running = 0;
+          for (size_t Offset = SkipCount; Offset > 0; --Offset) {
+            const size_t Pc = RangeStart + (Offset - 1);
+            uint64_t Cost = 0;
+            if (GasChunkEnd && GasChunkCost && Pc < GasChunkSize &&
+                GasChunkEnd[Pc] > Pc) {
+              Cost = GasChunkCostSPP ? GasChunkCostSPP[Pc] : GasChunkCost[Pc];
+            } else {
+              // All bytes in the run are JUMPDEST opcode bytes (PUSH payload is
+              // skipped in the scan above), so the fallback is a constant.
+              Cost = JumpDestBaseCost;
+            }
+
+            if (UINT64_MAX - Running < Cost) {
+              Running = UINT64_MAX;
+            } else {
+              Running += Cost;
+            }
+            SkipCostByOffset[Pc - RangeStart] = Running;
+          }
+        }
+
+        // Cache the total skipped cost at run start so the linear decode path
+        // can reuse it without re-scanning the same consecutive JUMPDEST range.
+        if (RangeStart < JumpDestRunLastPC.size()) {
+          JumpDestRunLastPC[RangeStart] = static_cast<uint32_t>(RangeEnd);
+          JumpDestRunSkipCost[RangeStart] = SkipCostByOffset[0];
+        }
+
+        for (size_t DestPC = RangeStart; DestPC < RangeEnd; ++DestPC) {
+          MBasicBlock *EntryBB = createBasicBlock();
+          EntryBB->setJumpDestBB(true);
+          JumpDestTable[DestPC] = EntryBB;
+
+          setInsertBlock(EntryBB);
+          meterGas(SkipCostByOffset[DestPC - RangeStart]);
+          createInstruction<BrInstruction>(true, Ctx, BodyBB);
+          addSuccessor(BodyBB);
+        }
+        JumpDestTable[RangeEnd] = BodyBB;
+      }
+    } else {
+      if (static_cast<Byte>(evmc_opcode::OP_PUSH0) <= Bytecode[PC] &&
+          Bytecode[PC] <= static_cast<Byte>(evmc_opcode::OP_PUSH32)) {
+        uint8_t PushSize = static_cast<uint8_t>(Bytecode[PC]) + 1 -
+                           static_cast<uint8_t>(evmc_opcode::OP_PUSH1);
+        PC += PushSize; // Skip the immediate data
+      }
     }
   }
+
+  setInsertBlock(SavedInsertBB);
 
   // If the size of JumpDests is greater than MinHashSize, create a hash table
   // which calculates the hash of DestPC and use it as the index to jump
@@ -899,7 +1438,6 @@ void EVMMirBuilder::createJumpTable() {
     uint64_t HashSize =
         std::min(nextPowerOfTwo(JumpDestTable.size()), MaxHashSize);
     HashMask = HashSize - 1;
-    std::vector<std::vector<MBasicBlock *>> HashDests(HashSize);
     for (const auto &[DestPC, DestBB] : JumpDestTable) {
       // HashIndex(a) = (a * HashMultiplier) & (size - 1)
       uint64_t Index = (DestPC * HashMultiplier) & HashMask;
@@ -912,6 +1450,7 @@ void EVMMirBuilder::createJumpTable() {
 void EVMMirBuilder::implementConstantJump(uint64_t ConstDest,
                                           MBasicBlock *FailureBB) {
   if (JumpDestTable.count(ConstDest)) {
+    registerPhiIncomingBlock(ConstDest, CurrentBlockPC, CurBB);
     createInstruction<BrInstruction>(true, Ctx, JumpDestTable[ConstDest]);
     addSuccessor(JumpDestTable[ConstDest]);
   } else {
@@ -929,7 +1468,7 @@ void EVMMirBuilder::implementIndirectJump(MInstruction *JumpTarget,
   }
   HasIndirectJump = true;
 
-  MBasicBlock *TargetBB = getOrCreateIndirectJumpBB();
+  MBasicBlock *TargetBB = getOrCreateIndirectJumpBB(CurrentBlockPC);
   createInstruction<DassignInstruction>(true, &(Ctx.VoidType), JumpTarget,
                                         JumpTargetVar->getVarIdx());
   createInstruction<BrInstruction>(true, Ctx, TargetBB);
@@ -984,13 +1523,35 @@ void EVMMirBuilder::handleJump(Operand Dest) {
   MBasicBlock *InvalidJumpBB =
       getOrCreateExceptionSetBB(ErrorCode::EVMBadJumpDestination);
   if (Dest.isConstant()) {
-    uint64_t ConstDest = Dest.getConstValue()[0];
+    const auto &ConstValue = Dest.getConstValue();
+    if ((ConstValue[3] | ConstValue[2] | ConstValue[1]) != 0) {
+      createInstruction<BrInstruction>(true, Ctx, InvalidJumpBB);
+      addSuccessor(InvalidJumpBB);
+      return;
+    }
+    uint64_t ConstDest = ConstValue[0];
     implementConstantJump(ConstDest, InvalidJumpBB);
-  } else {
-    U256Inst DestComponents = extractU256Operand(Dest);
-    MInstruction *JumpTarget = DestComponents[0];
-    implementIndirectJump(JumpTarget, InvalidJumpBB);
+    return;
   }
+
+  U256Inst DestComponents = extractU256Operand(Dest);
+  MInstruction *JumpTarget = DestComponents[0];
+  MType *MirI64Type =
+      EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MInstruction *Zero = createIntConstInstruction(MirI64Type, 0);
+  MInstruction *HighOr = createInstruction<BinaryInstruction>(
+      false, OP_or, MirI64Type, DestComponents[1], DestComponents[2]);
+  HighOr = createInstruction<BinaryInstruction>(false, OP_or, MirI64Type,
+                                                HighOr, DestComponents[3]);
+  MInstruction *HighNonZero = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_NE, &Ctx.I64Type, HighOr, Zero);
+  MBasicBlock *ValidJumpBB = createBasicBlock();
+  createInstruction<BrIfInstruction>(true, Ctx, HighNonZero, InvalidJumpBB,
+                                     ValidJumpBB);
+  addSuccessor(InvalidJumpBB);
+  addSuccessor(ValidJumpBB);
+  setInsertBlock(ValidJumpBB);
+  implementIndirectJump(JumpTarget, InvalidJumpBB);
 }
 
 void EVMMirBuilder::handleJumpI(Operand Dest, Operand Cond) {
@@ -1026,6 +1587,29 @@ void EVMMirBuilder::handleJumpI(Operand Dest, Operand Cond) {
                                        FallThroughBB);
     addUniqueSuccessor(InvalidJumpBB);
     addSuccessor(FallThroughBB);
+  } else if (Dest.isConstant()) {
+    const auto &ConstValue = Dest.getConstValue();
+    if ((ConstValue[3] | ConstValue[2] | ConstValue[1]) != 0) {
+      createInstruction<BrIfInstruction>(true, Ctx, IsNonZero, InvalidJumpBB,
+                                         FallThroughBB);
+      addUniqueSuccessor(InvalidJumpBB);
+      addSuccessor(FallThroughBB);
+    } else {
+      uint64_t ConstDest = ConstValue[0];
+      auto JumpIt = JumpDestTable.find(ConstDest);
+      if (JumpIt == JumpDestTable.end()) {
+        createInstruction<BrIfInstruction>(true, Ctx, IsNonZero, InvalidJumpBB,
+                                           FallThroughBB);
+        addUniqueSuccessor(InvalidJumpBB);
+        addSuccessor(FallThroughBB);
+      } else {
+        registerPhiIncomingBlock(ConstDest, CurrentBlockPC, CurBB);
+        createInstruction<BrIfInstruction>(true, Ctx, IsNonZero, JumpIt->second,
+                                           FallThroughBB);
+        addSuccessor(JumpIt->second);
+        addSuccessor(FallThroughBB);
+      }
+    }
   } else {
     MBasicBlock *JumpTableBB = createBasicBlock();
     createInstruction<BrIfInstruction>(true, Ctx, IsNonZero, JumpTableBB,
@@ -1033,19 +1617,28 @@ void EVMMirBuilder::handleJumpI(Operand Dest, Operand Cond) {
     addSuccessor(JumpTableBB);
     addSuccessor(FallThroughBB);
     setInsertBlock(JumpTableBB);
-    if (Dest.isConstant()) {
-      uint64_t ConstDest = Dest.getConstValue()[0];
-      implementConstantJump(ConstDest, InvalidJumpBB);
-    } else {
-      implementIndirectJump(JumpTarget, InvalidJumpBB);
-    }
+    MInstruction *HighOr = createInstruction<BinaryInstruction>(
+        false, OP_or, MirI64Type, DestComponents[1], DestComponents[2]);
+    HighOr = createInstruction<BinaryInstruction>(false, OP_or, MirI64Type,
+                                                  HighOr, DestComponents[3]);
+    MInstruction *HighNonZero = createInstruction<CmpInstruction>(
+        false, CmpInstruction::Predicate::ICMP_NE, &Ctx.I64Type, HighOr, Zero);
+    MBasicBlock *ValidJumpBB = createBasicBlock();
+    createInstruction<BrIfInstruction>(true, Ctx, HighNonZero, InvalidJumpBB,
+                                       ValidJumpBB);
+    addSuccessor(InvalidJumpBB);
+    addSuccessor(ValidJumpBB);
+    setInsertBlock(ValidJumpBB);
+    implementIndirectJump(JumpTarget, InvalidJumpBB);
   }
 
   setInsertBlock(FallThroughBB);
 }
 
 void EVMMirBuilder::handleJumpDest(const uint64_t &PC) {
-  MBasicBlock *DestBB = JumpDestTable.at(PC);
+  auto BodyIt = JumpDestBodyTable.find(PC);
+  ZEN_ASSERT(BodyIt != JumpDestBodyTable.end() && "JUMPDEST body not found");
+  MBasicBlock *DestBB = BodyIt->second;
   // Only add successor if the current BB is not ExceptionSetBB,
   bool IsExceptionSetBB = false;
   for (auto &[EC, BB] : CurFunc->getExceptionSetBBs()) {
@@ -1056,11 +1649,13 @@ void EVMMirBuilder::handleJumpDest(const uint64_t &PC) {
   }
   if (CurBB != DestBB && !IsExceptionSetBB) {
     if (CurBB->empty()) {
+      registerPhiIncomingBlock(PC, CurrentBlockPC, CurBB);
       CurBB->addSuccessor(DestBB);
       createInstruction<BrInstruction>(true, Ctx, DestBB);
     } else {
       MInstruction *LastInst = *std::prev(CurBB->end());
       if (!LastInst->isTerminator()) {
+        registerPhiIncomingBlock(PC, CurrentBlockPC, CurBB);
         CurBB->addSuccessor(DestBB);
         createInstruction<BrInstruction>(true, Ctx, DestBB);
       }
@@ -1077,24 +1672,619 @@ void EVMMirBuilder::handleJumpDest(const uint64_t &PC) {
 
 // ==================== Arithmetic Instruction Handlers ====================
 
+MInstruction *EVMMirBuilder::createEvmUmul128(MInstruction *LHS,
+                                              MInstruction *RHS) {
+  return createInstruction<EvmUmul128Instruction>(false, OP_evm_umul128_lo,
+                                                  &Ctx.I64Type, LHS, RHS);
+}
+
+MInstruction *EVMMirBuilder::createEvmUmul128Hi(MInstruction *MulInst) {
+  return createInstruction<EvmUmul128HiInstruction>(false, &Ctx.I64Type,
+                                                    MulInst);
+}
+
+MInstruction *EVMMirBuilder::createEvmUdiv128By64(MInstruction *Hi,
+                                                  MInstruction *Lo,
+                                                  MInstruction *Divisor) {
+  return createInstruction<EvmUdiv128By64Instruction>(
+      false, OP_evm_udiv128_by64, &Ctx.I64Type, Hi, Lo, Divisor);
+}
+
+MInstruction *EVMMirBuilder::createEvmUrem128By64(MInstruction *DivInst) {
+  return createInstruction<EvmUrem128By64Instruction>(false, &Ctx.I64Type,
+                                                      DivInst);
+}
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::handleDivU64Divisor(const Operand &DividendOp,
+                                   uint64_t Divisor) {
+  MType *I64Type = &Ctx.I64Type;
+  MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+  MInstruction *DivConst = createIntConstInstruction(I64Type, Divisor);
+
+  U256Inst A = extractU256Operand(DividendOp);
+
+  // Cascading division: (0:A[3]) / D, then (R3:A[2]) / D, ...
+  MInstruction *Div3 = createEvmUdiv128By64(Zero, A[3], DivConst);
+  MInstruction *Rem3 = createEvmUrem128By64(Div3);
+  MInstruction *Div2 = createEvmUdiv128By64(Rem3, A[2], DivConst);
+  MInstruction *Rem2 = createEvmUrem128By64(Div2);
+  MInstruction *Div1 = createEvmUdiv128By64(Rem2, A[1], DivConst);
+  MInstruction *Rem1 = createEvmUrem128By64(Div1);
+  MInstruction *Div0 = createEvmUdiv128By64(Rem1, A[0], DivConst);
+
+  // DIV(x, d>=1) <= x, so the quotient fits wherever the dividend fits.
+  U256Inst Result = {Div0, Div1, Div2, Div3};
+  return Operand(Result, EVMType::UINT256, DividendOp.getRange());
+}
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::handleModU64Divisor(const Operand &DividendOp,
+                                   uint64_t Divisor) {
+  MType *I64Type = &Ctx.I64Type;
+  MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+  MInstruction *DivConst = createIntConstInstruction(I64Type, Divisor);
+
+  U256Inst A = extractU256Operand(DividendOp);
+
+  // Cascading division to get remainder
+  MInstruction *Div3 = createEvmUdiv128By64(Zero, A[3], DivConst);
+  MInstruction *Rem3 = createEvmUrem128By64(Div3);
+  MInstruction *Div2 = createEvmUdiv128By64(Rem3, A[2], DivConst);
+  MInstruction *Rem2 = createEvmUrem128By64(Div2);
+  MInstruction *Div1 = createEvmUdiv128By64(Rem2, A[1], DivConst);
+  MInstruction *Rem1 = createEvmUrem128By64(Div1);
+  MInstruction *Div0 = createEvmUdiv128By64(Rem1, A[0], DivConst);
+  MInstruction *Rem0 = createEvmUrem128By64(Div0);
+
+  // MOD(x, d) with u64 divisor d: remainder < d <= 2^64-1, so it fits in u64.
+  U256Inst Result = {Rem0, Zero, Zero, Zero};
+  return Operand(Result, EVMType::UINT256, ValueRange::U64);
+}
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::handleDivU64Dividend(uint64_t Dividend,
+                                    const Operand &DivisorOp) {
+  MType *I64Type = &Ctx.I64Type;
+  MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+
+  U256Inst B = extractU256Operand(DivisorOp);
+
+  // If divisor has any upper limb set, b > a, so DIV = 0
+  MInstruction *Upper = createInstruction<BinaryInstruction>(
+      false, OP_or, I64Type, B[1],
+      createInstruction<BinaryInstruction>(false, OP_or, I64Type, B[2], B[3]));
+  MInstruction *HasUpper = createInstruction<CmpInstruction>(
+      false, CmpInstruction::ICMP_NE, &Ctx.I64Type, Upper, Zero);
+
+  // Guard B[0] against zero to prevent hardware divide-by-zero trap.
+  // EVM DIV(a, 0) = 0, but x86 DIV with zero divisor raises SIGFPE.
+  MInstruction *One = createIntConstInstruction(I64Type, 1);
+  MInstruction *IsB0Zero = createInstruction<CmpInstruction>(
+      false, CmpInstruction::ICMP_EQ, &Ctx.I64Type, B[0], Zero);
+  MInstruction *SafeB0 =
+      createInstruction<SelectInstruction>(false, I64Type, IsB0Zero, One, B[0]);
+
+  MInstruction *A0 = createIntConstInstruction(I64Type, Dividend);
+  MInstruction *Q64 =
+      createInstruction<BinaryInstruction>(false, OP_udiv, I64Type, A0, SafeB0);
+  // Chain two selects so lowerSelectExpr can fuse each CmpInstruction
+  // condition directly into CMP+CMOVcc, avoiding SETcc+OR+TEST overhead.
+  MInstruction *TmpResult =
+      createInstruction<SelectInstruction>(false, I64Type, IsB0Zero, Zero, Q64);
+  MInstruction *DivResult = createInstruction<SelectInstruction>(
+      false, I64Type, HasUpper, Zero, TmpResult);
+
+  // DIV(u64 dividend, x) <= the u64 dividend, so the quotient fits in u64.
+  U256Inst Result = {DivResult, Zero, Zero, Zero};
+  return Operand(Result, EVMType::UINT256, ValueRange::U64);
+}
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::handleModU64Dividend(uint64_t Dividend,
+                                    const Operand &DivisorOp) {
+  MType *I64Type = &Ctx.I64Type;
+  MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+
+  U256Inst B = extractU256Operand(DivisorOp);
+
+  MInstruction *Upper = createInstruction<BinaryInstruction>(
+      false, OP_or, I64Type, B[1],
+      createInstruction<BinaryInstruction>(false, OP_or, I64Type, B[2], B[3]));
+  MInstruction *HasUpper = createInstruction<CmpInstruction>(
+      false, CmpInstruction::ICMP_NE, &Ctx.I64Type, Upper, Zero);
+
+  // Guard B[0] against zero to prevent hardware divide-by-zero trap.
+  // EVM MOD(a, 0) = 0, but x86 DIV with zero divisor raises SIGFPE.
+  MInstruction *One = createIntConstInstruction(I64Type, 1);
+  MInstruction *IsB0Zero = createInstruction<CmpInstruction>(
+      false, CmpInstruction::ICMP_EQ, &Ctx.I64Type, B[0], Zero);
+  MInstruction *SafeB0 =
+      createInstruction<SelectInstruction>(false, I64Type, IsB0Zero, One, B[0]);
+
+  MInstruction *A0 = createIntConstInstruction(I64Type, Dividend);
+  MInstruction *R64 =
+      createInstruction<BinaryInstruction>(false, OP_urem, I64Type, A0, SafeB0);
+  // Chain two selects: IsB0Zero → 0 (div-by-zero), HasUpper → A0 (divisor >
+  // dividend)
+  MInstruction *TmpResult =
+      createInstruction<SelectInstruction>(false, I64Type, IsB0Zero, Zero, R64);
+  MInstruction *ModResult = createInstruction<SelectInstruction>(
+      false, I64Type, HasUpper, A0, TmpResult);
+
+  // MOD(u64 dividend, x) <= the u64 dividend, so the remainder fits in u64.
+  U256Inst Result = {ModResult, Zero, Zero, Zero};
+  return Operand(Result, EVMType::UINT256, ValueRange::U64);
+}
+
+typename EVMMirBuilder::Operand EVMMirBuilder::handleDivModGeneral(
+    const Operand &DividendOp, const Operand &DivisorOp, bool WantQuotient) {
+  MType *I64Type = &Ctx.I64Type;
+  MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+  MInstruction *One = createIntConstInstruction(I64Type, 1);
+
+  U256Inst A = extractU256Operand(DividendOp);
+  U256Inst B = extractU256Operand(DivisorOp);
+
+  // Materialize dividend limbs before branching.  The tree IR for A[i] may
+  // contain sub-expressions (e.g. cascading-division intermediates from a
+  // preceding MOD) that are also referenced inside SingleLimbBB.  Without
+  // materialisation the instruction-selection lowering can place the shared
+  // computations into only one branch, leaving the other branch with undefined
+  // virtual-register uses -- a miscompile observed as issue #525 (SHR after
+  // double MOD producing wrong shift counts).
+  for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+    A[I] = protectUnsafeValue(A[I], I64Type);
+  }
+
+  // Check if divisor upper limbs are all zero (runtime 1-limb divisor)
+  MInstruction *UpperOr = createInstruction<BinaryInstruction>(
+      false, OP_or, I64Type, B[1],
+      createInstruction<BinaryInstruction>(false, OP_or, I64Type, B[2], B[3]));
+  MInstruction *HasUpperLimbs = createInstruction<CmpInstruction>(
+      false, CmpInstruction::ICMP_NE, I64Type, UpperOr, Zero);
+
+  // Guard B[0] against zero to prevent hardware divide-by-zero trap.
+  // EVM DIV/MOD(a, 0) = 0, but x86 DIV with zero divisor raises SIGFPE.
+  // Replace zero divisor with 1 (harmless), then select result to 0 afterward.
+  MInstruction *IsB0Zero = createInstruction<CmpInstruction>(
+      false, CmpInstruction::ICMP_EQ, I64Type, B[0], Zero);
+  MInstruction *SafeB0 =
+      createInstruction<SelectInstruction>(false, I64Type, IsB0Zero, One, B[0]);
+
+  // Result variables for cross-BB communication
+  U256Var ResultVars = {};
+  for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+    ResultVars[I] = CurFunc->createVariable(I64Type);
+  }
+
+  auto storeResult = [&](const U256Inst &Values) {
+    for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+      createInstruction<DassignInstruction>(true, &(Ctx.VoidType), Values[I],
+                                            ResultVars[I]->getVarIdx());
+    }
+  };
+
+  auto loadResult = [&]() -> U256Inst {
+    U256Inst Values = {};
+    for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+      Values[I] = loadVariable(ResultVars[I]);
+    }
+    return Values;
+  };
+
+  // Branch structure (3-block, matches handleDiv pattern):
+  //   if (HasUpperLimbs) goto MultiLimbBB else goto SingleLimbBB
+  //   SingleLimbBB: inline cascading 128/64 div with SafeB0; goto AfterBB
+  //   MultiLimbBB: runtime call; goto AfterBB
+  //   AfterBB: load result
+  MBasicBlock *MultiLimbBB = createBasicBlock();
+  MBasicBlock *SingleLimbBB = createBasicBlock();
+  MBasicBlock *AfterBB = createBasicBlock();
+
+  createInstruction<BrIfInstruction>(true, Ctx, HasUpperLimbs, MultiLimbBB,
+                                     SingleLimbBB);
+  addSuccessor(MultiLimbBB);
+  addSuccessor(SingleLimbBB);
+
+  // --- SingleLimbBB: 1-limb divisor, cascading 128/64 division ---
+  // Uses SafeB0 (guaranteed non-zero) to avoid hardware DIV-by-zero.
+  // If B[0] was actually zero, IsB0Zero selects result to 0 afterward.
+  setInsertBlock(SingleLimbBB);
+  // Cascading: (0:A[3])/SafeB0, (R3:A[2])/SafeB0, ...
+  MInstruction *Div3 = createEvmUdiv128By64(Zero, A[3], SafeB0);
+  MInstruction *Rem3 = createEvmUrem128By64(Div3);
+  MInstruction *Div2 = createEvmUdiv128By64(Rem3, A[2], SafeB0);
+  MInstruction *Rem2 = createEvmUrem128By64(Div2);
+  MInstruction *Div1 = createEvmUdiv128By64(Rem2, A[1], SafeB0);
+  MInstruction *Rem1 = createEvmUrem128By64(Div1);
+  MInstruction *Div0 = createEvmUdiv128By64(Rem1, A[0], SafeB0);
+  MInstruction *Rem0 = createEvmUrem128By64(Div0);
+
+  if (WantQuotient) {
+    // Select each quotient limb to 0 when divisor was zero
+    U256Inst QuotResult = {createInstruction<SelectInstruction>(
+                               false, I64Type, IsB0Zero, Zero, Div0),
+                           createInstruction<SelectInstruction>(
+                               false, I64Type, IsB0Zero, Zero, Div1),
+                           createInstruction<SelectInstruction>(
+                               false, I64Type, IsB0Zero, Zero, Div2),
+                           createInstruction<SelectInstruction>(
+                               false, I64Type, IsB0Zero, Zero, Div3)};
+    storeResult(QuotResult);
+  } else {
+    // Select remainder to 0 when divisor was zero (only limb 0 matters)
+    U256Inst RemResult = {createInstruction<SelectInstruction>(
+                              false, I64Type, IsB0Zero, Zero, Rem0),
+                          Zero, Zero, Zero};
+    storeResult(RemResult);
+  }
+  createInstruction<BrInstruction>(true, Ctx, AfterBB);
+  addSuccessor(AfterBB);
+
+  // --- MultiLimbBB: multi-limb divisor, fall back to runtime ---
+  setInsertBlock(MultiLimbBB);
+  const auto &RuntimeFunctions = getRuntimeFunctionTable();
+  Operand RuntimeResult;
+  if (WantQuotient) {
+    RuntimeResult = callRuntimeFor<const intx::uint256 *, const intx::uint256 &,
+                                   const intx::uint256 &>(
+        RuntimeFunctions.GetDiv, DividendOp, DivisorOp);
+  } else {
+    RuntimeResult = callRuntimeFor<const intx::uint256 *, const intx::uint256 &,
+                                   const intx::uint256 &>(
+        RuntimeFunctions.GetMod, DividendOp, DivisorOp);
+  }
+  storeResult(extractU256Operand(RuntimeResult));
+  createInstruction<BrInstruction>(true, Ctx, AfterBB);
+  addSuccessor(AfterBB);
+
+  // --- AfterBB: merge results ---
+  setInsertBlock(AfterBB);
+  return Operand(loadResult(), EVMType::UINT256);
+}
+
 typename EVMMirBuilder::Operand EVMMirBuilder::handleMul(Operand MultiplicandOp,
                                                          Operand MultiplierOp) {
-  const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  return callRuntimeFor<const intx::uint256 *, const intx::uint256 &,
-                        const intx::uint256 &>(RuntimeFunctions.GetMul,
-                                               MultiplicandOp, MultiplierOp);
+  // Phase 0: Constant folding
+  if (MultiplicandOp.isConstant() && MultiplierOp.isConstant()) {
+    intx::uint256 A = u256ValueToIntx(MultiplicandOp.getConstValue());
+    intx::uint256 B = u256ValueToIntx(MultiplierOp.getConstValue());
+    return Operand(intxToU256Value(A * B));
+  }
+
+  if (MultiplicandOp.isZeroConstant() || MultiplierOp.isZeroConstant()) {
+    return Operand(U256Value{0, 0, 0, 0});
+  }
+
+  if (MultiplicandOp.isOneConstant()) {
+    return MultiplierOp;
+  }
+
+  if (MultiplierOp.isOneConstant()) {
+    return MultiplicandOp;
+  }
+
+  // Phase 1: Range-based u64×u64 → u128 fast path
+  // When both operands provably fit in u64, a single 64×64→128 multiply
+  // replaces the expensive 4×4 schoolbook multiplication.
+  if (Operand::bothFitU64(MultiplicandOp, MultiplierOp) &&
+      !MultiplicandOp.isConstant() && !MultiplierOp.isConstant()) {
+    U256Inst A = extractU256Operand(MultiplicandOp);
+    U256Inst B = extractU256Operand(MultiplierOp);
+    MType *I64Type = &Ctx.I64Type;
+    MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+    MInstruction *MulLo = createEvmUmul128(A[0], B[0]);
+    MInstruction *MulHi = createEvmUmul128Hi(MulLo);
+    U256Inst Result = {MulLo, MulHi, Zero, Zero};
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.MulFastRangeU64Count;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    return Operand(Result, EVMType::UINT256, ValueRange::U128);
+  }
+
+  // Phase 4: u64 fast path - one operand fits in u64 (4x1 multiplication)
+  bool AIsU64 = MultiplicandOp.isConstU64();
+  bool BIsU64 = MultiplierOp.isConstU64();
+  if (AIsU64 || BIsU64) {
+    const Operand &U256Op = AIsU64 ? MultiplierOp : MultiplicandOp;
+    const Operand &U64Op = AIsU64 ? MultiplicandOp : MultiplierOp;
+
+    U256Inst A = extractU256Operand(U256Op);
+    MType *I64Type = &Ctx.I64Type;
+    MInstruction *B0 =
+        createIntConstInstruction(I64Type, U64Op.getConstValue()[0]);
+    MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+
+    // 4x1 schoolbook: Result = A * B0 (truncated to 256 bits)
+    // P[i] = A[i] * B0, splitting into lo/hi 64-bit halves
+    MInstruction *PLo[4];
+    MInstruction *PHi[3];
+    for (size_t I = 0; I < 4; ++I) {
+      PLo[I] = createEvmUmul128(A[I], B0);
+      if (I < 3)
+        PHi[I] = createEvmUmul128Hi(PLo[I]);
+    }
+
+    using SumCarryPair = std::pair<MInstruction *, MInstruction *>;
+    auto addTermWithCarry = [&](MInstruction *Sum, MInstruction *Carry,
+                                MInstruction *Term) -> SumCarryPair {
+      MInstruction *NewSum = createInstruction<BinaryInstruction>(
+          false, OP_add, I64Type, Sum, Term);
+      MInstruction *NewCarry =
+          createInstruction<AdcInstruction>(false, I64Type, Carry, Zero, Zero);
+      return {protectUnsafeValue(NewSum, I64Type),
+              protectUnsafeValue(NewCarry, I64Type)};
+    };
+
+    auto addTermNoCarry = [&](MInstruction *Sum, MInstruction *Term) {
+      MInstruction *NewSum = createInstruction<BinaryInstruction>(
+          false, OP_add, I64Type, Sum, Term);
+      return protectUnsafeValue(NewSum, I64Type);
+    };
+
+    // R[0] = PLo[0]
+    MInstruction *R0 = PLo[0];
+
+    // R[1] = PHi[0] + PLo[1]
+    MInstruction *R1 = PHi[0];
+    MInstruction *C1 = Zero;
+    {
+      auto [S1, C1a] = addTermWithCarry(R1, C1, PLo[1]);
+      R1 = S1;
+      C1 = C1a;
+    }
+
+    // R[2] = PHi[1] + PLo[2] + C1
+    MInstruction *R2 = PHi[1];
+    MInstruction *C2 = Zero;
+    {
+      auto [S1, C2a] = addTermWithCarry(R2, C2, PLo[2]);
+      auto [S2, C2b] = addTermWithCarry(S1, C2a, C1);
+      R2 = S2;
+      C2 = C2b;
+    }
+
+    // R[3] = PHi[2] + PLo[3] + C2 (truncated, no carry out needed)
+    MInstruction *R3 = PHi[2];
+    R3 = addTermNoCarry(R3, PLo[3]);
+    R3 = addTermNoCarry(R3, C2);
+
+    // u64const * value: if the value fits in u64, the product is < 2^128;
+    // for a u128 value it can reach ~2^192, so only narrow in the u64 case.
+    const ValueRange ResultRange = Operand::widenOneTier(U256Op.getRange());
+    U256Inst Result = {R0, R1, R2, R3};
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.MulFastConstU64Count;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    return Operand(Result, EVMType::UINT256, ResultRange);
+  }
+
+  // General case: use EvmU256MulInstruction for full 4x4 multiplication
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  {
+    ValueRange RA = MultiplicandOp.getRange();
+    ValueRange RB = MultiplierOp.getRange();
+    if ((RA == ValueRange::U128 && RB <= ValueRange::U128) ||
+        (RB == ValueRange::U128 && RA <= ValueRange::U128)) {
+      ++MemStats.MulU128OpportunityCount;
+    }
+  }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  U256Inst A = extractU256Operand(MultiplicandOp);
+  U256Inst B = extractU256Operand(MultiplierOp);
+  MType *I64Type = &Ctx.I64Type;
+
+  MInstruction *MulInst = createInstruction<EvmU256MulInstruction>(
+      false, I64Type, A[0], A[1], A[2], A[3], B[0], B[1], B[2], B[3]);
+  U256Inst Result = {MulInst,
+                     createInstruction<EvmU256MulResultInstruction>(
+                         false, I64Type, MulInst, 1),
+                     createInstruction<EvmU256MulResultInstruction>(
+                         false, I64Type, MulInst, 2),
+                     createInstruction<EvmU256MulResultInstruction>(
+                         false, I64Type, MulInst, 3)};
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  ++MemStats.MulFullCount;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  return Operand(Result, EVMType::UINT256);
 }
 
 typename EVMMirBuilder::Operand EVMMirBuilder::handleDiv(Operand DividendOp,
                                                          Operand DivisorOp) {
-  const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  return callRuntimeFor<const intx::uint256 *, const intx::uint256 &,
-                        const intx::uint256 &>(RuntimeFunctions.GetDiv,
-                                               DividendOp, DivisorOp);
+  if (DividendOp.isConstant() && DivisorOp.isConstant()) {
+    intx::uint256 D = u256ValueToIntx(DivisorOp.getConstValue());
+    if (D == 0)
+      return Operand(U256Value{0, 0, 0, 0});
+    intx::uint256 N = u256ValueToIntx(DividendOp.getConstValue());
+    return Operand(intxToU256Value(N / D));
+  }
+
+  // DIV(x, 2^n) -> SHR(x, n)
+  if (DivisorOp.isConstant()) {
+    intx::uint256 D = u256ValueToIntx(DivisorOp.getConstValue());
+    if (D != 0 && (D & (D - 1)) == 0) {
+      unsigned ShiftAmt = 0;
+      intx::uint256 Tmp = D;
+      while (Tmp > 1) {
+        Tmp >>= 1;
+        ++ShiftAmt;
+      }
+      Operand ShiftOp(U256Value{ShiftAmt, 0, 0, 0});
+      return handleShift<BinaryOperator::BO_SHR_U>(ShiftOp, DividendOp);
+    }
+  }
+
+  // Range-based u64÷u64 fast path: single OP_udiv with div-by-zero guard.
+  // DIV(u64, u64) → u64 result.  Inserted before the isConstU64() path so
+  // that non-constant operands with proven narrow range benefit too.
+  if (Operand::bothFitU64(DividendOp, DivisorOp) && !DividendOp.isConstant() &&
+      !DivisorOp.isConstant()) {
+    U256Inst A = extractU256Operand(DividendOp);
+    U256Inst B = extractU256Operand(DivisorOp);
+    MType *I64Type = &Ctx.I64Type;
+    MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+    MInstruction *One = createIntConstInstruction(I64Type, 1);
+
+    // Guard against div-by-zero: EVM DIV(x, 0) = 0, but x86 traps
+    MInstruction *IsZero = createInstruction<CmpInstruction>(
+        false, CmpInstruction::ICMP_EQ, I64Type, B[0], Zero);
+    MInstruction *SafeB =
+        createInstruction<SelectInstruction>(false, I64Type, IsZero, One, B[0]);
+    MInstruction *Quotient = createInstruction<BinaryInstruction>(
+        false, OP_udiv, I64Type, A[0], SafeB);
+    MInstruction *DivResult = createInstruction<SelectInstruction>(
+        false, I64Type, IsZero, Zero, Quotient);
+
+    U256Inst Result = {DivResult, Zero, Zero, Zero};
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.DivFastRangeU64Count;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    return Operand(Result, EVMType::UINT256, ValueRange::U64);
+  }
+
+  // u64 divisor: inline cascading 128/64 division
+  if (DivisorOp.isConstU64()) {
+    uint64_t D = DivisorOp.getConstValue()[0];
+    if (D != 0) {
+      if (!DividendOp.isConstant()) {
+        U256Inst A = extractU256Operand(DividendOp);
+        MType *I64Type = &Ctx.I64Type;
+        MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+
+        MInstruction *UpperAny = createInstruction<BinaryInstruction>(
+            false, OP_or, I64Type, A[1],
+            createInstruction<BinaryInstruction>(false, OP_or, I64Type, A[2],
+                                                 A[3]));
+        MInstruction *HasUpper = createInstruction<CmpInstruction>(
+            false, CmpInstruction::ICMP_NE, I64Type, UpperAny, Zero);
+
+        U256Var ResultVars = {};
+        for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+          ResultVars[I] = CurFunc->createVariable(I64Type);
+        }
+
+        auto storeResult = [&](const U256Inst &Values) {
+          for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+            createInstruction<DassignInstruction>(
+                true, &(Ctx.VoidType), Values[I], ResultVars[I]->getVarIdx());
+          }
+        };
+
+        auto loadResult = [&]() -> U256Inst {
+          U256Inst Values = {};
+          for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+            Values[I] = loadVariable(ResultVars[I]);
+          }
+          return Values;
+        };
+
+        MBasicBlock *KnownU64BB = createBasicBlock();
+        MBasicBlock *SlowBB = createBasicBlock();
+        MBasicBlock *AfterBB = createBasicBlock();
+        createInstruction<BrIfInstruction>(true, Ctx, HasUpper, SlowBB,
+                                           KnownU64BB);
+        addSuccessor(SlowBB);
+        addSuccessor(KnownU64BB);
+
+        setInsertBlock(KnownU64BB);
+        MInstruction *DivConst = createIntConstInstruction(I64Type, D);
+        MInstruction *Quotient = createInstruction<BinaryInstruction>(
+            false, OP_udiv, I64Type, A[0], DivConst);
+        U256Inst FastResult = {Quotient, Zero, Zero, Zero};
+        storeResult(FastResult);
+        createInstruction<BrInstruction>(true, Ctx, AfterBB);
+        addSuccessor(AfterBB);
+
+        setInsertBlock(SlowBB);
+        U256Inst SlowResult =
+            extractU256Operand(handleDivU64Divisor(DividendOp, D));
+        storeResult(SlowResult);
+        createInstruction<BrInstruction>(true, Ctx, AfterBB);
+        addSuccessor(AfterBB);
+
+        setInsertBlock(AfterBB);
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+        ++MemStats.DivFastConstU64Count;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+       // DIV(x, d>=1) <= x, so the quotient fits wherever the dividend fits.
+        return Operand(loadResult(), EVMType::UINT256, DividendOp.getRange());
+      }
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+      ++MemStats.DivFastConstU64Count;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+      return handleDivU64Divisor(DividendOp, D);
+    }
+  }
+
+  // u64 dividend: OR-fold + select
+  if (DividendOp.isConstU64()) {
+    uint64_t A = DividendOp.getConstValue()[0];
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.DivFastConstU64Count;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    return handleDivU64Dividend(A, DivisorOp);
+  }
+
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  ++MemStats.DivFullCount;
+  {
+    ValueRange RA = DividendOp.getRange();
+    ValueRange RB = DivisorOp.getRange();
+    if ((RA == ValueRange::U128 && RB <= ValueRange::U128) ||
+        (RB == ValueRange::U128 && RA <= ValueRange::U128)) {
+      ++MemStats.DivU128OpportunityCount;
+    }
+  }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  return handleDivModGeneral(DividendOp, DivisorOp, /*WantQuotient=*/true);
 }
 
 typename EVMMirBuilder::Operand EVMMirBuilder::handleSDiv(Operand DividendOp,
                                                           Operand DivisorOp) {
+  if (DividendOp.isConstant() && DivisorOp.isConstant()) {
+    intx::uint256 D = u256ValueToIntx(DivisorOp.getConstValue());
+    if (D == 0)
+      return Operand(U256Value{0, 0, 0, 0});
+    intx::uint256 N = u256ValueToIntx(DividendOp.getConstValue());
+    auto Result = intx::sdivrem(N, D);
+    return Operand(intxToU256Value(Result.quot));
+  }
+
+  // u64 divisor (value fits in i63, so it's positive): use unsigned div + sign
+  if (DivisorOp.isConstU64()) {
+    uint64_t D = DivisorOp.getConstValue()[0];
+    if (D != 0 && D <= INT64_MAX) {
+      MType *I64Type = &Ctx.I64Type;
+      MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+      U256Inst A = extractU256Operand(DividendOp);
+      MInstruction *SignBit = createInstruction<CmpInstruction>(
+          false, CmpInstruction::ICMP_SLT, &Ctx.I64Type, A[3], Zero);
+      Operand NegA = handleNot(DividendOp);
+      Operand AbsDividend =
+          handleAddU64Const(NegA, Operand(U256Value{1, 0, 0, 0}));
+      U256Inst AbsInst = extractU256Operand(AbsDividend);
+      U256Inst SelA;
+      for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+        SelA[I] = createInstruction<SelectInstruction>(false, I64Type, SignBit,
+                                                       AbsInst[I], A[I]);
+      }
+      Operand AbsOp(SelA, EVMType::UINT256);
+      Operand UnsignedResult = handleDivU64Divisor(AbsOp, D);
+      Operand NegResult = handleNot(UnsignedResult);
+      Operand NegResult1 =
+          handleAddU64Const(NegResult, Operand(U256Value{1, 0, 0, 0}));
+      U256Inst URes = extractU256Operand(UnsignedResult);
+      U256Inst NRes = extractU256Operand(NegResult1);
+      U256Inst FinalInst;
+      for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+        FinalInst[I] = createInstruction<SelectInstruction>(
+            false, I64Type, SignBit, NRes[I], URes[I]);
+      }
+      return Operand(FinalInst, EVMType::UINT256);
+    }
+  }
+
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
   return callRuntimeFor<const intx::uint256 *, const intx::uint256 &,
                         const intx::uint256 &>(RuntimeFunctions.GetSDiv,
@@ -1103,14 +2293,129 @@ typename EVMMirBuilder::Operand EVMMirBuilder::handleSDiv(Operand DividendOp,
 
 typename EVMMirBuilder::Operand EVMMirBuilder::handleMod(Operand DividendOp,
                                                          Operand DivisorOp) {
-  const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  return callRuntimeFor<const intx::uint256 *, const intx::uint256 &,
-                        const intx::uint256 &>(RuntimeFunctions.GetMod,
-                                               DividendOp, DivisorOp);
+  if (DividendOp.isConstant() && DivisorOp.isConstant()) {
+    intx::uint256 D = u256ValueToIntx(DivisorOp.getConstValue());
+    if (D == 0)
+      return Operand(U256Value{0, 0, 0, 0});
+    intx::uint256 N = u256ValueToIntx(DividendOp.getConstValue());
+    return Operand(intxToU256Value(N % D));
+  }
+
+  // MOD(x, 2^n) -> AND(x, 2^n - 1)
+  if (DivisorOp.isConstant()) {
+    intx::uint256 D = u256ValueToIntx(DivisorOp.getConstValue());
+    if (D != 0 && (D & (D - 1)) == 0) {
+      Operand MaskOp(intxToU256Value(D - 1));
+      return handleBitwiseOp<BinaryOperator::BO_AND>(DividendOp, MaskOp);
+    }
+  }
+
+  // Range-based u64%u64 fast path: single OP_urem with div-by-zero guard.
+  // MOD(u64, u64) → u64 result (remainder < divisor).
+  if (Operand::bothFitU64(DividendOp, DivisorOp) && !DividendOp.isConstant() &&
+      !DivisorOp.isConstant()) {
+    U256Inst A = extractU256Operand(DividendOp);
+    U256Inst B = extractU256Operand(DivisorOp);
+    MType *I64Type = &Ctx.I64Type;
+    MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+    MInstruction *One = createIntConstInstruction(I64Type, 1);
+
+    // Guard against div-by-zero: EVM MOD(x, 0) = 0
+    MInstruction *IsZero = createInstruction<CmpInstruction>(
+        false, CmpInstruction::ICMP_EQ, I64Type, B[0], Zero);
+    MInstruction *SafeB =
+        createInstruction<SelectInstruction>(false, I64Type, IsZero, One, B[0]);
+    MInstruction *Remainder = createInstruction<BinaryInstruction>(
+        false, OP_urem, I64Type, A[0], SafeB);
+    MInstruction *ModResult = createInstruction<SelectInstruction>(
+        false, I64Type, IsZero, Zero, Remainder);
+
+    U256Inst Result = {ModResult, Zero, Zero, Zero};
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.ModFastRangeU64Count;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    return Operand(Result, EVMType::UINT256, ValueRange::U64);
+  }
+
+  // u64 divisor: inline cascading 128/64 mod
+  if (DivisorOp.isConstU64()) {
+    uint64_t D = DivisorOp.getConstValue()[0];
+    if (D != 0) {
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+      ++MemStats.ModFastConstU64Count;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+      return handleModU64Divisor(DividendOp, D);
+    }
+  }
+
+  // u64 dividend: OR-fold + select
+  if (DividendOp.isConstU64()) {
+    uint64_t A = DividendOp.getConstValue()[0];
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.ModFastConstU64Count;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    return handleModU64Dividend(A, DivisorOp);
+  }
+
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  ++MemStats.ModFullCount;
+  {
+    ValueRange RA = DividendOp.getRange();
+    ValueRange RB = DivisorOp.getRange();
+    if ((RA == ValueRange::U128 && RB <= ValueRange::U128) ||
+        (RB == ValueRange::U128 && RA <= ValueRange::U128)) {
+      ++MemStats.ModU128OpportunityCount;
+    }
+  }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  return handleDivModGeneral(DividendOp, DivisorOp, /*WantQuotient=*/false);
 }
 
 typename EVMMirBuilder::Operand EVMMirBuilder::handleSMod(Operand DividendOp,
                                                           Operand DivisorOp) {
+  if (DividendOp.isConstant() && DivisorOp.isConstant()) {
+    intx::uint256 D = u256ValueToIntx(DivisorOp.getConstValue());
+    if (D == 0)
+      return Operand(U256Value{0, 0, 0, 0});
+    intx::uint256 N = u256ValueToIntx(DividendOp.getConstValue());
+    auto Result = intx::sdivrem(N, D);
+    return Operand(intxToU256Value(Result.rem));
+  }
+
+  // u64 divisor (fits in i63): sign of result = sign of dividend
+  if (DivisorOp.isConstU64()) {
+    uint64_t D = DivisorOp.getConstValue()[0];
+    if (D != 0 && D <= INT64_MAX) {
+      MType *I64Type = &Ctx.I64Type;
+      MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+      U256Inst A = extractU256Operand(DividendOp);
+      MInstruction *SignBit = createInstruction<CmpInstruction>(
+          false, CmpInstruction::ICMP_SLT, &Ctx.I64Type, A[3], Zero);
+      Operand NegA = handleNot(DividendOp);
+      Operand AbsDividend =
+          handleAddU64Const(NegA, Operand(U256Value{1, 0, 0, 0}));
+      U256Inst AbsInst = extractU256Operand(AbsDividend);
+      U256Inst SelA;
+      for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+        SelA[I] = createInstruction<SelectInstruction>(false, I64Type, SignBit,
+                                                       AbsInst[I], A[I]);
+      }
+      Operand AbsOp(SelA, EVMType::UINT256);
+      Operand UnsignedResult = handleModU64Divisor(AbsOp, D);
+      Operand NegResult = handleNot(UnsignedResult);
+      Operand NegResult1 =
+          handleAddU64Const(NegResult, Operand(U256Value{1, 0, 0, 0}));
+      U256Inst URes = extractU256Operand(UnsignedResult);
+      U256Inst NRes = extractU256Operand(NegResult1);
+      U256Inst FinalInst;
+      for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+        FinalInst[I] = createInstruction<SelectInstruction>(
+            false, I64Type, SignBit, NRes[I], URes[I]);
+      }
+      return Operand(FinalInst, EVMType::UINT256);
+    }
+  }
+
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
   return callRuntimeFor<const intx::uint256 *, const intx::uint256 &,
                         const intx::uint256 &>(RuntimeFunctions.GetSMod,
@@ -1120,31 +2425,519 @@ typename EVMMirBuilder::Operand EVMMirBuilder::handleSMod(Operand DividendOp,
 typename EVMMirBuilder::Operand EVMMirBuilder::handleAddMod(Operand AugendOp,
                                                             Operand AddendOp,
                                                             Operand ModulusOp) {
-  const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  return callRuntimeFor<const intx::uint256 *, const intx::uint256 &,
-                        const intx::uint256 &, const intx::uint256 &>(
-      RuntimeFunctions.GetAddMod, AugendOp, AddendOp, ModulusOp);
+  if (AugendOp.isConstant() && AddendOp.isConstant() &&
+      ModulusOp.isConstant()) {
+    intx::uint256 M = u256ValueToIntx(ModulusOp.getConstValue());
+    if (M == 0)
+      return Operand(U256Value{0, 0, 0, 0});
+    intx::uint512 Sum =
+        intx::uint512(u256ValueToIntx(AugendOp.getConstValue())) +
+        intx::uint512(u256ValueToIntx(AddendOp.getConstValue()));
+    intx::uint256 Result = intx::uint256(Sum % M);
+    return Operand(intxToU256Value(Result));
+  }
+
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+
+  U256Inst Augend = extractU256Operand(AugendOp);
+  U256Inst Addend = extractU256Operand(AddendOp);
+  U256Inst Modulus = extractU256Operand(ModulusOp);
+
+  // Fast-path eligibility: mod[3] != 0 && x[3] <= mod[3] && y[3] <= mod[3].
+  // Invariant established: x < 2*mod and y < 2*mod, so a single conditional
+  // subtraction is sufficient to normalize each operand into [0, mod).
+  // Proof: x < (x[3]+1)*2^192 <= (mod[3]+1)*2^192 <= 2*mod[3]*2^192 <= 2*mod,
+  // where the last two steps use mod[3] >= 1. Any weaker check (e.g. dropping
+  // the high-limb bound) breaks this invariant and the fast path.
+  // The mod == 0 case is routed to the runtime slow path, which returns 0.
+  MInstruction *ModHi = Modulus[3];
+  MInstruction *ModHiNonZero = createInstruction<CmpInstruction>(
+      false, CmpInstruction::ICMP_NE, I64Type, ModHi, Zero);
+  MInstruction *AugendHiLE = createInstruction<CmpInstruction>(
+      false, CmpInstruction::ICMP_ULE, I64Type, Augend[3], ModHi);
+  MInstruction *AddendHiLE = createInstruction<CmpInstruction>(
+      false, CmpInstruction::ICMP_ULE, I64Type, Addend[3], ModHi);
+
+  // FastEligible = ModHiNonZero && AugendHiLE && AddendHiLE
+  MInstruction *FastEligible = createInstruction<BinaryInstruction>(
+      false, OP_and, I64Type, ModHiNonZero, AugendHiLE);
+  FastEligible = createInstruction<BinaryInstruction>(false, OP_and, I64Type,
+                                                      FastEligible, AddendHiLE);
+
+  // Cascaded u256 unsigned LT: returns i64 {0,1} for A < B, high limb first.
+  auto u256UnsignedLT = [&](const U256Inst &A, const U256Inst &B) {
+    MInstruction *CmpResult = nullptr;
+    MInstruction *AllEqual = nullptr;
+    for (int I = EVM_ELEMENTS_COUNT - 1; I >= 0; --I) {
+      MInstruction *LT = createInstruction<CmpInstruction>(
+          false, CmpInstruction::ICMP_ULT, I64Type, A[I], B[I]);
+      MInstruction *EQ = createInstruction<CmpInstruction>(
+          false, CmpInstruction::ICMP_EQ, I64Type, A[I], B[I]);
+      if (CmpResult == nullptr) {
+        CmpResult = LT;
+        AllEqual = EQ;
+      } else {
+        CmpResult = createInstruction<SelectInstruction>(
+            false, I64Type, AllEqual, LT, CmpResult);
+        AllEqual = createInstruction<BinaryInstruction>(false, OP_and, I64Type,
+                                                        AllEqual, EQ);
+      }
+    }
+    return CmpResult;
+  };
+
+  // Prepare result variables
+  U256Var ResultVars = {};
+  for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+    ResultVars[I] = CurFunc->createVariable(I64Type);
+  }
+
+  auto storeResult = [&](const U256Inst &Values) {
+    for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+      createInstruction<DassignInstruction>(true, &(Ctx.VoidType), Values[I],
+                                            ResultVars[I]->getVarIdx());
+    }
+  };
+
+  auto loadResult = [&]() -> U256Inst {
+    U256Inst Values = {};
+    for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+      Values[I] = loadVariable(ResultVars[I]);
+    }
+    return Values;
+  };
+
+  // Branch: FastEligible ? FastBB : SlowBB
+  MBasicBlock *FastBB = createBasicBlock();
+  MBasicBlock *SlowBB = createBasicBlock();
+  MBasicBlock *AfterBB = createBasicBlock();
+  createInstruction<BrIfInstruction>(true, Ctx, FastEligible, FastBB, SlowBB);
+  addSuccessor(FastBB);
+  addSuccessor(SlowBB);
+
+  // === Fast path (inline addmod) ===
+  setInsertBlock(FastBB);
+  {
+    // Step 1: Normalize augend — if augend >= mod, use augend - mod
+    MInstruction *AugLtMod = u256UnsignedLT(Augend, Modulus);
+
+    // Compute augend - mod (u256 SUB chain)
+    Operand AugSubMod =
+        handleBinaryArithmetic<BinaryOperator::BO_SUB>(AugendOp, ModulusOp);
+    U256Inst AugDiff = extractU256Operand(AugSubMod);
+
+    // NormAugend = AugLtMod ? Augend : AugDiff  (if augend < mod, keep augend)
+    U256Inst NormAugend = {};
+    for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+      NormAugend[I] = createInstruction<SelectInstruction>(
+          false, I64Type, AugLtMod, Augend[I], AugDiff[I]);
+    }
+
+    // Step 2: Normalize addend — if addend >= mod, use addend - mod
+    MInstruction *AddLtMod = u256UnsignedLT(Addend, Modulus);
+
+    Operand AddSubMod =
+        handleBinaryArithmetic<BinaryOperator::BO_SUB>(AddendOp, ModulusOp);
+    U256Inst AddDiff = extractU256Operand(AddSubMod);
+
+    // NormAddend = AddLtMod ? Addend : AddDiff
+    U256Inst NormAddend = {};
+    for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+      NormAddend[I] = createInstruction<SelectInstruction>(
+          false, I64Type, AddLtMod, Addend[I], AddDiff[I]);
+    }
+
+    // Step 3: Sum = NormAugend + NormAddend (u256 ADD chain)
+    Operand NormAugendOp(NormAugend, EVMType::UINT256);
+    Operand NormAddendOp(NormAddend, EVMType::UINT256);
+    Operand SumOp = handleBinaryArithmetic<BinaryOperator::BO_ADD>(
+        NormAugendOp, NormAddendOp);
+    U256Inst Sum = extractU256Operand(SumOp);
+
+    // Detect overflow: sum < NormAugend (unsigned comparison)
+    MInstruction *Overflow = u256UnsignedLT(Sum, NormAugend);
+
+    // Step 4: SumSubMod = Sum - Mod (u256 SUB chain)
+    Operand ModulusOpLocal(Modulus, EVMType::UINT256);
+    Operand SumSubModOp =
+        handleBinaryArithmetic<BinaryOperator::BO_SUB>(SumOp, ModulusOpLocal);
+    U256Inst SumSubMod = extractU256Operand(SumSubModOp);
+
+    // Detect borrow: Sum < Mod
+    MInstruction *SumLtMod = u256UnsignedLT(Sum, Modulus);
+
+    // Result selection: if (overflow || !borrow) use SumSubMod, else Sum
+    // !borrow means Sum >= Mod, i.e., !SumLtMod
+    // overflow || !SumLtMod  =>  use SumSubMod
+    //
+    // Equivalently: use Sum only when (!overflow && SumLtMod)
+    // UseSumSubMod = Overflow || !SumLtMod
+    // Since SumLtMod is 0 or 1:  !SumLtMod = (SumLtMod == 0)
+    MInstruction *One = createIntConstInstruction(I64Type, 1);
+    MInstruction *NotBorrow = createInstruction<BinaryInstruction>(
+        false, OP_xor, I64Type, SumLtMod, One);
+    MInstruction *UseSumSubMod = createInstruction<BinaryInstruction>(
+        false, OP_or, I64Type, Overflow, NotBorrow);
+
+    U256Inst FastResult = {};
+    for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+      FastResult[I] = createInstruction<SelectInstruction>(
+          false, I64Type, UseSumSubMod, SumSubMod[I], Sum[I]);
+    }
+
+    storeResult(FastResult);
+    createInstruction<BrInstruction>(true, Ctx, AfterBB);
+    addSuccessor(AfterBB);
+  }
+
+  // === Slow path (runtime call, handles mod == 0 and small moduli) ===
+  setInsertBlock(SlowBB);
+  {
+    // Runtime handles all cases including mod == 0.
+    const auto &RuntimeFunctions = getRuntimeFunctionTable();
+    U256Inst SlowResult = extractU256Operand(
+        callRuntimeFor<const intx::uint256 *, const intx::uint256 &,
+                       const intx::uint256 &, const intx::uint256 &>(
+            RuntimeFunctions.GetAddMod, AugendOp, AddendOp, ModulusOp));
+    storeResult(SlowResult);
+    createInstruction<BrInstruction>(true, Ctx, AfterBB);
+    addSuccessor(AfterBB);
+  }
+
+  // === After block: load result ===
+  // ADDMOD(a, b, N) < N (or 0 when N == 0), so the result fits wherever the
+  // modulus operand fits.
+  setInsertBlock(AfterBB);
+  return Operand(loadResult(), EVMType::UINT256, ModulusOp.getRange());
 }
 
 typename EVMMirBuilder::Operand
 EVMMirBuilder::handleMulMod(Operand MultiplicandOp, Operand MultiplierOp,
                             Operand ModulusOp) {
+  if (MultiplicandOp.isConstant() && MultiplierOp.isConstant() &&
+      ModulusOp.isConstant()) {
+    intx::uint256 M = u256ValueToIntx(ModulusOp.getConstValue());
+    if (M == 0)
+      return Operand(U256Value{0, 0, 0, 0});
+    intx::uint512 Product =
+        intx::uint512(u256ValueToIntx(MultiplicandOp.getConstValue())) *
+        intx::uint512(u256ValueToIntx(MultiplierOp.getConstValue()));
+    intx::uint256 Result = intx::uint256(Product % M);
+    return Operand(intxToU256Value(Result));
+  }
+
+  // MULMOD(a, b, N) < N (or 0 when N == 0), so the result fits wherever the
+  // modulus operand fits.
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  return callRuntimeFor<const intx::uint256 *, const intx::uint256 &,
-                        const intx::uint256 &, const intx::uint256 &>(
+  Operand Result = callRuntimeFor<const intx::uint256 *, const intx::uint256 &,
+                                  const intx::uint256 &, const intx::uint256 &>(
       RuntimeFunctions.GetMulMod, MultiplicandOp, MultiplierOp, ModulusOp);
+  Result.setRange(ModulusOp.getRange());
+  return Result;
+}
+
+uint64_t EVMMirBuilder::constExpDynamicGas(const intx::uint256 &Exponent,
+                                           evmc_revision Rev) {
+  // EIP-160 dynamic gas for EXP: GasPerByte * number of significant bytes of
+  // the exponent.  Uses the same intx::count_significant_bytes helper as the
+  // runtime EXP gas path (evm_imported.cpp) so the const-fold and runtime
+  // charges cannot diverge.
+  const uint64_t GasPerByte = Rev < EVMC_SPURIOUS_DRAGON
+                                  ? zen::evm::EXP_BYTE_GAS_PRE_SPURIOUS_DRAGON
+                                  : zen::evm::EXP_BYTE_GAS;
+  return intx::count_significant_bytes(Exponent) * GasPerByte;
 }
 
 typename EVMMirBuilder::Operand EVMMirBuilder::handleExp(Operand BaseOp,
                                                          Operand ExponentOp) {
-  const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  return callRuntimeFor<const intx::uint256 *, const intx::uint256 &,
-                        const intx::uint256 &>(RuntimeFunctions.GetExp, BaseOp,
-                                               ExponentOp);
+  // Constant folding: both base and exponent known at compile time.
+  // EVM EXP is base ** exponent mod 2^256, which intx::exp computes directly,
+  // avoiding the inline square-and-multiply loop for compile-time constants
+  // (e.g. 10 ** 18, 2 ** 96 masks pervasive in Solidity).  The EIP-160 dynamic
+  // gas (GasPerByte * exponent-byte-size) must still be charged here, since the
+  // exponent magnitude is observable in the gas cost.
+  if (BaseOp.isConstant() && ExponentOp.isConstant()) {
+    MType *FoldI64Type =
+        EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+    const intx::uint256 Base = u256ValueToIntx(BaseOp.getConstValue());
+    const intx::uint256 Exponent = u256ValueToIntx(ExponentOp.getConstValue());
+    chargeDynamicGasIR(createIntConstInstruction(
+        FoldI64Type, constExpDynamicGas(Exponent, Ctx.getRevision())));
+    return Operand(intxToU256Value(intx::exp(Base, Exponent)));
+  }
+
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+  MInstruction *One = createIntConstInstruction(I64Type, 1);
+  MInstruction *Const3 = createIntConstInstruction(I64Type, 3);
+  MInstruction *Const2 = createIntConstInstruction(I64Type, 2);
+  MInstruction *Const8 = createIntConstInstruction(I64Type, 8);
+
+  U256Inst Base = extractU256Operand(BaseOp);
+  U256Inst Exponent = extractU256Operand(ExponentOp);
+
+  auto loadU256Vars = [&](const U256Var &Vars) -> U256Inst {
+    U256Inst Result = {};
+    for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+      Result[I] = loadVariable(Vars[I]);
+    }
+    return Result;
+  };
+
+  auto storeU256Vars = [&](const U256Inst &Values, const U256Var &Vars) {
+    for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+      createInstruction<DassignInstruction>(true, &(Ctx.VoidType), Values[I],
+                                            Vars[I]->getVarIdx());
+    }
+  };
+
+  // Calculate exponent byte size for dynamic gas (EIP-160)
+  auto computeExpByteSize = [&]() -> MInstruction * {
+    MInstruction *Any01 = createInstruction<BinaryInstruction>(
+        false, OP_or, I64Type, Exponent[0], Exponent[1]);
+    MInstruction *Any23 = createInstruction<BinaryInstruction>(
+        false, OP_or, I64Type, Exponent[2], Exponent[3]);
+    MInstruction *Any = createInstruction<BinaryInstruction>(
+        false, OP_or, I64Type, Any01, Any23);
+    MInstruction *IsZero = createInstruction<CmpInstruction>(
+        false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, Any, Zero);
+
+    MInstruction *Has3 = createInstruction<CmpInstruction>(
+        false, CmpInstruction::Predicate::ICMP_NE, &Ctx.I64Type, Exponent[3],
+        Zero);
+    MInstruction *Has2 = createInstruction<CmpInstruction>(
+        false, CmpInstruction::Predicate::ICMP_NE, &Ctx.I64Type, Exponent[2],
+        Zero);
+    MInstruction *Has1 = createInstruction<CmpInstruction>(
+        false, CmpInstruction::Predicate::ICMP_NE, &Ctx.I64Type, Exponent[1],
+        Zero);
+
+    MInstruction *Idx1 =
+        createInstruction<SelectInstruction>(false, I64Type, Has1, One, Zero);
+    MInstruction *Idx2 = createInstruction<SelectInstruction>(
+        false, I64Type, Has2, Const2, Idx1);
+    MInstruction *Idx = createInstruction<SelectInstruction>(
+        false, I64Type, Has3, Const3, Idx2);
+
+    MInstruction *Limb1 = createInstruction<SelectInstruction>(
+        false, I64Type, Has1, Exponent[1], Exponent[0]);
+    MInstruction *Limb2 = createInstruction<SelectInstruction>(
+        false, I64Type, Has2, Exponent[2], Limb1);
+    MInstruction *Limb = createInstruction<SelectInstruction>(
+        false, I64Type, Has3, Exponent[3], Limb2);
+
+    // Avoid clz(0) undefined behavior by forcing at least one bit set.
+    MInstruction *SafeLimb =
+        createInstruction<BinaryInstruction>(false, OP_or, I64Type, Limb, One);
+    MInstruction *Clz =
+        createInstruction<UnaryInstruction>(false, OP_clz, I64Type, SafeLimb);
+    MInstruction *ClzBytes = createInstruction<BinaryInstruction>(
+        false, OP_ushr, I64Type, Clz, Const3);
+    MInstruction *SigBytes = createInstruction<BinaryInstruction>(
+        false, OP_sub, I64Type, Const8, ClzBytes);
+    MInstruction *IdxBytes = createInstruction<BinaryInstruction>(
+        false, OP_mul, I64Type, Idx, Const8);
+    MInstruction *TotalBytes = createInstruction<BinaryInstruction>(
+        false, OP_add, I64Type, SigBytes, IdxBytes);
+
+    return createInstruction<SelectInstruction>(false, I64Type, IsZero, Zero,
+                                                TotalBytes);
+  };
+
+  const uint64_t GasPerByte = Ctx.getRevision() < EVMC_SPURIOUS_DRAGON
+                                  ? zen::evm::EXP_BYTE_GAS_PRE_SPURIOUS_DRAGON
+                                  : zen::evm::EXP_BYTE_GAS;
+  MInstruction *ExpByteSize = computeExpByteSize();
+  MInstruction *GasPerByteConst =
+      createIntConstInstruction(I64Type, GasPerByte);
+  MInstruction *ExpGas = createInstruction<BinaryInstruction>(
+      false, OP_mul, I64Type, ExpByteSize, GasPerByteConst);
+  chargeDynamicGasIR(ExpGas);
+
+  // Initialize loop variables
+  U256Var BaseVars = {};
+  U256Var ExpVars = {};
+  U256Var ResultVars = {};
+  Operand ResultInit = createU256ConstOperand(intx::uint256{1});
+  U256Inst ResultInitComponents = ResultInit.getU256Components();
+
+  for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+    BaseVars[I] = CurFunc->createVariable(I64Type);
+    ExpVars[I] = CurFunc->createVariable(I64Type);
+    ResultVars[I] = CurFunc->createVariable(I64Type);
+    createInstruction<DassignInstruction>(true, &(Ctx.VoidType), Base[I],
+                                          BaseVars[I]->getVarIdx());
+    createInstruction<DassignInstruction>(true, &(Ctx.VoidType), Exponent[I],
+                                          ExpVars[I]->getVarIdx());
+    createInstruction<DassignInstruction>(true, &(Ctx.VoidType),
+                                          ResultInitComponents[I],
+                                          ResultVars[I]->getVarIdx());
+  }
+
+  Variable *Exp64Var = CurFunc->createVariable(I64Type);
+  createInstruction<DassignInstruction>(true, &(Ctx.VoidType), Exponent[0],
+                                        Exp64Var->getVarIdx());
+
+  Operand ShiftOne = createU256ConstOperand(intx::uint256{1});
+
+  MInstruction *High01 = createInstruction<BinaryInstruction>(
+      false, OP_or, I64Type, Exponent[1], Exponent[2]);
+  MInstruction *HighAny = createInstruction<BinaryInstruction>(
+      false, OP_or, I64Type, High01, Exponent[3]);
+  MInstruction *HasHigh = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_NE, &Ctx.I64Type, HighAny, Zero);
+
+  MBasicBlock *FastCondBB = createBasicBlock();
+  MBasicBlock *SlowCondBB = createBasicBlock();
+  MBasicBlock *AfterBB = createBasicBlock();
+  createInstruction<BrIfInstruction>(true, Ctx, HasHigh, SlowCondBB,
+                                     FastCondBB);
+  addSuccessor(SlowCondBB);
+  addSuccessor(FastCondBB);
+
+  // Fast path: 64-bit exponent loop when high limbs are zero.
+  MBasicBlock *FastBodyBB = createBasicBlock();
+  MBasicBlock *FastOddBB = createBasicBlock();
+  MBasicBlock *FastEvenBB = createBasicBlock();
+  MBasicBlock *FastContinueBB = createBasicBlock();
+  MBasicBlock *FastBaseBB = createBasicBlock();
+
+  setInsertBlock(FastCondBB);
+  MInstruction *Exp64 = loadVariable(Exp64Var);
+  MInstruction *FastIsNonZero = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_NE, &Ctx.I64Type, Exp64, Zero);
+  createInstruction<BrIfInstruction>(true, Ctx, FastIsNonZero, FastBodyBB,
+                                     AfterBB);
+  addSuccessor(FastBodyBB);
+  addSuccessor(AfterBB);
+
+  setInsertBlock(FastBodyBB);
+  U256Inst FastBaseCur = loadU256Vars(BaseVars);
+  Operand FastBaseOpCur(FastBaseCur, EVMType::UINT256);
+  MInstruction *FastLsb =
+      createInstruction<BinaryInstruction>(false, OP_and, I64Type, Exp64, One);
+  MInstruction *FastIsOdd = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_NE, &Ctx.I64Type, FastLsb, Zero);
+  createInstruction<BrIfInstruction>(true, Ctx, FastIsOdd, FastOddBB,
+                                     FastEvenBB);
+  addSuccessor(FastOddBB);
+  addSuccessor(FastEvenBB);
+
+  setInsertBlock(FastOddBB);
+  U256Inst FastResultCur = loadU256Vars(ResultVars);
+  Operand FastResultOp(FastResultCur, EVMType::UINT256);
+  Operand FastMulResOp = handleMul(FastResultOp, FastBaseOpCur);
+  U256Inst FastMulRes = extractU256Operand(FastMulResOp);
+  storeU256Vars(FastMulRes, ResultVars);
+  createInstruction<BrInstruction>(true, Ctx, FastContinueBB);
+  addSuccessor(FastContinueBB);
+
+  setInsertBlock(FastEvenBB);
+  createInstruction<BrInstruction>(true, Ctx, FastContinueBB);
+  addSuccessor(FastContinueBB);
+
+  setInsertBlock(FastContinueBB);
+  MInstruction *FastShifted =
+      createInstruction<BinaryInstruction>(false, OP_ushr, I64Type, Exp64, One);
+  MInstruction *FastShiftZero = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, FastShifted,
+      Zero);
+  createInstruction<BrIfInstruction>(true, Ctx, FastShiftZero, AfterBB,
+                                     FastBaseBB);
+  addSuccessor(AfterBB);
+  addSuccessor(FastBaseBB);
+
+  setInsertBlock(FastBaseBB);
+  createInstruction<DassignInstruction>(true, &(Ctx.VoidType), FastShifted,
+                                        Exp64Var->getVarIdx());
+  Operand FastBaseSquaredOp = handleMul(FastBaseOpCur, FastBaseOpCur);
+  U256Inst FastBaseSquared = extractU256Operand(FastBaseSquaredOp);
+  storeU256Vars(FastBaseSquared, BaseVars);
+  createInstruction<BrInstruction>(true, Ctx, FastCondBB);
+  addSuccessor(FastCondBB);
+
+  // Slow path: full 256-bit exponent loop.
+  MBasicBlock *SlowBodyBB = createBasicBlock();
+  MBasicBlock *SlowOddBB = createBasicBlock();
+  MBasicBlock *SlowEvenBB = createBasicBlock();
+  MBasicBlock *SlowContinueBB = createBasicBlock();
+  MBasicBlock *SlowBaseBB = createBasicBlock();
+
+  setInsertBlock(SlowCondBB);
+  U256Inst ExpCond = loadU256Vars(ExpVars);
+  MInstruction *SlowAny01 = createInstruction<BinaryInstruction>(
+      false, OP_or, I64Type, ExpCond[0], ExpCond[1]);
+  MInstruction *SlowAny23 = createInstruction<BinaryInstruction>(
+      false, OP_or, I64Type, ExpCond[2], ExpCond[3]);
+  MInstruction *SlowAny = createInstruction<BinaryInstruction>(
+      false, OP_or, I64Type, SlowAny01, SlowAny23);
+  MInstruction *SlowIsNonZero = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_NE, &Ctx.I64Type, SlowAny, Zero);
+  createInstruction<BrIfInstruction>(true, Ctx, SlowIsNonZero, SlowBodyBB,
+                                     AfterBB);
+  addSuccessor(SlowBodyBB);
+  addSuccessor(AfterBB);
+
+  setInsertBlock(SlowBodyBB);
+  U256Inst ExpCur = loadU256Vars(ExpVars);
+  U256Inst BaseCur = loadU256Vars(BaseVars);
+  Operand BaseOpCur(BaseCur, EVMType::UINT256);
+
+  MInstruction *Lsb = createInstruction<BinaryInstruction>(
+      false, OP_and, I64Type, ExpCur[0], One);
+  MInstruction *IsOdd = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_NE, &Ctx.I64Type, Lsb, Zero);
+  createInstruction<BrIfInstruction>(true, Ctx, IsOdd, SlowOddBB, SlowEvenBB);
+  addSuccessor(SlowOddBB);
+  addSuccessor(SlowEvenBB);
+
+  setInsertBlock(SlowOddBB);
+  U256Inst ResultCur = loadU256Vars(ResultVars);
+  Operand ResultOp(ResultCur, EVMType::UINT256);
+  Operand MulResOp = handleMul(ResultOp, BaseOpCur);
+  U256Inst MulRes = extractU256Operand(MulResOp);
+  storeU256Vars(MulRes, ResultVars);
+  createInstruction<BrInstruction>(true, Ctx, SlowContinueBB);
+  addSuccessor(SlowContinueBB);
+
+  setInsertBlock(SlowEvenBB);
+  createInstruction<BrInstruction>(true, Ctx, SlowContinueBB);
+  addSuccessor(SlowContinueBB);
+
+  setInsertBlock(SlowContinueBB);
+  Operand ExpShiftedOp = handleShift<BinaryOperator::BO_SHR_U>(
+      ShiftOne, Operand(ExpCur, EVMType::UINT256));
+  U256Inst ExpShifted = extractU256Operand(ExpShiftedOp);
+  MInstruction *ShiftAny01 = createInstruction<BinaryInstruction>(
+      false, OP_or, I64Type, ExpShifted[0], ExpShifted[1]);
+  MInstruction *ShiftAny23 = createInstruction<BinaryInstruction>(
+      false, OP_or, I64Type, ExpShifted[2], ExpShifted[3]);
+  MInstruction *ShiftAny = createInstruction<BinaryInstruction>(
+      false, OP_or, I64Type, ShiftAny01, ShiftAny23);
+  MInstruction *ShiftIsZero = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, ShiftAny, Zero);
+  createInstruction<BrIfInstruction>(true, Ctx, ShiftIsZero, AfterBB,
+                                     SlowBaseBB);
+  addSuccessor(AfterBB);
+  addSuccessor(SlowBaseBB);
+
+  setInsertBlock(SlowBaseBB);
+  Operand BaseSquaredOp = handleMul(BaseOpCur, BaseOpCur);
+  U256Inst BaseSquared = extractU256Operand(BaseSquaredOp);
+  storeU256Vars(BaseSquared, BaseVars);
+  storeU256Vars(ExpShifted, ExpVars);
+  createInstruction<BrInstruction>(true, Ctx, SlowCondBB);
+  addSuccessor(SlowCondBB);
+
+  setInsertBlock(AfterBB);
+  U256Inst ResultFinal = loadU256Vars(ResultVars);
+  return Operand(ResultFinal, EVMType::UINT256);
 }
 
 EVMMirBuilder::U256Inst EVMMirBuilder::handleCompareEQZ(const U256Inst &LHS,
-                                                        MType *ResultType) {
+                                                        MType *ResultType,
+                                                        bool IsNegated) {
   U256Inst Result = {};
   MType *MirI64Type =
       EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
@@ -1162,7 +2955,8 @@ EVMMirBuilder::U256Inst EVMMirBuilder::handleCompareEQZ(const U256Inst &LHS,
 
   // Final result is 1 if all are zero, 0 otherwise
   MInstruction *Zero = createIntConstInstruction(MirI64Type, 0);
-  auto Predicate = CmpInstruction::Predicate::ICMP_EQ;
+  auto Predicate = IsNegated ? CmpInstruction::Predicate::ICMP_NE
+                             : CmpInstruction::Predicate::ICMP_EQ;
   MInstruction *CmpResult = createInstruction<CmpInstruction>(
       false, Predicate, ResultType, OrResult, Zero);
 
@@ -1219,15 +3013,23 @@ EVMMirBuilder::handleCompareGT_LT(const U256Inst &LHS, const U256Inst &RHS,
   MInstruction *Zero = createIntConstInstruction(MirI64Type, 0);
   MInstruction *One = createIntConstInstruction(ResultType, 1);
 
-  CmpInstruction::Predicate LTPredicate;
+  CmpInstruction::Predicate SignedPredicate;
+  CmpInstruction::Predicate UnsignedPredicate;
+  bool IsSigned = false;
   if (Operator == CompareOperator::CO_LT) {
-    LTPredicate = CmpInstruction::Predicate::ICMP_ULT;
+    SignedPredicate = CmpInstruction::Predicate::ICMP_ULT;
+    UnsignedPredicate = CmpInstruction::Predicate::ICMP_ULT;
   } else if (Operator == CompareOperator::CO_LT_S) {
-    LTPredicate = CmpInstruction::Predicate::ICMP_SLT;
+    SignedPredicate = CmpInstruction::Predicate::ICMP_SLT;
+    UnsignedPredicate = CmpInstruction::Predicate::ICMP_ULT;
+    IsSigned = true;
   } else if (Operator == CompareOperator::CO_GT) {
-    LTPredicate = CmpInstruction::Predicate::ICMP_UGT;
+    SignedPredicate = CmpInstruction::Predicate::ICMP_UGT;
+    UnsignedPredicate = CmpInstruction::Predicate::ICMP_UGT;
   } else if (Operator == CompareOperator::CO_GT_S) {
-    LTPredicate = CmpInstruction::Predicate::ICMP_SGT;
+    SignedPredicate = CmpInstruction::Predicate::ICMP_SGT;
+    UnsignedPredicate = CmpInstruction::Predicate::ICMP_UGT;
+    IsSigned = true;
   } else {
     ZEN_ASSERT_TODO();
   }
@@ -1239,8 +3041,13 @@ EVMMirBuilder::handleCompareGT_LT(const U256Inst &LHS, const U256Inst &RHS,
   for (int I = EVM_ELEMENTS_COUNT - 1; I >= 0; --I) {
     ZEN_ASSERT(LHS[I] && RHS[I]);
 
+    // For signed 256-bit comparison, only the most significant component
+    // carries the sign bit; lower components are magnitude-only and must
+    // use unsigned comparison.
+    auto Pred = (IsSigned && I == EVM_ELEMENTS_COUNT - 1) ? SignedPredicate
+                                                          : UnsignedPredicate;
     MInstruction *CompResult = createInstruction<CmpInstruction>(
-        false, LTPredicate, ResultType, LHS[I], RHS[I]);
+        false, Pred, ResultType, LHS[I], RHS[I]);
     MInstruction *EqResult = createInstruction<CmpInstruction>(
         false, EQPredicate, ResultType, LHS[I], RHS[I]);
 
@@ -1267,20 +3074,330 @@ EVMMirBuilder::handleCompareGT_LT(const U256Inst &LHS, const U256Inst &RHS,
 }
 
 typename EVMMirBuilder::Operand EVMMirBuilder::handleNot(const Operand &LHSOp) {
-  U256Inst Result = {};
-  U256Inst LHS = extractU256Operand(LHSOp);
+  // Phase 0: Constant folding
+  if (LHSOp.isConstant()) {
+    const auto &V = LHSOp.getConstValue();
+    return Operand(U256Value{~V[0], ~V[1], ~V[2], ~V[3]});
+  }
 
+  if (LHSOp.isDeferredBitwiseNot()) {
+    return Operand(LHSOp.getDeferredBaseComponents(), EVMType::UINT256);
+  }
+
+  return Operand::createDeferredBitwiseNot(extractU256Operand(LHSOp));
+}
+
+// ==================== u64 Fast Path Helpers ====================
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::handleAddU64Const(const Operand &FullOp,
+                                 const Operand &U64ConstOp) {
+  U256Inst LHS = extractU256Operand(FullOp);
+  MType *MirI64Type =
+      EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MInstruction *Carry = createIntConstInstruction(MirI64Type, 0);
+
+  MInstruction *RHS0 =
+      createIntConstInstruction(MirI64Type, U64ConstOp.getConstValue()[0]);
+  MInstruction *RHSZero = createIntConstInstruction(MirI64Type, 0);
+
+  // Pre-materialize LHS operands for carry chain safety
+  for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+    LHS[I] = protectUnsafeValue(LHS[I], MirI64Type);
+  }
+  // RHS constants (immediate MOV) never clobber flags — no barrier needed.
+
+  U256Inst Result = {};
+  // Limb 0: ADD with the actual u64 value
+  Result[0] = protectUnsafeValue(createInstruction<BinaryInstruction>(
+                                     false, OP_add, MirI64Type, LHS[0], RHS0),
+                                 MirI64Type);
+  // Limbs 1-3: ADC with zero (carry propagation only)
+  for (size_t I = 1; I < EVM_ELEMENTS_COUNT; ++I) {
+    MInstruction *AdcInst = createInstruction<AdcInstruction>(
+        false, MirI64Type, LHS[I], RHSZero, Carry);
+    // Every ADC must be protected (materialized into a variable) to force
+    // immediate evaluation while CF is live. Even the last ADC — while CF
+    // is dead *within* the carry chain after this instruction, the tree-IR
+    // expression for the last ADC may not be lowered immediately.
+    // Subsequent CMP instructions from comparison consumers (e.g. GT/LT)
+    // can clobber EFLAGS before the ADC expression is evaluated, silently
+    // corrupting the carry chain. (See GitHub issue #541.)
+    Result[I] = protectUnsafeValue(AdcInst, MirI64Type);
+  }
+  // u64const + value: if the value fits in u64, the sum is < 2^65 (fits u128);
+  // for wider operands a carry past bit 127 is possible, so stay conservative.
+  const ValueRange ResultRange = Operand::widenOneTier(FullOp.getRange());
+  return Operand(Result, EVMType::UINT256, ResultRange);
+}
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::handleSubU64Const(const Operand &LHSOp,
+                                 const Operand &U64ConstRHSOp) {
+  U256Inst LHS = extractU256Operand(LHSOp);
   MType *MirI64Type =
       EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
 
-  for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
-    MInstruction *LocalResult =
-        createInstruction<NotInstruction>(false, MirI64Type, LHS[I]);
-    Result[I] = protectUnsafeValue(LocalResult, MirI64Type);
-  }
+  MInstruction *RHS0 =
+      createIntConstInstruction(MirI64Type, U64ConstRHSOp.getConstValue()[0]);
 
+  // Limb 0: full sub
+  MInstruction *Diff0 = createInstruction<BinaryInstruction>(
+      false, OP_sub, MirI64Type, LHS[0], RHS0);
+  // Borrow from limb 0: LHS[0] < RHS0
+  auto LTPredicate = CmpInstruction::Predicate::ICMP_ULT;
+  MInstruction *Borrow = createInstruction<CmpInstruction>(
+      false, LTPredicate, &Ctx.I64Type, LHS[0], RHS0);
+  Borrow = zeroExtendToI64(Borrow);
+
+  U256Inst Result = {};
+  // No SBB instructions used — explicit borrow computation means carry flag
+  // is never live, so no protectUnsafeValue barriers are needed.
+  Result[0] = Diff0;
+
+  // Limbs 1-3: only subtract the borrow (RHS is 0 for upper limbs)
+  for (size_t I = 1; I < EVM_ELEMENTS_COUNT; ++I) {
+    MInstruction *Diff = createInstruction<BinaryInstruction>(
+        false, OP_sub, MirI64Type, LHS[I], Borrow);
+    Result[I] = Diff;
+
+    if (I < EVM_ELEMENTS_COUNT - 1) {
+      // New borrow: LHS[I] < Borrow
+      MInstruction *NewBorrow = createInstruction<CmpInstruction>(
+          false, LTPredicate, &Ctx.I64Type, LHS[I], Borrow);
+      Borrow = zeroExtendToI64(NewBorrow);
+    }
+  }
   return Operand(Result, EVMType::UINT256);
 }
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::handleCompareEqU64(const Operand &FullOp, uint64_t U64Val) {
+  U256Inst LHS = extractU256Operand(FullOp);
+  MType *MirI64Type =
+      EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MInstruction *Zero = createIntConstInstruction(MirI64Type, 0);
+
+  // Check low limb against the u64 value
+  MInstruction *CmpVal = createIntConstInstruction(MirI64Type, U64Val);
+  auto EqPred = CmpInstruction::Predicate::ICMP_EQ;
+  MInstruction *LowEq = createInstruction<CmpInstruction>(
+      false, EqPred, &Ctx.I64Type, LHS[0], CmpVal);
+
+  MInstruction *FinalResult;
+  if (FullOp.getRange() == ValueRange::U64) {
+    // Upper limbs are value-zero by Range contract (producer materialization
+    // or EVMRangeAnalyzer narrowing). Skip the OR-fold and the zero-test.
+    FinalResult = LowEq;
+  } else if (FullOp.getRange() == ValueRange::U128) {
+    // Limbs[2..3] are value-zero by Range contract — only LHS[1] needs check.
+    MInstruction *UpperZero = createInstruction<CmpInstruction>(
+        false, EqPred, &Ctx.I64Type, LHS[1], Zero);
+    FinalResult = createInstruction<BinaryInstruction>(
+        false, OP_and, &Ctx.I64Type, LowEq, UpperZero);
+  } else {
+    MInstruction *Upper = createInstruction<BinaryInstruction>(
+        false, OP_or, MirI64Type, LHS[1], LHS[2]);
+    Upper = createInstruction<BinaryInstruction>(false, OP_or, MirI64Type,
+                                                 Upper, LHS[3]);
+    MInstruction *UpperZero = createInstruction<CmpInstruction>(
+        false, EqPred, &Ctx.I64Type, Upper, Zero);
+    FinalResult = createInstruction<BinaryInstruction>(
+        false, OP_and, &Ctx.I64Type, LowEq, UpperZero);
+  }
+
+  U256Inst Result = {};
+  Result[0] = protectUnsafeValue(FinalResult, MirI64Type);
+  for (size_t I = 1; I < EVM_ELEMENTS_COUNT; ++I) {
+    Result[I] = Zero;
+  }
+  return Operand(Result, EVMType::UINT256, ValueRange::U64);
+}
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::handleCompareLtRhsU64(const Operand &LHSOp, uint64_t RhsU64) {
+  // LT(a, u64_b): a < b where b fits in u64
+  // If a >= 2^64 (upper limbs non-zero), then a > any u64, so result = false
+  // Otherwise, compare a[0] < b
+  U256Inst LHS = extractU256Operand(LHSOp);
+  MType *MirI64Type =
+      EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MInstruction *Zero = createIntConstInstruction(MirI64Type, 0);
+
+  MInstruction *RhsVal = createIntConstInstruction(MirI64Type, RhsU64);
+  auto LtPred = CmpInstruction::Predicate::ICMP_ULT;
+  MInstruction *LowLt = createInstruction<CmpInstruction>(
+      false, LtPred, &Ctx.I64Type, LHS[0], RhsVal);
+
+  MInstruction *FinalResult;
+  if (LHSOp.getRange() == ValueRange::U64) {
+    // Upper limbs are value-zero by Range contract — HasUpper would always
+    // be false, so the select collapses to LowLt.
+    FinalResult = LowLt;
+  } else if (LHSOp.getRange() == ValueRange::U128) {
+    // Limbs[2..3] are value-zero by Range contract — HasUpper reduces to
+    // LHS[1] != 0.
+    auto NePred = CmpInstruction::Predicate::ICMP_NE;
+    MInstruction *HasUpper = createInstruction<CmpInstruction>(
+        false, NePred, &Ctx.I64Type, LHS[1], Zero);
+    FinalResult = createInstruction<SelectInstruction>(false, &Ctx.I64Type,
+                                                       HasUpper, Zero, LowLt);
+  } else {
+    MInstruction *Upper = createInstruction<BinaryInstruction>(
+        false, OP_or, MirI64Type, LHS[1], LHS[2]);
+    Upper = createInstruction<BinaryInstruction>(false, OP_or, MirI64Type,
+                                                 Upper, LHS[3]);
+    auto NePred = CmpInstruction::Predicate::ICMP_NE;
+    MInstruction *HasUpper = createInstruction<CmpInstruction>(
+        false, NePred, &Ctx.I64Type, Upper, Zero);
+    FinalResult = createInstruction<SelectInstruction>(false, &Ctx.I64Type,
+                                                       HasUpper, Zero, LowLt);
+  }
+
+  U256Inst Result = {};
+  Result[0] = protectUnsafeValue(FinalResult, MirI64Type);
+  for (size_t I = 1; I < EVM_ELEMENTS_COUNT; ++I) {
+    Result[I] = Zero;
+  }
+  return Operand(Result, EVMType::UINT256, ValueRange::U64);
+}
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::handleCompareGtRhsU64(const Operand &LHSOp, uint64_t RhsU64) {
+  // GT(a, u64_b): a > b where b fits in u64
+  // If a >= 2^64 (upper limbs non-zero), then a > any u64, so result = true
+  // Otherwise, compare a[0] > b
+  U256Inst LHS = extractU256Operand(LHSOp);
+  MType *MirI64Type =
+      EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MInstruction *Zero = createIntConstInstruction(MirI64Type, 0);
+
+  MInstruction *RhsVal = createIntConstInstruction(MirI64Type, RhsU64);
+  auto GtPred = CmpInstruction::Predicate::ICMP_UGT;
+  MInstruction *LowGt = createInstruction<CmpInstruction>(
+      false, GtPred, &Ctx.I64Type, LHS[0], RhsVal);
+
+  MInstruction *FinalResult;
+  if (LHSOp.getRange() == ValueRange::U64) {
+    // Upper limbs are value-zero by Range contract — HasUpper would always
+    // be false, so the select collapses to LowGt.
+    FinalResult = LowGt;
+  } else if (LHSOp.getRange() == ValueRange::U128) {
+    // Limbs[2..3] are value-zero by Range contract — HasUpper reduces to
+    // LHS[1] != 0.
+    MInstruction *One = createIntConstInstruction(MirI64Type, 1);
+    auto NePred = CmpInstruction::Predicate::ICMP_NE;
+    MInstruction *HasUpper = createInstruction<CmpInstruction>(
+        false, NePred, &Ctx.I64Type, LHS[1], Zero);
+    FinalResult = createInstruction<SelectInstruction>(false, &Ctx.I64Type,
+                                                       HasUpper, One, LowGt);
+  } else {
+    MInstruction *One = createIntConstInstruction(MirI64Type, 1);
+    MInstruction *Upper = createInstruction<BinaryInstruction>(
+        false, OP_or, MirI64Type, LHS[1], LHS[2]);
+    Upper = createInstruction<BinaryInstruction>(false, OP_or, MirI64Type,
+                                                 Upper, LHS[3]);
+    auto NePred = CmpInstruction::Predicate::ICMP_NE;
+    MInstruction *HasUpper = createInstruction<CmpInstruction>(
+        false, NePred, &Ctx.I64Type, Upper, Zero);
+    FinalResult = createInstruction<SelectInstruction>(false, &Ctx.I64Type,
+                                                       HasUpper, One, LowGt);
+  }
+
+  U256Inst Result = {};
+  Result[0] = protectUnsafeValue(FinalResult, MirI64Type);
+  for (size_t I = 1; I < EVM_ELEMENTS_COUNT; ++I) {
+    Result[I] = Zero;
+  }
+  return Operand(Result, EVMType::UINT256, ValueRange::U64);
+}
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::handleClz(const Operand &ValueOp) {
+  // EIP-7939 CLZ inlined: 4-limb chain-select on the highest non-zero limb
+  // plus a base offset (limb index 3 -> 0, 2 -> 64, 1 -> 128, 0 -> 192).
+  // CLZ(0) = 256 is enforced by an outer Select(IsZero, 256, partial).
+  // Pattern mirrors handleExp's computeExpByteSize for parity with
+  // proven MIR shapes.
+  MType *MirI64Type =
+      EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MInstruction *Zero = createIntConstInstruction(MirI64Type, 0);
+  MInstruction *One = createIntConstInstruction(MirI64Type, 1);
+  MInstruction *Const64 = createIntConstInstruction(MirI64Type, 64);
+  MInstruction *Const128 = createIntConstInstruction(MirI64Type, 128);
+  MInstruction *Const192 = createIntConstInstruction(MirI64Type, 192);
+  MInstruction *Const256 = createIntConstInstruction(MirI64Type, 256);
+
+  U256Inst Value = extractU256Operand(ValueOp);
+
+  auto NePred = CmpInstruction::Predicate::ICMP_NE;
+  MInstruction *Has1 = createInstruction<CmpInstruction>(
+      false, NePred, MirI64Type, Value[1], Zero);
+  MInstruction *Has2 = createInstruction<CmpInstruction>(
+      false, NePred, MirI64Type, Value[2], Zero);
+  MInstruction *Has3 = createInstruction<CmpInstruction>(
+      false, NePred, MirI64Type, Value[3], Zero);
+
+  // OR all four limbs to detect the all-zero case.
+  MInstruction *Any01 = createInstruction<BinaryInstruction>(
+      false, OP_or, MirI64Type, Value[0], Value[1]);
+  MInstruction *Any23 = createInstruction<BinaryInstruction>(
+      false, OP_or, MirI64Type, Value[2], Value[3]);
+  MInstruction *Any = createInstruction<BinaryInstruction>(
+      false, OP_or, MirI64Type, Any01, Any23);
+  auto EqPred = CmpInstruction::Predicate::ICMP_EQ;
+  MInstruction *IsZero =
+      createInstruction<CmpInstruction>(false, EqPred, MirI64Type, Any, Zero);
+
+  // Chain-select the highest non-zero limb.
+  MInstruction *Limb01 = createInstruction<SelectInstruction>(
+      false, MirI64Type, Has1, Value[1], Value[0]);
+  MInstruction *Limb02 = createInstruction<SelectInstruction>(
+      false, MirI64Type, Has2, Value[2], Limb01);
+  MInstruction *Limb = createInstruction<SelectInstruction>(
+      false, MirI64Type, Has3, Value[3], Limb02);
+
+  // Chain-select the matching base offset.
+  MInstruction *Off01 = createInstruction<SelectInstruction>(
+      false, MirI64Type, Has1, Const128, Const192);
+  MInstruction *Off02 = createInstruction<SelectInstruction>(
+      false, MirI64Type, Has2, Const64, Off01);
+  MInstruction *Offset = createInstruction<SelectInstruction>(
+      false, MirI64Type, Has3, Zero, Off02);
+
+  // Defense-in-depth against clz(0) UB on the picked limb (mirrors
+  // handleExp:2547-2548). The outer Select discards Partial when IsZero,
+  // but we keep the guard so the MIR is self-contained.
+  MInstruction *SafeLimb =
+      createInstruction<BinaryInstruction>(false, OP_or, MirI64Type, Limb, One);
+  MInstruction *Clz =
+      createInstruction<UnaryInstruction>(false, OP_clz, MirI64Type, SafeLimb);
+  MInstruction *Partial = createInstruction<BinaryInstruction>(
+      false, OP_add, MirI64Type, Offset, Clz);
+
+  // EIP-7939: CLZ(0) = 256.
+  MInstruction *FinalResult = createInstruction<SelectInstruction>(
+      false, MirI64Type, IsZero, Const256, Partial);
+
+  U256Inst Result = {};
+  Result[0] = protectUnsafeValue(FinalResult, MirI64Type);
+  for (size_t I = 1; I < EVM_ELEMENTS_COUNT; ++I) {
+    Result[I] = Zero;
+  }
+  return Operand(Result, EVMType::UINT256, ValueRange::U64);
+}
+
+namespace {
+// Extract constant shift amount from MInstruction if it is a constant.
+std::optional<uint64_t> getConstShiftAmount(MInstruction *Inst) {
+  if (auto *CI = llvm::dyn_cast<ConstantInstruction>(Inst)) {
+    if (auto *IntConst = llvm::dyn_cast<MConstantInt>(&CI->getConstant())) {
+      return IntConst->getValue().getZExtValue();
+    }
+  }
+  return std::nullopt;
+}
+} // namespace
 
 EVMMirBuilder::U256Inst
 EVMMirBuilder::handleLeftShift(const U256Inst &Value, MInstruction *ShiftAmount,
@@ -1290,6 +3407,59 @@ EVMMirBuilder::handleLeftShift(const U256Inst &Value, MInstruction *ShiftAmount,
   U256Inst Result = {};
 
   MInstruction *Zero = createIntConstInstruction(MirI64Type, 0);
+
+  // Fast path: constant shift amount — direct limb logic, no Select/cmp loops.
+  if (auto ShiftOpt = getConstShiftAmount(ShiftAmount)) {
+    uint64_t Shift = *ShiftOpt;
+    if (Shift >= 256) {
+      for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I)
+        Result[I] = Zero;
+      return Result;
+    }
+    uint64_t CompShift = Shift / 64;
+    uint64_t ShiftMod = Shift % 64;
+
+    // Hoist loop-invariant constant instructions out of the limb loop.
+    MInstruction *ShiftModConst = nullptr;
+    MInstruction *RemainingBitsConst = nullptr;
+    if (ShiftMod != 0) {
+      ShiftModConst = createIntConstInstruction(MirI64Type, ShiftMod);
+    }
+    if (ShiftMod != 0 && (64 - ShiftMod) > 0) {
+      RemainingBitsConst = createIntConstInstruction(MirI64Type, 64 - ShiftMod);
+    }
+
+    for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+      MInstruction *R = Zero;
+      if (I >= CompShift) {
+        size_t SrcIdx = I - CompShift;
+        if (ShiftMod == 0) {
+          // Pure limb shift (multiple of 64): no intra-limb shift/carry needed.
+          R = Value[SrcIdx];
+        } else {
+          MInstruction *SrcVal = Value[SrcIdx];
+          MInstruction *Shifted = createInstruction<BinaryInstruction>(
+              false, OP_shl, MirI64Type, SrcVal, ShiftModConst);
+          if (SrcIdx > 0 && RemainingBitsConst) {
+            MInstruction *Carry = createInstruction<BinaryInstruction>(
+                false, OP_ushr, MirI64Type, Value[SrcIdx - 1],
+                RemainingBitsConst);
+            R = createInstruction<BinaryInstruction>(false, OP_or, MirI64Type,
+                                                     Shifted, Carry);
+          } else {
+            R = Shifted;
+          }
+        }
+      }
+      // Guard with IsLargeShift: if the full 256-bit shift has high limbs set,
+      // the result must be zero per EVM spec.
+      R = createInstruction<SelectInstruction>(false, MirI64Type, IsLargeShift,
+                                               Zero, R);
+      Result[I] = protectUnsafeValue(R, MirI64Type);
+    }
+    return Result;
+  }
+
   MInstruction *One = createIntConstInstruction(MirI64Type, 1);
   MInstruction *Const64 = createIntConstInstruction(MirI64Type, 64);
 
@@ -1298,10 +3468,13 @@ EVMMirBuilder::handleLeftShift(const U256Inst &Value, MInstruction *ShiftAmount,
   // shift_mod = shift % 64 (shift amount within 64-bit range)
   // shift_comp = shift / 64 (which component index shift from)
   // remaining_bits = 64 - shift_mod (remaining bits for carry calculation)
+  // Strength-reduce: shift % 64 == shift & 63, shift / 64 == shift >> 6
+  MInstruction *Const63 = createIntConstInstruction(MirI64Type, 63);
+  MInstruction *Const6 = createIntConstInstruction(MirI64Type, 6);
   MInstruction *ShiftMod64 = createInstruction<BinaryInstruction>(
-      false, OP_urem, MirI64Type, ShiftAmount, Const64);
+      false, OP_and, MirI64Type, ShiftAmount, Const63);
   MInstruction *ComponentShift = createInstruction<BinaryInstruction>(
-      false, OP_udiv, MirI64Type, ShiftAmount, Const64);
+      false, OP_ushr, MirI64Type, ShiftAmount, Const6);
   MInstruction *RemainingBits = createInstruction<BinaryInstruction>(
       false, OP_sub, MirI64Type, Const64, ShiftMod64);
 
@@ -1425,6 +3598,65 @@ EVMMirBuilder::handleLogicalRightShift(const U256Inst &Value,
   U256Inst Result = {};
 
   MInstruction *Zero = createIntConstInstruction(MirI64Type, 0);
+
+  // Fast path: constant shift amount — direct limb logic, no Select/cmp loops.
+  if (auto ShiftOpt = getConstShiftAmount(ShiftAmount)) {
+    uint64_t Shift = *ShiftOpt;
+    if (Shift >= 256) {
+      for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I)
+        Result[I] = Zero;
+      return Result;
+    }
+    uint64_t CompShift = Shift / 64;
+    uint64_t ShiftMod = Shift % 64;
+
+    // If the shift is a multiple of 64, we only need to move whole limbs.
+    if (ShiftMod == 0) {
+      for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+        MInstruction *R = Zero;
+        if (I + CompShift < EVM_ELEMENTS_COUNT) {
+          size_t SrcIdx = I + CompShift;
+          R = Value[SrcIdx];
+        }
+        // Guard with IsLargeShift for correctness with 256-bit shift values.
+        R = createInstruction<SelectInstruction>(false, MirI64Type,
+                                                 IsLargeShift, Zero, R);
+        Result[I] = protectUnsafeValue(R, MirI64Type);
+      }
+      return Result;
+    }
+
+    // Hoist loop-invariant shift constants out of the limb loop.
+    MInstruction *ShiftModConst =
+        createIntConstInstruction(MirI64Type, ShiftMod);
+    uint64_t CarryShift = 64 - ShiftMod;
+    MInstruction *CarryShiftConst =
+        createIntConstInstruction(MirI64Type, CarryShift);
+
+    for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+      MInstruction *R = Zero;
+      if (I + CompShift < EVM_ELEMENTS_COUNT) {
+        size_t SrcIdx = I + CompShift;
+        MInstruction *SrcVal = Value[SrcIdx];
+        MInstruction *Shifted = createInstruction<BinaryInstruction>(
+            false, OP_ushr, MirI64Type, SrcVal, ShiftModConst);
+        if (SrcIdx + 1 < EVM_ELEMENTS_COUNT) {
+          MInstruction *Carry = createInstruction<BinaryInstruction>(
+              false, OP_shl, MirI64Type, Value[SrcIdx + 1], CarryShiftConst);
+          R = createInstruction<BinaryInstruction>(false, OP_or, MirI64Type,
+                                                   Shifted, Carry);
+        } else {
+          R = Shifted;
+        }
+      }
+      // Guard with IsLargeShift for correctness with 256-bit shift values.
+      R = createInstruction<SelectInstruction>(false, MirI64Type, IsLargeShift,
+                                               Zero, R);
+      Result[I] = protectUnsafeValue(R, MirI64Type);
+    }
+    return Result;
+  }
+
   MInstruction *One = createIntConstInstruction(MirI64Type, 1);
   MInstruction *Const64 = createIntConstInstruction(MirI64Type, 64);
 
@@ -1432,10 +3664,13 @@ EVMMirBuilder::handleLogicalRightShift(const U256Inst &Value,
   // DMIR implementation maps 256-bit shift to 4x64-bit components
   // shift_mod = shift % 64 (shift amount within 64-bit range)
   // shift_comp = shift / 64 (which component index shift from)
+  // Strength-reduce: shift % 64 == shift & 63, shift / 64 == shift >> 6
+  MInstruction *Const63 = createIntConstInstruction(MirI64Type, 63);
+  MInstruction *Const6 = createIntConstInstruction(MirI64Type, 6);
   MInstruction *ShiftMod64 = createInstruction<BinaryInstruction>(
-      false, OP_urem, MirI64Type, ShiftAmount, Const64);
+      false, OP_and, MirI64Type, ShiftAmount, Const63);
   MInstruction *ComponentShift = createInstruction<BinaryInstruction>(
-      false, OP_udiv, MirI64Type, ShiftAmount, Const64);
+      false, OP_ushr, MirI64Type, ShiftAmount, Const6);
 
   MInstruction *MaxIndex =
       createIntConstInstruction(MirI64Type, EVM_ELEMENTS_COUNT);
@@ -1495,6 +3730,14 @@ EVMMirBuilder::handleLogicalRightShift(const U256Inst &Value,
 
     // Calculate carry bits from the next component
     // carry_bits = (next_idx == K) ? (Value[K] << (64 - shift_mod)) : 0
+    MInstruction *HasBitShift = createInstruction<CmpInstruction>(
+        false, CmpInstruction::Predicate::ICMP_NE, &Ctx.I64Type, ShiftMod64,
+        Zero);
+    MInstruction *CarryShift = createInstruction<SelectInstruction>(
+        false, MirI64Type, HasBitShift,
+        createInstruction<BinaryInstruction>(false, OP_sub, MirI64Type, Const64,
+                                             ShiftMod64),
+        Zero);
     MInstruction *CarryValue = Zero;
     for (size_t K = 0; K < EVM_ELEMENTS_COUNT; ++K) {
       MInstruction *TargetIdx = createIntConstInstruction(MirI64Type, K);
@@ -1508,10 +3751,9 @@ EVMMirBuilder::handleLogicalRightShift(const U256Inst &Value,
 
       // Extract carry bits by shifting left the remaining bits
       MInstruction *CarryBits = createInstruction<BinaryInstruction>(
-          false, OP_shl, MirI64Type, NextValue,
-          createInstruction<BinaryInstruction>(
-              false, OP_sub, MirI64Type,
-              createIntConstInstruction(MirI64Type, 64), ShiftMod64));
+          false, OP_shl, MirI64Type, NextValue, CarryShift);
+      CarryBits = createInstruction<SelectInstruction>(
+          false, MirI64Type, HasBitShift, CarryBits, Zero);
       CarryValue = createInstruction<SelectInstruction>(
           false, MirI64Type, IsMatch, CarryBits, CarryValue);
     }
@@ -1545,32 +3787,90 @@ EVMMirBuilder::handleArithmeticRightShift(const U256Inst &Value,
       EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
   U256Inst Result = {};
 
-  // Arithmetic right shift: sign-extend when shift >= 256
   MInstruction *Zero = createIntConstInstruction(MirI64Type, 0);
   MInstruction *AllOnes = createIntConstInstruction(MirI64Type, ~0ULL);
 
-  // Check sign bit (bit 63 of highest component)
+  // Check sign bit (bit 63 of highest component) for large-shift result
   MInstruction *HighComponent = Value[EVM_ELEMENTS_COUNT - 1];
   MInstruction *Const63 = createIntConstInstruction(MirI64Type, 63);
   MInstruction *SignBit = createInstruction<BinaryInstruction>(
       false, OP_ushr, MirI64Type, HighComponent, Const63);
-
-  // Sign bit is 1 if negative
   MInstruction *One = createIntConstInstruction(MirI64Type, 1);
   MInstruction *IsNegative = createInstruction<CmpInstruction>(
       false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, SignBit, One);
-
-  // Large shift result: all 1s if negative, all 0s if positive
   MInstruction *LargeShiftResult = createInstruction<SelectInstruction>(
       false, MirI64Type, IsNegative, AllOnes, Zero);
 
+  // Fast path: constant shift amount — direct limb logic, no Select/cmp loops.
+  if (auto ShiftOpt = getConstShiftAmount(ShiftAmount)) {
+    uint64_t Shift = *ShiftOpt;
+    if (Shift >= 256) {
+      for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I)
+        Result[I] = LargeShiftResult;
+      return Result;
+    }
+    uint64_t CompShift = Shift / 64;
+    uint64_t ShiftMod = Shift % 64;
+
+    // If the shift is a multiple of 64, we only need to move whole limbs.
+    if (ShiftMod == 0) {
+      for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+        MInstruction *R = LargeShiftResult;
+        if (I + CompShift < EVM_ELEMENTS_COUNT) {
+          size_t SrcIdx = I + CompShift;
+          R = Value[SrcIdx];
+        }
+        // Guard with IsLargeShift for correctness with 256-bit shift values.
+        R = createInstruction<SelectInstruction>(
+            false, MirI64Type, IsLargeShift, LargeShiftResult, R);
+        Result[I] = protectUnsafeValue(R, MirI64Type);
+      }
+      return Result;
+    }
+
+    // Hoist loop-invariant shift constants out of the limb loop.
+    MInstruction *ShiftModConst =
+        createIntConstInstruction(MirI64Type, ShiftMod);
+    uint64_t CarryShift = 64 - ShiftMod;
+    MInstruction *CarryShiftConst =
+        createIntConstInstruction(MirI64Type, CarryShift);
+
+    for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+      MInstruction *R = LargeShiftResult;
+      if (I + CompShift < EVM_ELEMENTS_COUNT) {
+        size_t SrcIdx = I + CompShift;
+        MInstruction *SrcVal = Value[SrcIdx];
+        // Use arithmetic shift for the high component (contains sign bit)
+        bool UseArithShift = (SrcIdx == EVM_ELEMENTS_COUNT - 1);
+        MInstruction *Shifted = createInstruction<BinaryInstruction>(
+            false, UseArithShift ? OP_sshr : OP_ushr, MirI64Type, SrcVal,
+            ShiftModConst);
+        if (SrcIdx + 1 < EVM_ELEMENTS_COUNT) {
+          MInstruction *Carry = createInstruction<BinaryInstruction>(
+              false, OP_shl, MirI64Type, Value[SrcIdx + 1], CarryShiftConst);
+          R = createInstruction<BinaryInstruction>(false, OP_or, MirI64Type,
+                                                   Shifted, Carry);
+        } else {
+          R = Shifted;
+        }
+      }
+      // Guard with IsLargeShift for correctness with 256-bit shift values.
+      R = createInstruction<SelectInstruction>(false, MirI64Type, IsLargeShift,
+                                               LargeShiftResult, R);
+      Result[I] = protectUnsafeValue(R, MirI64Type);
+    }
+    return Result;
+  }
+
   // intra-component shifts = shift % 64
   // shift_comp = shift / 64 (which component index shift from)
+  // Strength-reduce: shift % 64 == shift & 63, shift / 64 == shift >> 6
   MInstruction *Const64 = createIntConstInstruction(MirI64Type, 64);
+  MInstruction *Const6 = createIntConstInstruction(MirI64Type, 6);
   MInstruction *ShiftMod64 = createInstruction<BinaryInstruction>(
-      false, OP_urem, MirI64Type, ShiftAmount, Const64);
+      false, OP_and, MirI64Type, ShiftAmount, Const63);
   MInstruction *ComponentShift = createInstruction<BinaryInstruction>(
-      false, OP_udiv, MirI64Type, ShiftAmount, Const64);
+      false, OP_ushr, MirI64Type, ShiftAmount, Const6);
 
   MInstruction *MaxIndex =
       createIntConstInstruction(MirI64Type, EVM_ELEMENTS_COUNT);
@@ -1622,44 +3922,37 @@ EVMMirBuilder::handleArithmeticRightShift(const U256Inst &Value,
     MInstruction *IsNextValid = createInstruction<BinaryInstruction>(
         false, OP_and, MirI64Type, IsValidNextLow, IsValidNextHigh);
 
-    // Calculate carry bits from the next component (higher index)
-    MInstruction *CarryValue = Zero;
+    // Calculate carry bits from the next component (higher index).
     MInstruction *HasShift = createInstruction<CmpInstruction>(
         false, CmpInstruction::Predicate::ICMP_NE, &Ctx.I64Type, ShiftMod64,
         Zero);
+    MInstruction *CarryShift = createInstruction<SelectInstruction>(
+        false, MirI64Type, HasShift,
+        createInstruction<BinaryInstruction>(false, OP_sub, MirI64Type, Const64,
+                                             ShiftMod64),
+        Zero);
+    MInstruction *NextValue = LargeShiftResult;
     for (size_t K = 0; K < EVM_ELEMENTS_COUNT; ++K) {
       MInstruction *TargetIdx = createIntConstInstruction(MirI64Type, K);
       MInstruction *IsMatch = createInstruction<CmpInstruction>(
           false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, NextIdx,
           TargetIdx);
-      MInstruction *NextValue = createInstruction<SelectInstruction>(
-          false, MirI64Type, IsMatch, Value[K], LargeShiftResult);
       NextValue = createInstruction<SelectInstruction>(
-          false, MirI64Type, IsNextValid, NextValue, LargeShiftResult);
-
-      // Extract low bits from next component as carry
-      // carry_bits = (next_value << (64 - shift_mod)) for arithmetic right
-      // shift
-      MInstruction *CarryBits = createInstruction<BinaryInstruction>(
-          false, OP_shl, MirI64Type, NextValue,
-          createInstruction<BinaryInstruction>(
-              false, OP_sub, MirI64Type,
-              createIntConstInstruction(MirI64Type, 64), ShiftMod64));
-      // Only use carry bits if there is an actual shift (ShiftMod64 > 0)
-      CarryBits = createInstruction<SelectInstruction>(
-          false, MirI64Type, HasShift, CarryBits, Zero);
-      CarryValue = createInstruction<SelectInstruction>(
-          false, MirI64Type, IsMatch, CarryBits, CarryValue);
+          false, MirI64Type, IsMatch, Value[K], NextValue);
     }
+    NextValue = createInstruction<SelectInstruction>(
+        false, MirI64Type, IsNextValid, NextValue, LargeShiftResult);
 
-    // Use arithmetic right shift for negative numbers, logical for positive
-    // This ensures proper sign extension within each 64-bit component
-    MInstruction *ShiftedValue = createInstruction<SelectInstruction>(
-        false, MirI64Type, IsNegative,
-        createInstruction<BinaryInstruction>(false, OP_sshr, MirI64Type,
-                                             SrcValue, ShiftMod64),
-        createInstruction<BinaryInstruction>(false, OP_ushr, MirI64Type,
-                                             SrcValue, ShiftMod64));
+    // Extract low bits from next component as carry. When next_idx is out of
+    // bounds, use sign-extension bits from LargeShiftResult.
+    MInstruction *CarryBits = createInstruction<BinaryInstruction>(
+        false, OP_shl, MirI64Type, NextValue, CarryShift);
+    MInstruction *CarryValue = createInstruction<SelectInstruction>(
+        false, MirI64Type, HasShift, CarryBits, Zero);
+
+    // Use logical right shift; sign extension is handled via LargeShiftResult.
+    MInstruction *ShiftedValue = createInstruction<BinaryInstruction>(
+        false, OP_ushr, MirI64Type, SrcValue, ShiftMod64);
     MInstruction *CombinedValue = createInstruction<BinaryInstruction>(
         false, OP_or, MirI64Type, ShiftedValue, CarryValue);
 
@@ -1678,68 +3971,105 @@ EVMMirBuilder::handleArithmeticRightShift(const U256Inst &Value,
 // (value >> (8 × (31 - index))) & 0xFF
 typename EVMMirBuilder::Operand EVMMirBuilder::handleByte(Operand IndexOp,
                                                           Operand ValueOp) {
-  U256Inst IndexComponents = extractU256Operand(IndexOp);
-  U256Inst ValueComponents = extractU256Operand(ValueOp);
-
-  // Check if index >= 32 (out of bounds)
-  MInstruction *IsOutOfBounds = isU256GreaterOrEqual(IndexComponents, 32);
-
   MType *MirI64Type =
       EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
-
-  // Calculate bit shift: (31 - index) * 8
-  MInstruction *Const31 = createIntConstInstruction(MirI64Type, 31);
-  MInstruction *ByteIndex = createInstruction<BinaryInstruction>(
-      false, OP_sub, MirI64Type, Const31, IndexComponents[0]);
-  MInstruction *Const8 = createIntConstInstruction(MirI64Type, 8);
-  MInstruction *BitShift = createInstruction<BinaryInstruction>(
-      false, OP_mul, MirI64Type, ByteIndex, Const8);
-
-  // Determine which 64-bit component contains the byte
-  MInstruction *Const64 = createIntConstInstruction(MirI64Type, 64);
-  MInstruction *ComponentIndex = createInstruction<BinaryInstruction>(
-      false, OP_udiv, MirI64Type, BitShift, Const64);
-
-  // Calculate the bit offset within the selected 64-bit component
-  MInstruction *BitOffset = createInstruction<BinaryInstruction>(
-      false, OP_urem, MirI64Type, BitShift, Const64);
-
-  // Select the appropriate 64-bit component based on component_index
-  // Example: bit_shift=248 → component_index=3 (248/64=3), bit_offset=56
-  // This means target byte is in the highest component (comp3) at bit offset 56
-  MInstruction *SelectedComponent = ValueComponents[0];
-  for (size_t I = 1; I < EVM_ELEMENTS_COUNT; ++I) {
-    MInstruction *IsThisComponent = createInstruction<CmpInstruction>(
-        false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, ComponentIndex,
-        createIntConstInstruction(MirI64Type, I));
-    SelectedComponent = createInstruction<SelectInstruction>(
-        false, MirI64Type, IsThisComponent, ValueComponents[I],
-        SelectedComponent);
-  }
-
-  // Extract the byte by shifting right and masking
-  // Shift the selected component right by bit_offset to move target byte to LSB
-  // Then mask with 0xFF to extract the lowest 8 bits
-  MInstruction *ShiftedValue = createInstruction<BinaryInstruction>(
-      false, OP_ushr, MirI64Type, SelectedComponent, BitOffset);
-  MInstruction *ConstFF = createIntConstInstruction(MirI64Type, 0xFF);
-  MInstruction *ByteValue = createInstruction<BinaryInstruction>(
-      false, OP_and, MirI64Type, ShiftedValue, ConstFF);
-
   MInstruction *Zero = createIntConstInstruction(MirI64Type, 0);
-  // Return 0 if out of bounds, otherwise return the extracted byte value
-  MInstruction *Result = createInstruction<SelectInstruction>(
-      false, MirI64Type, IsOutOfBounds, Zero, ByteValue);
+  MInstruction *ConstFF = createIntConstInstruction(MirI64Type, 0xFF);
 
-  // Create U256 result with only the low component set
-  // High components are zeroed out as per EVM specification
-  U256Inst ResultComponents = {};
-  ResultComponents[0] = Result;
-  for (size_t I = 1; I < EVM_ELEMENTS_COUNT; ++I) {
-    ResultComponents[I] = Zero;
+  auto buildByteResult = [&](MInstruction *SelectedComponent,
+                             MInstruction *BitOffset,
+                             MInstruction *IsOutOfBounds = nullptr) {
+    MInstruction *ShiftedValue = createInstruction<BinaryInstruction>(
+        false, OP_ushr, MirI64Type, SelectedComponent, BitOffset);
+    MInstruction *ByteValue = createInstruction<BinaryInstruction>(
+        false, OP_and, MirI64Type, ShiftedValue, ConstFF);
+    MInstruction *Result =
+        IsOutOfBounds ? createInstruction<SelectInstruction>(
+                            false, MirI64Type, IsOutOfBounds, Zero, ByteValue)
+                      : ByteValue;
+
+    U256Inst ResultComponents = {};
+    ResultComponents[0] = protectUnsafeValue(Result, MirI64Type);
+    for (size_t I = 1; I < EVM_ELEMENTS_COUNT; ++I) {
+      ResultComponents[I] = Zero;
+    }
+    // BYTE always produces a single byte value (0..255)
+    return Operand(ResultComponents, EVMType::UINT256, ValueRange::U64);
+  };
+
+  if (IndexOp.isConstant() && ValueOp.isConstant()) {
+    const auto &IndexConst = IndexOp.getConstValue();
+    if (IndexConst[1] != 0 || IndexConst[2] != 0 || IndexConst[3] != 0 ||
+        IndexConst[0] >= 32) {
+      return Operand(U256Value{0, 0, 0, 0});
+    }
+
+    uint64_t Index = IndexConst[0];
+    size_t ComponentIndex = 3 - static_cast<size_t>(Index >> 3);
+    uint64_t BitOffset = (7 - (Index & 7)) << 3;
+    uint64_t ByteValue =
+        (ValueOp.getConstValue()[ComponentIndex] >> BitOffset) & 0xFF;
+    return Operand(U256Value{ByteValue, 0, 0, 0});
   }
 
-  return Operand(ResultComponents, EVMType::UINT256);
+  U256Inst ValueComponents = extractU256Operand(ValueOp);
+
+  if (IndexOp.isConstant()) {
+    const auto &IndexConst = IndexOp.getConstValue();
+    if (IndexConst[1] != 0 || IndexConst[2] != 0 || IndexConst[3] != 0 ||
+        IndexConst[0] >= 32) {
+      return Operand(U256Value{0, 0, 0, 0});
+    }
+
+    uint64_t Index = IndexConst[0];
+    size_t ComponentIndex = 3 - static_cast<size_t>(Index >> 3);
+    uint64_t BitOffset = (7 - (Index & 7)) << 3;
+    return buildByteResult(ValueComponents[ComponentIndex],
+                           createIntConstInstruction(MirI64Type, BitOffset));
+  }
+
+  U256Inst IndexComponents = extractU256Operand(IndexOp);
+
+  // Check if index >= 32 (out of bounds).
+  MInstruction *IsOutOfBounds = isU256GreaterOrEqual(IndexComponents, 32);
+  MInstruction *IndexLow = IndexComponents[0];
+  MInstruction *Const1 = createIntConstInstruction(MirI64Type, 1);
+  MInstruction *Const2 = createIntConstInstruction(MirI64Type, 2);
+  MInstruction *Const3 = createIntConstInstruction(MirI64Type, 3);
+  MInstruction *Const7 = createIntConstInstruction(MirI64Type, 7);
+
+  // Use byte-granular arithmetic directly:
+  //   component_index = 3 - (index / 8)
+  //   bit_offset = (7 - (index % 8)) * 8
+  MInstruction *GroupIndex = createInstruction<BinaryInstruction>(
+      false, OP_ushr, MirI64Type, IndexLow, Const3);
+  MInstruction *ByteInGroup = createInstruction<BinaryInstruction>(
+      false, OP_and, MirI64Type, IndexLow, Const7);
+  MInstruction *ByteShiftInComponent = createInstruction<BinaryInstruction>(
+      false, OP_sub, MirI64Type, Const7, ByteInGroup);
+  MInstruction *BitOffset = createInstruction<BinaryInstruction>(
+      false, OP_shl, MirI64Type, ByteShiftInComponent, Const3);
+
+  // Pick the source limb with a two-level select tree to shorten live ranges:
+  // [3,2] and [1,0] are selected independently, then merged.
+  MInstruction *GroupLowBit = createInstruction<BinaryInstruction>(
+      false, OP_and, MirI64Type, GroupIndex, Const1);
+  MInstruction *IsSecondInPair = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_NE, &Ctx.I64Type, GroupLowBit,
+      Zero);
+  MInstruction *IsLowerPair = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_UGE, &Ctx.I64Type, GroupIndex,
+      Const2);
+  MInstruction *UpperPair = createInstruction<SelectInstruction>(
+      false, MirI64Type, IsSecondInPair, ValueComponents[2],
+      ValueComponents[3]);
+  MInstruction *LowerPair = createInstruction<SelectInstruction>(
+      false, MirI64Type, IsSecondInPair, ValueComponents[0],
+      ValueComponents[1]);
+  MInstruction *SelectedComponent = createInstruction<SelectInstruction>(
+      false, MirI64Type, IsLowerPair, LowerPair, UpperPair);
+
+  return buildByteResult(SelectedComponent, BitOffset, IsOutOfBounds);
 }
 
 // EVM SIGNEXTEND opcode: sign-extends a signed integer from (index+1) bytes to
@@ -1752,6 +4082,21 @@ typename EVMMirBuilder::Operand EVMMirBuilder::handleByte(Operand IndexOp,
 //   SIGNEXTEND(31, 0x1234) = 0x1234 (no extension when index >= 31)
 typename EVMMirBuilder::Operand
 EVMMirBuilder::handleSignextend(Operand IndexOp, Operand ValueOp) {
+  // Constant folding: both index and value known at compile time.  Mirrors the
+  // inline lowering below: index >= 31 leaves the value untouched (the sign
+  // byte is already the top byte); otherwise sign-extend from bit index*8+7.
+  if (IndexOp.isConstant() && ValueOp.isConstant()) {
+    intx::uint256 Value = u256ValueToIntx(ValueOp.getConstValue());
+    const intx::uint256 Index = u256ValueToIntx(IndexOp.getConstValue());
+    if (Index < 31) {
+      const unsigned SignBit = static_cast<unsigned>(Index) * 8 + 7;
+      const intx::uint256 LowMask = (intx::uint256(1) << (SignBit + 1)) - 1;
+      const bool Negative = (static_cast<uint64_t>(Value >> SignBit) & 1) != 0;
+      Value = Negative ? (Value | ~LowMask) : (Value & LowMask);
+    }
+    return Operand(intxToU256Value(Value));
+  }
+
   U256Inst IndexComponents = extractU256Operand(IndexOp);
   U256Inst ValueComponents = extractU256Operand(ValueOp);
 
@@ -1760,54 +4105,58 @@ EVMMirBuilder::handleSignextend(Operand IndexOp, Operand ValueOp) {
 
   MType *MirI64Type =
       EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MType *MirI8Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT8);
 
-  // Calculate sign bit position: index * 8 + 7
-  MInstruction *Const8 = createIntConstInstruction(MirI64Type, 8);
-  MInstruction *ByteBitPos = createInstruction<BinaryInstruction>(
-      false, OP_mul, MirI64Type, IndexComponents[0], Const8);
   MInstruction *Const7 = createIntConstInstruction(MirI64Type, 7);
-  MInstruction *SignBitPos = createInstruction<BinaryInstruction>(
-      false, OP_add, MirI64Type, ByteBitPos, Const7);
-
-  // ComponentIndex = (index * 8 + 7) / 64
-  MInstruction *Const64 = createIntConstInstruction(MirI64Type, 64);
-  MInstruction *ComponentIndex = createInstruction<BinaryInstruction>(
-      false, OP_udiv, MirI64Type, SignBitPos, Const64);
-  // BitOffset = (index * 8 + 7) % 64
-  MInstruction *BitOffset = createInstruction<BinaryInstruction>(
-      false, OP_urem, MirI64Type, SignBitPos, Const64);
-
-  // Calculate sign extension mask
-  // FullMask = (1 << (BitOffset + 1)) - 1
-  // InvMask = ~FullMask = FullMask ^ AllOnes
-  MInstruction *One = createIntConstInstruction(MirI64Type, 1);
+  MInstruction *Const3 = createIntConstInstruction(MirI64Type, 3);
+  MInstruction *Const63 = createIntConstInstruction(MirI64Type, 63);
   MInstruction *AllOnes = createIntConstInstruction(MirI64Type, ~0ULL);
-  MInstruction *MaskBits = createInstruction<BinaryInstruction>(
-      false, OP_add, MirI64Type, BitOffset, One);
-  MInstruction *Mask = createInstruction<BinaryInstruction>(
-      false, OP_shl, MirI64Type, One, MaskBits);
-  MInstruction *FullMask = createInstruction<BinaryInstruction>(
-      false, OP_sub, MirI64Type, Mask, One);
-  MInstruction *InvMask = createInstruction<BinaryInstruction>(
-      false, OP_xor, MirI64Type, FullMask, AllOnes);
-
-  // Extract sign bit
   MInstruction *Zero = createIntConstInstruction(MirI64Type, 0);
-  MInstruction *SignBit = Zero;
-  for (int I = 0; I < 4; I++) {
-    MInstruction *IsComp = createInstruction<CmpInstruction>(
-        false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, ComponentIndex,
+
+  // Match the interpreter strategy:
+  //   sign_word_index = index / 8
+  //   sign_byte_index = index % 8
+  //   sign_word = value[sign_word_index]
+  //   sign_word' = sext(int8(sign_word >> (sign_byte_index * 8)))
+  //   upper words = sign fill
+  MInstruction *SignWordIndex = createInstruction<BinaryInstruction>(
+      false, OP_ushr, MirI64Type, IndexComponents[0], Const3);
+  MInstruction *SignByteIndex = createInstruction<BinaryInstruction>(
+      false, OP_and, MirI64Type, IndexComponents[0], Const7);
+  MInstruction *SignByteOffset = createInstruction<BinaryInstruction>(
+      false, OP_shl, MirI64Type, SignByteIndex, Const3);
+
+  MInstruction *SelectedWord = ValueComponents[0];
+  for (size_t I = 1; I < EVM_ELEMENTS_COUNT; ++I) {
+    MInstruction *IsThisWord = createInstruction<CmpInstruction>(
+        false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, SignWordIndex,
         createIntConstInstruction(MirI64Type, I));
-    // Shifted = ValueComponents[I] >> BitOffset
-    MInstruction *Shifted = createInstruction<BinaryInstruction>(
-        false, OP_ushr, MirI64Type, ValueComponents[I], BitOffset);
-    // Bit = Shifted & 1
-    MInstruction *Bit = createInstruction<BinaryInstruction>(
-        false, OP_and, MirI64Type, Shifted, One);
-    // SignBit = IsComp ? Bit : SignBit
-    SignBit = createInstruction<SelectInstruction>(false, MirI64Type, IsComp,
-                                                   Bit, SignBit);
+    SelectedWord = createInstruction<SelectInstruction>(
+        false, MirI64Type, IsThisWord, ValueComponents[I], SelectedWord);
   }
+
+  MInstruction *ShiftedWord = createInstruction<BinaryInstruction>(
+      false, OP_ushr, MirI64Type, SelectedWord, SignByteOffset);
+  MInstruction *ConstFF = createIntConstInstruction(MirI64Type, 0xFF);
+  MInstruction *SignByte = createInstruction<BinaryInstruction>(
+      false, OP_and, MirI64Type, ShiftedWord, ConstFF);
+  MInstruction *SignByteI8 = createInstruction<ConversionInstruction>(
+      false, OP_trunc, MirI8Type, SignByte);
+  MInstruction *SextByte = createInstruction<ConversionInstruction>(
+      false, OP_sext, MirI64Type, SignByteI8);
+
+  MInstruction *SignMask = createInstruction<BinaryInstruction>(
+      false, OP_shl, MirI64Type, AllOnes, SignByteOffset);
+  MInstruction *LowerMask = createInstruction<BinaryInstruction>(
+      false, OP_xor, MirI64Type, SignMask, AllOnes);
+  MInstruction *LowerBits = createInstruction<BinaryInstruction>(
+      false, OP_and, MirI64Type, SelectedWord, LowerMask);
+  MInstruction *SextWord = createInstruction<BinaryInstruction>(
+      false, OP_shl, MirI64Type, SextByte, SignByteOffset);
+  MInstruction *ExtendedSelectedWord = createInstruction<BinaryInstruction>(
+      false, OP_or, MirI64Type, SextWord, LowerBits);
+  MInstruction *HighValue = createInstruction<BinaryInstruction>(
+      false, OP_sshr, MirI64Type, SextByte, Const63);
 
   // Create sign extension for each component
   U256Inst ResultComponents = {};
@@ -1815,28 +4164,16 @@ EVMMirBuilder::handleSignextend(Operand IndexOp, Operand ValueOp) {
     MInstruction *CompIdx = createIntConstInstruction(MirI64Type, I);
     MInstruction *IsAbove = createInstruction<CmpInstruction>(
         false, CmpInstruction::Predicate::ICMP_UGT, &Ctx.I64Type, CompIdx,
-        ComponentIndex);
+        SignWordIndex);
     MInstruction *IsEqual = createInstruction<CmpInstruction>(
         false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, CompIdx,
-        ComponentIndex);
-
-    // For components above sign bit: all 1s if negative, all 0s if positive
-    MInstruction *HighValue = createInstruction<SelectInstruction>(
-        false, MirI64Type, SignBit, AllOnes, Zero);
-
-    // For sign component: apply mask and sign extension
-    MInstruction *SignCompValue = createInstruction<BinaryInstruction>(
-        false, OP_and, MirI64Type, ValueComponents[I], FullMask);
-    MInstruction *SignExtBits = createInstruction<BinaryInstruction>(
-        false, OP_and, MirI64Type, InvMask, HighValue);
-    MInstruction *ExtendedSignComp = createInstruction<BinaryInstruction>(
-        false, OP_or, MirI64Type, SignCompValue, SignExtBits);
+        SignWordIndex);
 
     // Select appropriate value based on position relative to sign bit
+    MInstruction *SameOrBelow = createInstruction<SelectInstruction>(
+        false, MirI64Type, IsEqual, ExtendedSelectedWord, ValueComponents[I]);
     MInstruction *ComponentResult = createInstruction<SelectInstruction>(
-        false, MirI64Type, IsAbove, HighValue,
-        createInstruction<SelectInstruction>(
-            false, MirI64Type, IsEqual, ExtendedSignComp, ValueComponents[I]));
+        false, MirI64Type, IsAbove, HighValue, SameOrBelow);
 
     // If index >= 31, use original value; otherwise use sign-extended value
     ResultComponents[I] =
@@ -1855,22 +4192,36 @@ typename EVMMirBuilder::Operand EVMMirBuilder::handlePC(const uint64_t &PC) {
   MType *UInt64Type =
       EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
   MInstruction *PCInst = createIntConstInstruction(UInt64Type, PC);
+  // Spill the constant through a temporary so it can be safely re-read across
+  // basic blocks (e.g. when the value is later consumed in the slow path of
+  // ADDMOD/MULMOD). Without this, cross-BB reuse of the constant instruction
+  // can hit a stale vreg in the lowering expression cache.
+  PCInst = protectUnsafeValue(PCInst, UInt64Type);
 
   // Convert the 64-bit PC value to U256 format (EVM specification)
   return convertSingleInstrToU256Operand(PCInst);
 }
 
 typename EVMMirBuilder::Operand EVMMirBuilder::handleGas() {
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
-  syncGasToMemory();
+  if (Ctx.isGasRegisterEnabled() && GasRegVar) {
+    MInstruction *GasValue =
+        protectUnsafeValue(loadVariable(GasRegVar), I64Type);
+    return convertSingleInstrToU256Operand(GasValue);
+  }
 #endif
-  const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  return callRuntimeFor<uint64_t>(RuntimeFunctions.GetGas);
+  MInstruction *GasValue = getInstanceElement(
+      &Ctx.I64Type, zen::runtime::EVMInstance::getGasFieldOffset());
+  GasValue = protectUnsafeValue(GasValue, I64Type);
+  return convertSingleInstrToU256Operand(GasValue);
 }
 
 typename EVMMirBuilder::Operand EVMMirBuilder::handleAddress() {
-  const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  return callRuntimeFor(RuntimeFunctions.GetAddress);
+  MInstruction *MsgPtr = loadProtectedInstancePointer(
+      zen::runtime::EVMInstance::getCurrentMessagePointerOffset());
+  return loadProtectedAddressFieldAsU256(
+      MsgPtr, zen::runtime::EVMInstance::getMessageRecipientOffset());
 }
 
 typename EVMMirBuilder::Operand EVMMirBuilder::handleBalance(Operand Address) {
@@ -1878,8 +4229,9 @@ typename EVMMirBuilder::Operand EVMMirBuilder::handleBalance(Operand Address) {
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemory();
 #endif
-  auto Result = callRuntimeFor<const intx::uint256 *, const uint8_t *>(
-      RuntimeFunctions.GetBalance, Address);
+  auto Result =
+      callRuntimeForWithErrorCheck<const intx::uint256 *, const uint8_t *>(
+          RuntimeFunctions.GetBalance, Address);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   reloadGasFromMemory();
 #endif
@@ -1892,19 +4244,24 @@ typename EVMMirBuilder::Operand EVMMirBuilder::handleOrigin() {
 }
 
 typename EVMMirBuilder::Operand EVMMirBuilder::handleCaller() {
-  const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  return callRuntimeFor(RuntimeFunctions.GetCaller);
+  MInstruction *MsgPtr = loadProtectedInstancePointer(
+      zen::runtime::EVMInstance::getCurrentMessagePointerOffset());
+  return loadProtectedAddressFieldAsU256(
+      MsgPtr, zen::runtime::EVMInstance::getMessageSenderOffset());
 }
 
 typename EVMMirBuilder::Operand EVMMirBuilder::handleCallValue() {
-  const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  return callRuntimeFor(RuntimeFunctions.GetCallValue);
+  MInstruction *MsgPtr = loadProtectedInstancePointer(
+      zen::runtime::EVMInstance::getCurrentMessagePointerOffset());
+  return loadProtectedBytes32FieldAsU256(
+      MsgPtr, zen::runtime::EVMInstance::getMessageValueOffset());
 }
 
 typename EVMMirBuilder::Operand
 EVMMirBuilder::handleCallDataLoad(Operand Offset) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  normalizeOperandU64(Offset);
+  uint64_t Non64Value = std::numeric_limits<uint64_t>::max();
+  normalizeOperandU64(Offset, &Non64Value);
   return callRuntimeFor<const uint8_t *, uint64_t>(
       RuntimeFunctions.GetCallDataLoad, Offset);
 }
@@ -1915,26 +4272,32 @@ typename EVMMirBuilder::Operand EVMMirBuilder::handleGasPrice() {
 }
 
 typename EVMMirBuilder::Operand EVMMirBuilder::handleCallDataSize() {
-  const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  return callRuntimeFor(RuntimeFunctions.GetCallDataSize);
+  MInstruction *MsgPtr = loadProtectedInstancePointer(
+      zen::runtime::EVMInstance::getCurrentMessagePointerOffset());
+  MInstruction *InputSize = loadProtectedU64Field(
+      MsgPtr, zen::runtime::EVMInstance::getMessageInputSizeOffset());
+  return convertSingleInstrToU256Operand(InputSize);
 }
 
 typename EVMMirBuilder::Operand EVMMirBuilder::handleCodeSize() {
-  const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  return callRuntimeFor(RuntimeFunctions.GetCodeSize);
+  MInstruction *ModulePtr = loadProtectedInstancePointer(
+      zen::runtime::EVMInstance::getModuleOffset());
+  MInstruction *CodeSize = loadProtectedU64Field(
+      ModulePtr, zen::runtime::EVMModule::getCodeSizeOffset());
+  return convertSingleInstrToU256Operand(CodeSize);
 }
 
 void EVMMirBuilder::handleCodeCopy(Operand DestOffsetComponents,
                                    Operand OffsetComponents,
                                    Operand SizeComponents) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  normalizeOperandU64(DestOffsetComponents);
-  normalizeOperandU64(OffsetComponents);
-  normalizeOperandU64(SizeComponents);
+  normalizeOffsetWithSize(DestOffsetComponents, SizeComponents);
+  uint64_t Non64Value = std::numeric_limits<uint64_t>::max();
+  normalizeOperandU64(OffsetComponents, &Non64Value);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemory();
 #endif
-  callRuntimeFor<void, uint64_t, uint64_t, uint64_t>(
+  callRuntimeForWithErrorCheck<void, uint64_t, uint64_t, uint64_t>(
       RuntimeFunctions.SetCodeCopy, DestOffsetComponents, OffsetComponents,
       SizeComponents);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
@@ -1949,7 +4312,7 @@ EVMMirBuilder::handleExtCodeSize(Operand Address) {
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemory();
 #endif
-  auto Result = callRuntimeFor<uint64_t, const uint8_t *>(
+  auto Result = callRuntimeForWithErrorCheck<uint64_t, const uint8_t *>(
       RuntimeFunctions.GetExtCodeSize, Address);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   reloadGasFromMemory();
@@ -1963,8 +4326,9 @@ EVMMirBuilder::handleExtCodeHash(Operand Address) {
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemory();
 #endif
-  auto Result = callRuntimeFor<const uint8_t *, const uint8_t *>(
-      RuntimeFunctions.GetExtCodeHash, Address);
+  auto Result =
+      callRuntimeForWithErrorCheck<const intx::uint256 *, const uint8_t *>(
+          RuntimeFunctions.GetExtCodeHash, Address);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   reloadGasFromMemory();
 #endif
@@ -1974,6 +4338,8 @@ EVMMirBuilder::handleExtCodeHash(Operand Address) {
 typename EVMMirBuilder::Operand
 EVMMirBuilder::handleBlockHash(Operand BlockNumber) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
+  uint64_t Non64Value = std::numeric_limits<uint64_t>::max();
+  normalizeOperandU64(BlockNumber, &Non64Value);
   return callRuntimeFor<const uint8_t *, int64_t>(RuntimeFunctions.GetBlockHash,
                                                   BlockNumber);
 }
@@ -2039,33 +4405,149 @@ typename EVMMirBuilder::Operand EVMMirBuilder::handleMSize() {
   MemSize = protectUnsafeValue(MemSize, &Ctx.I64Type);
   return convertSingleInstrToU256Operand(MemSize);
 }
+
+void EVMMirBuilder::fallbackToInterpreter(uint64_t targetPC) {
+  // Phase 1 implementation: Basic fallback infrastructure
+  // This method provides the interface for JIT-to-interpreter fallback
+  //
+  // The method generates MIR instructions to:
+  // 1. Synchronize current execution state (stack, memory) with EVMInstance
+  // 2. Call the runtime fallback function with the target PC
+  //
+  // State synchronization is handled automatically by the existing
+  // EVMInstance state management, so we can directly call the runtime function.
+
+#ifdef ZEN_ENABLE_EVM_GAS_REGISTER
+  syncGasToMemory();
+#endif
+  // Sync stack size to memory, all stack elements should be synced before
+  // calling this function
+  const int32_t StackSizeOffset =
+      zen::runtime::EVMInstance::getEVMStackSizeOffset();
+  MInstruction *StackSize = loadVariable(StackSizeVar);
+  setInstanceElement(&Ctx.I64Type, StackSize, StackSizeOffset);
+
+  const auto &RuntimeFunctions = getRuntimeFunctionTable();
+  // Create a constant instruction for the target PC
+  MType *I64Type = &Ctx.I64Type;
+  MInstruction *PCConst = createIntConstInstruction(I64Type, targetPC);
+
+  // Call the runtime fallback function
+  // This will transfer control to the interpreter at the specified PC
+  callRuntimeFor<void, uint64_t>(RuntimeFunctions.HandleFallback,
+                                 Operand(PCConst, EVMType::UINT64));
+
+  createInstruction<BrInstruction>(true, Ctx, ReturnBB);
+  addSuccessor(ReturnBB);
+
+  if (ReturnBB->empty()) {
+    setInsertBlock(ReturnBB);
+    handleVoidReturn();
+  }
+}
+
 typename EVMMirBuilder::Operand
 EVMMirBuilder::handleMLoad(Operand AddrComponents) {
-  normalizeOperandU64(AddrComponents);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemory();
 #endif
   MType *I64Type = &Ctx.I64Type;
+  uint64_t ConstAddr = 0;
+  const bool OffsetWasConst = AddrComponents.isConstU64();
+  const uint64_t OriginalConstOffset =
+      OffsetWasConst ? AddrComponents.getConstValue()[0] : 0;
+  bool OffsetKnownU64 = OffsetWasConst;
+  const bool CanUseConstBaseDispPath =
+      OffsetWasConst && (ConstAddr = OriginalConstOffset) <=
+                            static_cast<uint64_t>(INT32_MAX - 24);
 
-  U256Inst AddrParts = extractU256Operand(AddrComponents);
-  MInstruction *Offset = AddrParts[0];
+  const bool CanUseLinearU64AddrFastPath =
+      CurBlockLinearPrecheckPlan.Active &&
+      CurBlockLinearPrecheckPlan.CoveredDirectOpsRemaining != 0;
+  MInstruction *Offset = nullptr;
+  bool UsedLinearPrecheck = false;
+  if (CanUseLinearU64AddrFastPath) {
+    Offset = extractKnownU64LowOperand(AddrComponents);
+    UsedLinearPrecheck = tryConsumeLinearBlockMemoryPrecheck(Offset, nullptr);
+    OffsetKnownU64 = OffsetKnownU64 || UsedLinearPrecheck;
+  }
+  if (!UsedLinearPrecheck) {
+    normalizeOperandU64(AddrComponents);
+    Offset = extractKnownU64LowOperand(AddrComponents);
+  }
+  bool UsedSharedPrecheck =
+      UsedLinearPrecheck || tryConsumeConstBlockMemoryPrecheck();
+  noteSmallFrameMemoryOp(SmallFrameMemoryOp::MLoad, OffsetWasConst,
+                         OriginalConstOffset, OffsetKnownU64, 32,
+                         UsedSharedPrecheck);
+  if (!UsedSharedPrecheck) {
+    MInstruction *SizeConst = createIntConstInstruction(I64Type, 32);
+    MInstruction *RequiredSize = createInstruction<BinaryInstruction>(
+        false, OP_add, I64Type, Offset, SizeConst);
+    MInstruction *Overflow = createInstruction<CmpInstruction>(
+        false, CmpInstruction::Predicate::ICMP_ULT, I64Type, RequiredSize,
+        Offset);
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.MLoadExpandCount;
+    if (CurBlockMemStats.Active) {
+      CurBlockMemStats.ExpandCallCount++;
+    }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    expandMemoryIR(RequiredSize, Overflow);
+  }
 
-  MInstruction *SizeConst = createIntConstInstruction(I64Type, 32);
-  MInstruction *RequiredSize = createInstruction<BinaryInstruction>(
-      false, OP_add, I64Type, Offset, SizeConst);
-  MInstruction *Overflow = createInstruction<CmpInstruction>(
-      false, CmpInstruction::Predicate::ICMP_ULT, I64Type, RequiredSize,
-      Offset);
-  expandMemoryIR(RequiredSize, Overflow);
+  Operand Result;
+  if (!UsedLinearPrecheck && UsedSharedPrecheck && CanUseConstBaseDispPath) {
+    MInstruction *BasePtr = getConstBlockDirectMemoryBasePtr();
+    Result = loadU256FromBytes32BaseDisplaced(BasePtr, ConstAddr);
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.ConstDispBytes32MLoadCount;
+    if (CurBlockMemStats.Active) {
+      ++CurBlockMemStats.ConstDispBytes32MLoadCount;
+    }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  } else {
+    MInstruction *MemBase = getDirectMemoryDataPointer(UsedSharedPrecheck);
+    MInstruction *MemAddrInt = createInstruction<BinaryInstruction>(
+        false, OP_add, I64Type, MemBase, Offset);
+    MInstruction *MemPtr = createInstruction<ConversionInstruction>(
+        false, OP_inttoptr, createVoidPtrType(), MemAddrInt);
+    MemPtr = anchorDirectMemoryPointer(MemPtr);
+    Result = loadU256FromBytes32PointerDisplaced(MemPtr);
+  }
 
-  MInstruction *MemBase = getMemoryDataPointer();
-  MInstruction *MemAddrInt = createInstruction<BinaryInstruction>(
-      false, OP_add, I64Type, MemBase, Offset);
-  MInstruction *MemPtr = createInstruction<ConversionInstruction>(
-      false, OP_inttoptr, createVoidPtrType(), MemAddrInt);
+  // Pin loaded values into local variables so the backend cannot reschedule
+  // the memory reads past later function calls (e.g. CODECOPY / MSTORE) that
+  // may modify the same memory region.  Without this, an MLOAD result that
+  // stays on the EVM stack across a memory-writing opcode could observe the
+  // *new* contents instead of the value at the time of the MLOAD.
+  U256Inst Parts = extractU256Operand(Result);
+  for (int I = 0; I < static_cast<int>(EVM_ELEMENTS_COUNT); ++I) {
+    Parts[I] = protectUnsafeValue(Parts[I], I64Type);
+  }
+  Result = Operand(Parts, EVMType::UINT256);
 
-  Operand Bytes32Op(MemPtr, EVMType::BYTES32);
-  Operand Result = convertBytes32ToU256Operand(Bytes32Op);
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  if (UsedLinearPrecheck) {
+    ++MemStats.LinearU64AddrFastPathCount;
+    ++MemStats.LinearU64MLoadFastPathCount;
+    if (CurBlockMemStats.Active) {
+      ++CurBlockMemStats.LinearU64AddrFastPathCount;
+      ++CurBlockMemStats.LinearU64MLoadFastPathCount;
+    }
+  }
+  if (UsedSharedPrecheck) {
+    ++MemStats.PrecheckedMLoadOpCount;
+    if (CurBlockMemStats.Active) {
+      ++CurBlockMemStats.PrecheckedMLoadOpCount;
+    }
+  }
+  ++MemStats.DispBytes32MLoadCount;
+  if (CurBlockMemStats.Active) {
+    ++CurBlockMemStats.DispBytes32MLoadCount;
+  }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   reloadGasFromMemory();
 #endif
@@ -2074,58 +4556,144 @@ EVMMirBuilder::handleMLoad(Operand AddrComponents) {
 
 void EVMMirBuilder::handleMStore(Operand AddrComponents,
                                  Operand ValueComponents) {
-  normalizeOperandU64(AddrComponents);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemory();
 #endif
   MType *I64Type = &Ctx.I64Type;
+  uint64_t ConstAddr = 0;
+  const bool OffsetWasConst = AddrComponents.isConstU64();
+  const uint64_t OriginalConstOffset =
+      OffsetWasConst ? AddrComponents.getConstValue()[0] : 0;
+  bool OffsetKnownU64 = OffsetWasConst;
+  const bool CanUseConstBaseDispPath =
+      OffsetWasConst && (ConstAddr = OriginalConstOffset) <=
+                            static_cast<uint64_t>(INT32_MAX - 24);
 
-  U256Inst AddrParts = extractU256Operand(AddrComponents);
-  MInstruction *Offset = AddrParts[0];
-  U256Inst ValueParts = extractU256Operand(ValueComponents);
-
-  MInstruction *SizeConst = createIntConstInstruction(I64Type, 32);
-  MInstruction *RequiredSize = createInstruction<BinaryInstruction>(
-      false, OP_add, I64Type, Offset, SizeConst);
-  // Tie expansion ordering to the stored value to prevent reordering.
-  MInstruction *Zero = createIntConstInstruction(I64Type, 0);
-  MInstruction *ValueDep = createInstruction<BinaryInstruction>(
-      false, OP_or, I64Type, ValueParts[0], ValueParts[1]);
-  ValueDep = createInstruction<BinaryInstruction>(false, OP_or, I64Type,
-                                                  ValueDep, ValueParts[2]);
-  ValueDep = createInstruction<BinaryInstruction>(false, OP_or, I64Type,
-                                                  ValueDep, ValueParts[3]);
-  ValueDep = createInstruction<BinaryInstruction>(false, OP_and, I64Type,
-                                                  ValueDep, Zero);
-  RequiredSize = createInstruction<BinaryInstruction>(false, OP_add, I64Type,
-                                                      RequiredSize, ValueDep);
-  MInstruction *Overflow = createInstruction<CmpInstruction>(
-      false, CmpInstruction::Predicate::ICMP_ULT, I64Type, RequiredSize,
-      Offset);
-  expandMemoryIR(RequiredSize, Overflow);
-
-  MInstruction *MemBase = getMemoryDataPointer();
-  MInstruction *BaseAddrInt = createInstruction<BinaryInstruction>(
-      false, OP_add, I64Type, MemBase, Offset);
-
-  MPointerType *U64PtrType = MPointerType::create(Ctx, Ctx.I64Type);
-
-  auto ByteSwap64 = [&](MInstruction *Value) -> MInstruction * {
-    return createInstruction<UnaryInstruction>(false, OP_bswap, I64Type, Value);
-  };
-
-  for (int Component = 0; Component < 4; ++Component) {
-    MInstruction *RawValue = ValueParts[3 - Component];
-    MInstruction *Swapped = ByteSwap64(RawValue);
-
-    MInstruction *OffsetValue = createIntConstInstruction(
-        I64Type, static_cast<uint64_t>(Component * 8));
-    MInstruction *Addr = createInstruction<BinaryInstruction>(
-        false, OP_add, I64Type, BaseAddrInt, OffsetValue);
-    MInstruction *Ptr = createInstruction<ConversionInstruction>(
-        false, OP_inttoptr, U64PtrType, Addr);
-    createInstruction<StoreInstruction>(true, &Ctx.VoidType, Swapped, Ptr);
+  U256Inst ValueParts = {};
+  bool HasValueParts = false;
+  bool CanReuseAddrAsValue =
+      CurBlockLinearPrecheckPlan.Active &&
+      CurBlockLinearPrecheckPlan.CoveredDirectOpsRemaining != 0 &&
+      CurBlockLinearPrecheckPlan.ValueEqualsFirstAddr;
+  const bool CanUseLinearU64AddrFastPath =
+      CurBlockLinearPrecheckPlan.Active &&
+      CurBlockLinearPrecheckPlan.CoveredDirectOpsRemaining != 0;
+  MInstruction *Offset = nullptr;
+  bool UsedLinearPrecheck = false;
+  if (CanUseLinearU64AddrFastPath) {
+    Offset = extractKnownU64LowOperand(AddrComponents);
+    UsedLinearPrecheck = tryConsumeLinearBlockMemoryPrecheck(Offset, nullptr);
+    OffsetKnownU64 = OffsetKnownU64 || UsedLinearPrecheck;
   }
+  if (!UsedLinearPrecheck) {
+    normalizeOperandU64(AddrComponents);
+    Offset = extractKnownU64LowOperand(AddrComponents);
+  }
+  bool UsedSharedPrecheck =
+      UsedLinearPrecheck || tryConsumeConstBlockMemoryPrecheck();
+  noteSmallFrameMemoryOp(SmallFrameMemoryOp::MStore, OffsetWasConst,
+                         OriginalConstOffset, OffsetKnownU64, 32,
+                         UsedSharedPrecheck);
+  if (!UsedSharedPrecheck) {
+    ValueParts = extractU256Operand(ValueComponents);
+    HasValueParts = true;
+    MInstruction *SizeConst = createIntConstInstruction(I64Type, 32);
+    MInstruction *RequiredSize = createInstruction<BinaryInstruction>(
+        false, OP_add, I64Type, Offset, SizeConst);
+    // Tie expansion ordering to the stored value to prevent reordering on the
+    // fallback path that still emits a per-op expand sequence.
+    MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+    MInstruction *ValueDep = createInstruction<BinaryInstruction>(
+        false, OP_or, I64Type, ValueParts[0], ValueParts[1]);
+    ValueDep = createInstruction<BinaryInstruction>(false, OP_or, I64Type,
+                                                    ValueDep, ValueParts[2]);
+    ValueDep = createInstruction<BinaryInstruction>(false, OP_or, I64Type,
+                                                    ValueDep, ValueParts[3]);
+    ValueDep = createInstruction<BinaryInstruction>(false, OP_and, I64Type,
+                                                    ValueDep, Zero);
+    RequiredSize = createInstruction<BinaryInstruction>(false, OP_add, I64Type,
+                                                        RequiredSize, ValueDep);
+    MInstruction *Overflow = createInstruction<CmpInstruction>(
+        false, CmpInstruction::Predicate::ICMP_ULT, I64Type, RequiredSize,
+        Offset);
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.MStoreExpandCount;
+    if (CurBlockMemStats.Active) {
+      CurBlockMemStats.ExpandCallCount++;
+    }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    expandMemoryIR(RequiredSize, Overflow);
+  }
+
+  if (!HasValueParts && UsedSharedPrecheck && CanReuseAddrAsValue) {
+    MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+    ValueParts = {Offset, Zero, Zero, Zero};
+    HasValueParts = true;
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.MStoreAddrValueAliasReuseCount;
+    if (CurBlockMemStats.Active) {
+      ++CurBlockMemStats.MStoreAddrValueAliasReuseCount;
+    }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  }
+
+  if (!HasValueParts) {
+    ValueParts = extractU256Operand(ValueComponents);
+  }
+  const bool IsFirstLinearStore =
+      UsedLinearPrecheck &&
+      CurBlockLinearPrecheckPlan.CoveredDirectOpsTotal != 0 &&
+      (CurBlockLinearPrecheckPlan.CoveredDirectOpsRemaining + 1) ==
+          CurBlockLinearPrecheckPlan.CoveredDirectOpsTotal;
+  uint64_t SkipLeadingZeroLimbStores = 0;
+  if (UsedLinearPrecheck && CanReuseAddrAsValue && !IsFirstLinearStore) {
+    SkipLeadingZeroLimbStores =
+        Ctx.getMemoryLinearStrideSkipLeadingZeroLimbStores();
+  }
+
+  if (!UsedLinearPrecheck && UsedSharedPrecheck && CanUseConstBaseDispPath) {
+    MInstruction *BasePtr = getConstBlockDirectMemoryBasePtr();
+    storeU256ToBytes32BaseDisplaced(BasePtr, ConstAddr, ValueParts,
+                                    SkipLeadingZeroLimbStores);
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.ConstDispBytes32MStoreCount;
+    ++MemStats.DispBytes32MStoreCount;
+    if (CurBlockMemStats.Active) {
+      ++CurBlockMemStats.ConstDispBytes32MStoreCount;
+      ++CurBlockMemStats.DispBytes32MStoreCount;
+    }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  } else {
+    MInstruction *MemBase = getDirectMemoryDataPointer(UsedSharedPrecheck);
+    MInstruction *BaseAddrInt = createInstruction<BinaryInstruction>(
+        false, OP_add, I64Type, MemBase, Offset);
+    MInstruction *BasePtr = createInstruction<ConversionInstruction>(
+        false, OP_inttoptr, createVoidPtrType(), BaseAddrInt);
+    BasePtr = anchorDirectMemoryPointer(BasePtr);
+    storeU256ToBytes32Pointer(BasePtr, ValueParts, SkipLeadingZeroLimbStores);
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.DispBytes32MStoreCount;
+    if (CurBlockMemStats.Active) {
+      ++CurBlockMemStats.DispBytes32MStoreCount;
+    }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  }
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  if (UsedLinearPrecheck) {
+    ++MemStats.LinearU64AddrFastPathCount;
+    ++MemStats.LinearU64MStoreFastPathCount;
+    if (CurBlockMemStats.Active) {
+      ++CurBlockMemStats.LinearU64AddrFastPathCount;
+      ++CurBlockMemStats.LinearU64MStoreFastPathCount;
+    }
+  }
+  if (UsedSharedPrecheck) {
+    ++MemStats.PrecheckedMStoreOpCount;
+    if (CurBlockMemStats.Active) {
+      ++CurBlockMemStats.PrecheckedMStoreOpCount;
+    }
+  }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   reloadGasFromMemory();
 #endif
@@ -2133,6 +4701,14 @@ void EVMMirBuilder::handleMStore(Operand AddrComponents,
 
 void EVMMirBuilder::handleMStore8(Operand AddrComponents,
                                   Operand ValueComponents) {
+  uint64_t ConstAddr = 0;
+  const bool OffsetWasConst = AddrComponents.isConstU64();
+  const uint64_t OriginalConstOffset =
+      OffsetWasConst ? AddrComponents.getConstValue()[0] : 0;
+  const bool OffsetKnownU64 = OffsetWasConst;
+  const bool CanUseConstBaseDispPath =
+      OffsetWasConst &&
+      (ConstAddr = OriginalConstOffset) <= static_cast<uint64_t>(INT32_MAX);
   normalizeOperandU64(AddrComponents);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemory();
@@ -2155,15 +4731,19 @@ void EVMMirBuilder::handleMStore8(Operand AddrComponents,
   MInstruction *Overflow = createInstruction<CmpInstruction>(
       false, CmpInstruction::Predicate::ICMP_ULT, I64Type, RequiredSize,
       Offset);
-  expandMemoryIR(RequiredSize, Overflow);
-
-  MInstruction *MemBase = getMemoryDataPointer();
-  MInstruction *AddrInt = createInstruction<BinaryInstruction>(
-      false, OP_add, I64Type, MemBase, Offset);
-
-  MPointerType *I8PtrType = MPointerType::create(Ctx, Ctx.I8Type);
-  MInstruction *AddrPtr = createInstruction<ConversionInstruction>(
-      false, OP_inttoptr, I8PtrType, AddrInt);
+  bool UsedSharedPrecheck = tryConsumeConstBlockMemoryPrecheck();
+  noteSmallFrameMemoryOp(SmallFrameMemoryOp::MStore8, OffsetWasConst,
+                         OriginalConstOffset, OffsetKnownU64, 1,
+                         UsedSharedPrecheck);
+  if (!UsedSharedPrecheck) {
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.MStore8ExpandCount;
+    if (CurBlockMemStats.Active) {
+      CurBlockMemStats.ExpandCallCount++;
+    }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    expandMemoryIR(RequiredSize, Overflow);
+  }
 
   MInstruction *Low64 = ValueParts[0];
   MInstruction *Mask = createIntConstInstruction(I64Type, 0xFF);
@@ -2171,7 +4751,21 @@ void EVMMirBuilder::handleMStore8(Operand AddrComponents,
       createInstruction<BinaryInstruction>(false, OP_and, I64Type, Low64, Mask);
   MInstruction *ByteValue = createInstruction<ConversionInstruction>(
       false, OP_trunc, &Ctx.I8Type, Masked);
-  createInstruction<StoreInstruction>(true, &Ctx.VoidType, ByteValue, AddrPtr);
+  if (UsedSharedPrecheck && CanUseConstBaseDispPath) {
+    MInstruction *BasePtr = getConstBlockDirectMemoryBasePtr();
+    createInstruction<StoreInstruction>(true, &Ctx.VoidType, ByteValue, BasePtr,
+                                        static_cast<int32_t>(ConstAddr));
+  } else {
+    MInstruction *MemBase = getDirectMemoryDataPointer(UsedSharedPrecheck);
+    MInstruction *AddrInt = createInstruction<BinaryInstruction>(
+        false, OP_add, I64Type, MemBase, Offset);
+
+    MPointerType *I8PtrType = MPointerType::create(Ctx, Ctx.I8Type);
+    MInstruction *AddrPtr = createInstruction<ConversionInstruction>(
+        false, OP_inttoptr, I8PtrType, AddrInt);
+    createInstruction<StoreInstruction>(true, &Ctx.VoidType, ByteValue,
+                                        AddrPtr);
+  }
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   reloadGasFromMemory();
 #endif
@@ -2243,6 +4837,12 @@ void EVMMirBuilder::handleMCopy(Operand DestAddrComponents,
       false, CmpInstruction::Predicate::ICMP_UGT, I64Type, DestEnd, SrcEnd);
   MInstruction *RequiredSize = createInstruction<SelectInstruction>(
       false, I64Type, DestGreater, DestEnd, SrcEnd);
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  ++MemStats.MCopyExpandCount;
+  if (CurBlockMemStats.Active) {
+    CurBlockMemStats.ExpandCallCount++;
+  }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
   expandMemoryIR(RequiredSize, Overflow);
 
   MInstruction *MemBase = getMemoryDataPointer();
@@ -2277,45 +4877,47 @@ void EVMMirBuilder::handleLogWithTopics(Operand OffsetOp, Operand SizeOp,
                                         TopicArgs... Topics) {
   ZEN_STATIC_ASSERT(NumTopics <= 4);
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  normalizeOperandU64(OffsetOp);
-  normalizeOperandU64(SizeOp);
+  normalizeOffsetWithSize(OffsetOp, SizeOp);
 
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemory();
 #endif
   if constexpr (NumTopics == 0) {
-    callRuntimeFor<void, uint64_t, uint64_t>(RuntimeFunctions.EmitLog0,
-                                             OffsetOp, SizeOp);
+    callRuntimeForWithErrorCheck<void, uint64_t, uint64_t>(
+        RuntimeFunctions.EmitLog0, OffsetOp, SizeOp);
   } else if constexpr (NumTopics == 1) {
-    callRuntimeFor<void, uint64_t, uint64_t, const uint8_t *>(
+    callRuntimeForWithErrorCheck<void, uint64_t, uint64_t, const uint8_t *>(
         RuntimeFunctions.EmitLog1, OffsetOp, SizeOp, Topics...);
   } else if constexpr (NumTopics == 2) {
-    callRuntimeFor<void, uint64_t, uint64_t, const uint8_t *, const uint8_t *>(
-        RuntimeFunctions.EmitLog2, OffsetOp, SizeOp, Topics...);
+    callRuntimeForWithErrorCheck<void, uint64_t, uint64_t, const uint8_t *,
+                                 const uint8_t *>(RuntimeFunctions.EmitLog2,
+                                                  OffsetOp, SizeOp, Topics...);
   } else if constexpr (NumTopics == 3) {
-    callRuntimeFor<void, uint64_t, uint64_t, const uint8_t *, const uint8_t *,
-                   const uint8_t *>(RuntimeFunctions.EmitLog3, OffsetOp, SizeOp,
-                                    Topics...);
+    callRuntimeForWithErrorCheck<void, uint64_t, uint64_t, const uint8_t *,
+                                 const uint8_t *, const uint8_t *>(
+        RuntimeFunctions.EmitLog3, OffsetOp, SizeOp, Topics...);
   } else { // NumTopics == 4
-    callRuntimeFor<void, uint64_t, uint64_t, const uint8_t *, const uint8_t *,
-                   const uint8_t *, const uint8_t *>(
-        RuntimeFunctions.EmitLog4, OffsetOp, SizeOp, Topics...);
+    callRuntimeForWithErrorCheck<void, uint64_t, uint64_t, const uint8_t *,
+                                 const uint8_t *, const uint8_t *,
+                                 const uint8_t *>(RuntimeFunctions.EmitLog4,
+                                                  OffsetOp, SizeOp, Topics...);
   }
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   reloadGasFromMemory();
 #endif
+  reloadMemorySizeFromInstance();
 }
 
 typename EVMMirBuilder::Operand
 EVMMirBuilder::handleCreate(Operand ValueOp, Operand OffsetOp, Operand SizeOp) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  normalizeOperandU64(OffsetOp);
-  normalizeOperandU64(SizeOp);
+  normalizeOffsetWithSize(OffsetOp, SizeOp);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemoryFull();
 #endif
   auto Result =
-      callRuntimeFor<const uint8_t *, intx::uint128, uint64_t, uint64_t>(
+      callRuntimeForWithErrorCheck<const uint8_t *, const intx::uint256 &,
+                                   uint64_t, uint64_t>(
           RuntimeFunctions.HandleCreate, ValueOp, OffsetOp, SizeOp);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   reloadGasFromMemory();
@@ -2329,14 +4931,14 @@ typename EVMMirBuilder::Operand EVMMirBuilder::handleCreate2(Operand ValueOp,
                                                              Operand SizeOp,
                                                              Operand SaltOp) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  normalizeOperandU64(OffsetOp);
-  normalizeOperandU64(SizeOp);
+  normalizeOffsetWithSize(OffsetOp, SizeOp);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemoryFull();
 #endif
-  auto Result = callRuntimeFor<const uint8_t *, intx::uint128, uint64_t,
-                               uint64_t, const uint8_t *>(
-      RuntimeFunctions.HandleCreate2, ValueOp, OffsetOp, SizeOp, SaltOp);
+  auto Result =
+      callRuntimeForWithErrorCheck<const uint8_t *, const intx::uint256 &,
+                                   uint64_t, uint64_t, const uint8_t *>(
+          RuntimeFunctions.HandleCreate2, ValueOp, OffsetOp, SizeOp, SaltOp);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   reloadGasFromMemory();
 #endif
@@ -2349,18 +4951,20 @@ EVMMirBuilder::handleCall(Operand GasOp, Operand ToAddrOp, Operand ValueOp,
                           Operand ArgsOffsetOp, Operand ArgsSizeOp,
                           Operand RetOffsetOp, Operand RetSizeOp) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  normalizeOperandU64(GasOp);
-  normalizeOperandU64(ArgsOffsetOp);
-  normalizeOperandU64(ArgsSizeOp);
-  normalizeOperandU64(RetOffsetOp);
-  normalizeOperandU64(RetSizeOp);
+  // When gas value exceeds 64 bits, use max uint64 as fallback.
+  // The runtime will cap it to available gas per EIP-150.
+  uint64_t Non64Value = std::numeric_limits<uint64_t>::max();
+  normalizeOperandU64(GasOp, &Non64Value);
+  normalizeOffsetWithSize(ArgsOffsetOp, ArgsSizeOp);
+  normalizeOffsetWithSize(RetOffsetOp, RetSizeOp);
 
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemoryFull();
 #endif
   auto Result =
-      callRuntimeFor<uint64_t, uint64_t, const uint8_t *, intx::uint128,
-                     uint64_t, uint64_t, uint64_t, uint64_t>(
+      callRuntimeForWithErrorCheck<uint64_t, uint64_t, const uint8_t *,
+                                   const intx::uint256 &, uint64_t, uint64_t,
+                                   uint64_t, uint64_t>(
           RuntimeFunctions.HandleCall, GasOp, ToAddrOp, ValueOp, ArgsOffsetOp,
           ArgsSizeOp, RetOffsetOp, RetSizeOp);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
@@ -2375,18 +4979,20 @@ EVMMirBuilder::handleCallCode(Operand GasOp, Operand ToAddrOp, Operand ValueOp,
                               Operand ArgsOffsetOp, Operand ArgsSizeOp,
                               Operand RetOffsetOp, Operand RetSizeOp) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  normalizeOperandU64(GasOp);
-  normalizeOperandU64(ArgsOffsetOp);
-  normalizeOperandU64(ArgsSizeOp);
-  normalizeOperandU64(RetOffsetOp);
-  normalizeOperandU64(RetSizeOp);
+  // When gas value exceeds 64 bits, use max uint64 as fallback.
+  // The runtime will cap it to available gas per EIP-150.
+  uint64_t Non64Value = std::numeric_limits<uint64_t>::max();
+  normalizeOperandU64(GasOp, &Non64Value);
+  normalizeOffsetWithSize(ArgsOffsetOp, ArgsSizeOp);
+  normalizeOffsetWithSize(RetOffsetOp, RetSizeOp);
 
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemoryFull();
 #endif
   auto Result =
-      callRuntimeFor<uint64_t, uint64_t, const uint8_t *, intx::uint128,
-                     uint64_t, uint64_t, uint64_t, uint64_t>(
+      callRuntimeForWithErrorCheck<uint64_t, uint64_t, const uint8_t *,
+                                   const intx::uint256 &, uint64_t, uint64_t,
+                                   uint64_t, uint64_t>(
           RuntimeFunctions.HandleCallCode, GasOp, ToAddrOp, ValueOp,
           ArgsOffsetOp, ArgsSizeOp, RetOffsetOp, RetSizeOp);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
@@ -2399,21 +5005,24 @@ EVMMirBuilder::handleCallCode(Operand GasOp, Operand ToAddrOp, Operand ValueOp,
 void EVMMirBuilder::handleReturn(Operand MemOffsetComponents,
                                  Operand LengthComponents) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  normalizeOperandU64(MemOffsetComponents);
-  normalizeOperandU64(LengthComponents);
+  uint64_t Non64Value = std::numeric_limits<uint64_t>::max();
+  normalizeOperandU64(MemOffsetComponents, &Non64Value);
+  normalizeOperandU64(LengthComponents, &Non64Value);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemoryFull();
 #endif
-  callRuntimeFor<void, uint64_t, uint64_t>(
+  callRuntimeForWithErrorCheck<void, uint64_t, uint64_t>(
       RuntimeFunctions.SetReturn, MemOffsetComponents, LengthComponents);
 
-  createInstruction<BrInstruction>(true, Ctx, ReturnBB);
-  addSuccessor(ReturnBB);
-
-  if (ReturnBB->empty()) {
-    setInsertBlock(ReturnBB);
-    handleVoidReturn();
-  }
+  // The runtime SetReturn may charge memory expansion gas via chargeGas(),
+  // which updates Instance->Gas directly. We must NOT branch to the shared
+  // ReturnBB because its syncGasToMemoryFull() would overwrite the correct
+  // Instance->Gas with the stale gas register value.
+  MBasicBlock *ReturnDirectBB = createBasicBlock();
+  createInstruction<BrInstruction>(true, Ctx, ReturnDirectBB);
+  addSuccessor(ReturnDirectBB);
+  setInsertBlock(ReturnDirectBB);
+  createInstruction<ReturnInstruction>(true, &Ctx.VoidType, nullptr);
 
   MBasicBlock *PostReturnBB = createBasicBlock();
   setInsertBlock(PostReturnBB);
@@ -2424,19 +5033,21 @@ EVMMirBuilder::handleDelegateCall(Operand GasOp, Operand ToAddrOp,
                                   Operand ArgsOffsetOp, Operand ArgsSizeOp,
                                   Operand RetOffsetOp, Operand RetSizeOp) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  normalizeOperandU64(GasOp);
-  normalizeOperandU64(ArgsOffsetOp);
-  normalizeOperandU64(ArgsSizeOp);
-  normalizeOperandU64(RetOffsetOp);
-  normalizeOperandU64(RetSizeOp);
+  // When gas value exceeds 64 bits, use max uint64 as fallback.
+  // The runtime will cap it to available gas per EIP-150.
+  uint64_t Non64Value = std::numeric_limits<uint64_t>::max();
+  normalizeOperandU64(GasOp, &Non64Value);
+  normalizeOffsetWithSize(ArgsOffsetOp, ArgsSizeOp);
+  normalizeOffsetWithSize(RetOffsetOp, RetSizeOp);
 
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemoryFull();
 #endif
-  auto Result = callRuntimeFor<uint64_t, uint64_t, const uint8_t *, uint64_t,
-                               uint64_t, uint64_t, uint64_t>(
-      RuntimeFunctions.HandleDelegateCall, GasOp, ToAddrOp, ArgsOffsetOp,
-      ArgsSizeOp, RetOffsetOp, RetSizeOp);
+  auto Result =
+      callRuntimeForWithErrorCheck<uint64_t, uint64_t, const uint8_t *,
+                                   uint64_t, uint64_t, uint64_t, uint64_t>(
+          RuntimeFunctions.HandleDelegateCall, GasOp, ToAddrOp, ArgsOffsetOp,
+          ArgsSizeOp, RetOffsetOp, RetSizeOp);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   reloadGasFromMemory();
 #endif
@@ -2449,19 +5060,21 @@ EVMMirBuilder::handleStaticCall(Operand GasOp, Operand ToAddrOp,
                                 Operand ArgsOffsetOp, Operand ArgsSizeOp,
                                 Operand RetOffsetOp, Operand RetSizeOp) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  normalizeOperandU64(GasOp);
-  normalizeOperandU64(ArgsOffsetOp);
-  normalizeOperandU64(ArgsSizeOp);
-  normalizeOperandU64(RetOffsetOp);
-  normalizeOperandU64(RetSizeOp);
+  // When gas value exceeds 64 bits, use max uint64 as fallback.
+  // The runtime will cap it to available gas per EIP-150.
+  uint64_t Non64Value = std::numeric_limits<uint64_t>::max();
+  normalizeOperandU64(GasOp, &Non64Value);
+  normalizeOffsetWithSize(ArgsOffsetOp, ArgsSizeOp);
+  normalizeOffsetWithSize(RetOffsetOp, RetSizeOp);
 
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemoryFull();
 #endif
-  auto Result = callRuntimeFor<uint64_t, uint64_t, const uint8_t *, uint64_t,
-                               uint64_t, uint64_t, uint64_t>(
-      RuntimeFunctions.HandleStaticCall, GasOp, ToAddrOp, ArgsOffsetOp,
-      ArgsSizeOp, RetOffsetOp, RetSizeOp);
+  auto Result =
+      callRuntimeForWithErrorCheck<uint64_t, uint64_t, const uint8_t *,
+                                   uint64_t, uint64_t, uint64_t, uint64_t>(
+          RuntimeFunctions.HandleStaticCall, GasOp, ToAddrOp, ArgsOffsetOp,
+          ArgsSizeOp, RetOffsetOp, RetSizeOp);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   reloadGasFromMemory();
 #endif
@@ -2471,53 +5084,61 @@ EVMMirBuilder::handleStaticCall(Operand GasOp, Operand ToAddrOp,
 
 void EVMMirBuilder::handleRevert(Operand OffsetOp, Operand SizeOp) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  normalizeOperandU64(OffsetOp);
-  normalizeOperandU64(SizeOp);
+  uint64_t Non64Value = std::numeric_limits<uint64_t>::max();
+  normalizeOperandU64(OffsetOp, &Non64Value);
+  normalizeOperandU64(SizeOp, &Non64Value);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemoryFull();
 #endif
-  callRuntimeFor<void, uint64_t, uint64_t>(RuntimeFunctions.SetRevert, OffsetOp,
-                                           SizeOp);
+  callRuntimeForWithErrorCheck<void, uint64_t, uint64_t>(
+      RuntimeFunctions.SetRevert, OffsetOp, SizeOp);
 
-  createInstruction<BrInstruction>(true, Ctx, ReturnBB);
-  addSuccessor(ReturnBB);
-
-  if (ReturnBB->empty()) {
-    setInsertBlock(ReturnBB);
-    handleVoidReturn();
-  }
+  // The runtime SetRevert may charge memory expansion gas via chargeGas(),
+  // which updates Instance->Gas directly. We must NOT branch to the shared
+  // ReturnBB because its syncGasToMemoryFull() would overwrite the correct
+  // Instance->Gas with the stale gas register value.
+  MBasicBlock *RevertReturnBB = createBasicBlock();
+  createInstruction<BrInstruction>(true, Ctx, RevertReturnBB);
+  addSuccessor(RevertReturnBB);
+  setInsertBlock(RevertReturnBB);
+  createInstruction<ReturnInstruction>(true, &Ctx.VoidType, nullptr);
 
   MBasicBlock *PostRevertBB = createBasicBlock();
   setInsertBlock(PostRevertBB);
-#ifdef ZEN_ENABLE_EVM_GAS_REGISTER
-  reloadGasFromMemory();
-#endif
 }
 
 void EVMMirBuilder::handleInvalid() {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
+#ifdef ZEN_ENABLE_EVM_GAS_REGISTER
+  syncGasToMemoryFull();
+#endif
   callRuntimeFor(RuntimeFunctions.HandleInvalid);
 
-  createInstruction<BrInstruction>(true, Ctx, ReturnBB);
-  addSuccessor(ReturnBB);
-
-  if (ReturnBB->empty()) {
-    setInsertBlock(ReturnBB);
-    handleVoidReturn();
-  }
+  // HandleInvalid sets Instance->Gas to 0. We must NOT branch to the shared
+  // ReturnBB because its syncGasToMemoryFull() would overwrite the zeroed gas
+  // with the stale gas register value.
+  MBasicBlock *InvalidReturnBB = createBasicBlock();
+  createInstruction<BrInstruction>(true, Ctx, InvalidReturnBB);
+  addSuccessor(InvalidReturnBB);
+  setInsertBlock(InvalidReturnBB);
+  createInstruction<ReturnInstruction>(true, &Ctx.VoidType, nullptr);
 }
 
 void EVMMirBuilder::handleUndefined() {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
+#ifdef ZEN_ENABLE_EVM_GAS_REGISTER
+  syncGasToMemoryFull();
+#endif
   callRuntimeFor(RuntimeFunctions.HandleUndefined);
 
-  createInstruction<BrInstruction>(true, Ctx, ReturnBB);
-  addSuccessor(ReturnBB);
-
-  if (ReturnBB->empty()) {
-    setInsertBlock(ReturnBB);
-    handleVoidReturn();
-  }
+  // HandleUndefined sets Instance->Gas to 0. We must NOT branch to the shared
+  // ReturnBB because its syncGasToMemoryFull() would overwrite the zeroed gas
+  // with the stale gas register value.
+  MBasicBlock *UndefinedReturnBB = createBasicBlock();
+  createInstruction<BrInstruction>(true, Ctx, UndefinedReturnBB);
+  addSuccessor(UndefinedReturnBB);
+  setInsertBlock(UndefinedReturnBB);
+  createInstruction<ReturnInstruction>(true, &Ctx.VoidType, nullptr);
 }
 typename EVMMirBuilder::Operand
 EVMMirBuilder::handleSLoad(Operand KeyComponents) {
@@ -2525,7 +5146,8 @@ EVMMirBuilder::handleSLoad(Operand KeyComponents) {
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemory();
 #endif
-  auto Result = callRuntimeFor<const intx::uint256 *, const intx::uint256 &>(
+  auto Result = callRuntimeForWithErrorCheck<const intx::uint256 *,
+                                             const intx::uint256 &>(
       RuntimeFunctions.GetSLoad, KeyComponents);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   reloadGasFromMemory();
@@ -2538,7 +5160,8 @@ void EVMMirBuilder::handleSStore(Operand KeyComponents,
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemory();
 #endif
-  callRuntimeFor<void, const intx::uint256 &, const intx::uint256 &>(
+  callRuntimeForWithErrorCheck<void, const intx::uint256 &,
+                               const intx::uint256 &>(
       RuntimeFunctions.SetSStore, KeyComponents, ValueComponents);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   reloadGasFromMemory();
@@ -2551,40 +5174,55 @@ typename EVMMirBuilder::Operand EVMMirBuilder::handleTLoad(Operand Index) {
 }
 void EVMMirBuilder::handleTStore(Operand Index, Operand ValueComponents) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  callRuntimeFor<void, const intx::uint256 &, const intx::uint256 &>(
+  callRuntimeForWithErrorCheck<void, const intx::uint256 &,
+                               const intx::uint256 &>(
       RuntimeFunctions.SetTStore, Index, ValueComponents);
 }
 void EVMMirBuilder::handleSelfDestruct(Operand Beneficiary) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  callRuntimeFor<void, const uint8_t *>(RuntimeFunctions.HandleSelfDestruct,
-                                        Beneficiary);
+#ifdef ZEN_ENABLE_EVM_GAS_REGISTER
+  // SELFDESTRUCT is a terminating opcode. Flush the live gas register so the
+  // runtime helper observes the current callee gas and returns the correct
+  // leftover amount to the caller.
+  syncGasToMemoryFull();
+#endif
+  callRuntimeForWithErrorCheck<void, const uint8_t *>(
+      RuntimeFunctions.HandleSelfDestruct, Beneficiary);
 
-  createInstruction<BrInstruction>(true, Ctx, ReturnBB);
-  addSuccessor(ReturnBB);
-
-  if (ReturnBB->empty()) {
-    setInsertBlock(ReturnBB);
-    handleVoidReturn();
-  }
+  // The runtime function (evmHandleSelfDestruct) calls popMessage() which may
+  // set CurrentMessage to nullptr when there is no parent frame. The shared
+  // ReturnBB uses syncGasToMemoryFull() which writes to Msg->gas via
+  // CurrentMessage, causing a null pointer write (SEGV at address 0x10).
+  // Use a dedicated return block with a plain return instruction instead.
+  MBasicBlock *SelfDestructReturnBB = createBasicBlock();
+  createInstruction<BrInstruction>(true, Ctx, SelfDestructReturnBB);
+  addSuccessor(SelfDestructReturnBB);
+  setInsertBlock(SelfDestructReturnBB);
+  createInstruction<ReturnInstruction>(true, &Ctx.VoidType, nullptr);
 
   MBasicBlock *PostSelfDestructBB = createBasicBlock();
   setInsertBlock(PostSelfDestructBB);
-#ifdef ZEN_ENABLE_EVM_GAS_REGISTER
-  reloadGasFromMemory();
-#endif
 }
 
 typename EVMMirBuilder::Operand
 EVMMirBuilder::handleKeccak256(Operand OffsetComponents,
                                Operand LengthComponents) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  normalizeOperandU64(OffsetComponents);
-  normalizeOperandU64(LengthComponents);
+  const bool OffsetWasConstU64 = OffsetComponents.isConstU64();
+  const uint64_t ConstOffset =
+      OffsetWasConstU64 ? OffsetComponents.getConstValue()[0] : 0;
+  const bool LengthWasConstU64 = LengthComponents.isConstU64();
+  const uint64_t ConstLength =
+      LengthWasConstU64 ? LengthComponents.getConstValue()[0] : 0;
+  normalizeOffsetWithSize(OffsetComponents, LengthComponents);
+  noteKeccak256MemoryAccess(OffsetWasConstU64, ConstOffset, LengthWasConstU64,
+                            ConstLength);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemory();
 #endif
-  auto Result = callRuntimeFor<const uint8_t *, uint64_t, uint64_t>(
-      RuntimeFunctions.GetKeccak256, OffsetComponents, LengthComponents);
+  auto Result =
+      callRuntimeForWithErrorCheck<const uint8_t *, uint64_t, uint64_t>(
+          RuntimeFunctions.GetKeccak256, OffsetComponents, LengthComponents);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   reloadGasFromMemory();
 #endif
@@ -2633,6 +5271,23 @@ EVMMirBuilder::U256Inst EVMMirBuilder::extractU256Operand(const Operand &Opnd) {
           *Constants[I]);
     }
     return Result;
+  }
+
+  if (Opnd.isDeferredBitwiseNot()) {
+    const U256Inst &Base = Opnd.getDeferredBaseComponents();
+    MType *MirI64Type =
+        EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+    for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+      MInstruction *LocalResult =
+          createInstruction<NotInstruction>(false, MirI64Type, Base[I]);
+      Result[I] = protectUnsafeValue(LocalResult, MirI64Type);
+    }
+    return Result;
+  }
+
+  if (Opnd.isDeferredZeroTest()) {
+    return handleCompareEQZ(Opnd.getDeferredBaseComponents(), &Ctx.I64Type,
+                            Opnd.isDeferredZeroTestNegated());
   }
 
   if (Opnd.isU256MultiComponent()) {
@@ -2694,13 +5349,16 @@ EVMMirBuilder::convertSingleInstrToU256Operand(MInstruction *SingleInstr) {
   // Convert the single instruction result to I64 and place it in low component
   Result[0] = zeroExtendToI64(SingleInstr);
 
-  // Fill the remaining components with zeros
-  MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+  // Each limb needs its own zero constant (dMIR tree IR: one parent per expr)
   for (size_t I = 1; I < EVM_ELEMENTS_COUNT; ++I) {
-    Result[I] = Zero;
+    Result[I] = createIntConstInstruction(I64Type, 0);
   }
-
-  return Operand(Result, EVMType::UINT256);
+  // limbs[1..3] are literal zero and limb[0] is zero-extended, so the value is
+  // structurally in [0, 2^64-1] regardless of caller intent. Tag it U64 so
+  // same-block consumers (e.g. size/bounds arithmetic over CALLDATASIZE / GAS /
+  // PC / MSIZE / CODESIZE / RETURNDATASIZE) hit the u64 fast path at first use
+  // instead of the full 256-bit lowering.
+  return Operand(Result, EVMType::UINT256, ValueRange::U64);
 }
 
 Variable *EVMMirBuilder::storeInstructionInTemp(MInstruction *Value,
@@ -2716,6 +5374,37 @@ MInstruction *EVMMirBuilder::loadVariable(Variable *Var) {
                                              Var->getVarIdx());
 }
 
+PhiInstruction *EVMMirBuilder::createPendingPhi(MType *Type,
+                                                size_t NumIncoming) {
+  // Create the phi without appending it to the block end. Phi instructions
+  // must be contiguous at the block start (verified by the MIR verifier).
+  // When merging multiple stack slots, each slot emits phis followed by
+  // non-phi temp-store dassigns; appending at the end would interleave a
+  // later slot's phis after an earlier slot's dassigns and break the
+  // phi-contiguity invariant. Insert the phi right after the existing leading
+  // phis instead so all phis stay grouped at the front.
+  PhiInstruction *Phi =
+      createInstruction<PhiInstruction>(false, Type, NumIncoming);
+  size_t InsertIdx = 0;
+  for (MInstruction *Inst : *CurBB) {
+    if (Inst->getKind() != MInstruction::PHI) {
+      break;
+    }
+    ++InsertIdx;
+  }
+  CurBB->addStatement(InsertIdx, Phi);
+  return Phi;
+}
+
+size_t EVMMirBuilder::getPhiIncomingSlot(PhiInstruction *Phi,
+                                         uint64_t PredBlockPC) const {
+  auto PhiIt = PhiIncomingSlotMap.find(Phi);
+  ZEN_ASSERT(PhiIt != PhiIncomingSlotMap.end());
+  auto SlotIt = PhiIt->second.find(PredBlockPC);
+  ZEN_ASSERT(SlotIt != PhiIt->second.end());
+  return SlotIt->second;
+}
+
 MInstruction *EVMMirBuilder::protectUnsafeValue(MInstruction *Value,
                                                 MType *Type) {
   Variable *ReusableVar = CurFunc->createVariable(Type);
@@ -2726,6 +5415,110 @@ MInstruction *EVMMirBuilder::protectUnsafeValue(MInstruction *Value,
                                              ReusableVarIdx);
 }
 
+MInstruction *EVMMirBuilder::anchorDirectMemoryPointer(MInstruction *Ptr) {
+  return protectUnsafeValue(Ptr, Ptr->getType());
+}
+
+MInstruction *EVMMirBuilder::loadProtectedInstancePointer(int32_t Offset) {
+  MPointerType *VoidPtrType = createVoidPtrType();
+  MInstruction *Ptr = getInstanceElement(VoidPtrType, Offset);
+  return protectUnsafeValue(Ptr, VoidPtrType);
+}
+
+MInstruction *EVMMirBuilder::getProtectedFieldAddress(MInstruction *BasePtr,
+                                                      int32_t Offset,
+                                                      MType *PointerType) {
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MInstruction *BaseAddr = BasePtr;
+
+  if (BasePtr->getType()->isPointer()) {
+    BaseAddr = createInstruction<ConversionInstruction>(false, OP_ptrtoint,
+                                                        I64Type, BasePtr);
+  } else if (!BasePtr->getType()->isI64()) {
+    BaseAddr = zeroExtendToI64(BasePtr);
+  }
+
+  BaseAddr = protectUnsafeValue(BaseAddr, I64Type);
+  MInstruction *OffsetValue =
+      createIntConstInstruction(I64Type, static_cast<uint64_t>(Offset));
+  MInstruction *FieldAddr = createInstruction<BinaryInstruction>(
+      false, OP_add, I64Type, BaseAddr, OffsetValue);
+  MInstruction *FieldPtr = createInstruction<ConversionInstruction>(
+      false, OP_inttoptr, PointerType, FieldAddr);
+  return protectUnsafeValue(FieldPtr, PointerType);
+}
+
+MInstruction *EVMMirBuilder::loadProtectedU64Field(MInstruction *BasePtr,
+                                                   int32_t Offset) {
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MPointerType *I64PtrType = MPointerType::create(Ctx, *I64Type);
+  MInstruction *FieldPtr =
+      getProtectedFieldAddress(BasePtr, Offset, I64PtrType);
+  MInstruction *Value =
+      createInstruction<LoadInstruction>(false, I64Type, FieldPtr);
+  return protectUnsafeValue(Value, I64Type);
+}
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::loadProtectedBytes32FieldAsU256(MInstruction *BasePtr,
+                                               int32_t Offset) {
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MInstruction *FieldPtr =
+      getProtectedFieldAddress(BasePtr, Offset, createVoidPtrType());
+  Operand Bytes32Op(FieldPtr, EVMType::BYTES32);
+  U256Inst Components =
+      convertBytes32ToU256Operand(Bytes32Op).getU256Components();
+  for (size_t I = 0; I < EVM_ELEMENTS_COUNT; ++I) {
+    Components[I] = protectUnsafeValue(Components[I], I64Type);
+  }
+  return Operand(Components, EVMType::UINT256);
+}
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::loadProtectedAddressFieldAsU256(MInstruction *BasePtr,
+                                               int32_t Offset) {
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MPointerType *I64PtrType = MPointerType::create(Ctx, *I64Type);
+  MInstruction *AddressPtr =
+      getProtectedFieldAddress(BasePtr, Offset, I64PtrType);
+
+  auto LoadAddressChunk = [&](int32_t InnerOffset) -> MInstruction * {
+    MInstruction *Raw = createInstruction<LoadInstruction>(
+        false, I64Type, AddressPtr, 1, nullptr, InnerOffset);
+    MInstruction *Swapped =
+        createInstruction<UnaryInstruction>(false, OP_bswap, I64Type, Raw);
+    return protectUnsafeValue(Swapped, I64Type);
+  };
+
+  MInstruction *Low64 = LoadAddressChunk(12);
+  MInstruction *Mid64 = LoadAddressChunk(4);
+  MInstruction *High64 = LoadAddressChunk(0);
+  MInstruction *Shift = createIntConstInstruction(I64Type, 32);
+  MInstruction *High32 = createInstruction<BinaryInstruction>(
+      false, OP_ushr, I64Type, High64, Shift);
+  High32 = protectUnsafeValue(High32, I64Type);
+  MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+
+  U256Inst Components = {Low64, Mid64, High32, Zero};
+  return Operand(Components, EVMType::UINT256);
+}
+
+MInstruction *EVMMirBuilder::getHostArgScratchPtr(std::size_t ScratchSlot) {
+  ZEN_ASSERT(ScratchSlot < zen::runtime::EVMInstance::HostArgScratchSlots);
+
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  const int32_t BaseOffset =
+      zen::runtime::EVMInstance::getHostArgScratchOffset() +
+      static_cast<int32_t>(
+          ScratchSlot * zen::runtime::EVMInstance::getHostArgScratchSlotSize());
+
+  MInstruction *OffsetValue = createIntConstInstruction(I64Type, BaseOffset);
+  MInstruction *ScratchAddrInt = createInstruction<BinaryInstruction>(
+      false, OP_add, I64Type, InstanceAddr, OffsetValue);
+
+  return createInstruction<ConversionInstruction>(
+      false, OP_inttoptr, createVoidPtrType(), ScratchAddrInt);
+}
 typename EVMMirBuilder::Operand
 EVMMirBuilder::convertU256InstrToU256Operand(MInstruction *U256Instr) {
   U256Inst Result = {};
@@ -2771,40 +5564,173 @@ EVMMirBuilder::convertBytes32ToU256Operand(const Operand &Bytes32Op) {
   // little-endian storage
   ZEN_ASSERT(Bytes32Op.getType() == EVMType::BYTES32);
 
+  MInstruction *Bytes32Ptr = Bytes32Op.getInstr();
+  if (Bytes32Ptr->getType()->isPointer()) {
+    return loadU256FromBytes32PointerDisplaced(Bytes32Ptr);
+  }
+
   U256Inst Result = {};
   MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
-  MInstruction *Bytes32Ptr = Bytes32Op.getInstr();
   MPointerType *U64PtrType = MPointerType::create(Ctx, Ctx.I64Type);
-
-  // Materialize the base address as an integer for pointer arithmetic
-  MInstruction *BaseAddr = Bytes32Ptr;
-  if (Bytes32Ptr->getType()->isPointer()) {
-    BaseAddr = createInstruction<ConversionInstruction>(
-        false, OP_ptrtoint, &Ctx.I64Type, Bytes32Ptr);
-  }
 
   auto ByteSwap64 = [&](MInstruction *Value) -> MInstruction * {
     return createInstruction<UnaryInstruction>(false, OP_bswap, I64Type, Value);
   };
 
   for (int Component = 0; Component < 4; ++Component) {
-    // Component 0 corresponds to bytes 24-31 (least significant 64 bits)
-    // Component 3 corresponds to bytes 0-7 (most significant 64 bits)
     int BaseOffset = (3 - Component) * 8;
-
     MInstruction *Offset =
         createIntConstInstruction(I64Type, static_cast<uint64_t>(BaseOffset));
     MInstruction *Addr = createInstruction<BinaryInstruction>(
-        false, OP_add, &Ctx.I64Type, BaseAddr, Offset);
+        false, OP_add, &Ctx.I64Type, Bytes32Ptr, Offset);
     MInstruction *ComponentPtr = createInstruction<ConversionInstruction>(
         false, OP_inttoptr, U64PtrType, Addr);
     MInstruction *RawValue =
         createInstruction<LoadInstruction>(false, I64Type, ComponentPtr);
+    Result[Component] = ByteSwap64(RawValue);
+  }
+
+  return Operand(Result, EVMType::UINT256);
+}
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::loadU256FromBytes32PointerDisplaced(MInstruction *Bytes32Ptr) {
+  U256Inst Result = {};
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+
+  auto ByteSwap64 = [&](MInstruction *Value) -> MInstruction * {
+    return createInstruction<UnaryInstruction>(false, OP_bswap, I64Type, Value);
+  };
+
+  for (int Component = 0; Component < 4; ++Component) {
+    MInstruction *RawValue = createInstruction<LoadInstruction>(
+        false, I64Type, Bytes32Ptr, 1, nullptr, (3 - Component) * 8);
 
     Result[Component] = ByteSwap64(RawValue);
   }
 
   return Operand(Result, EVMType::UINT256);
+}
+
+typename EVMMirBuilder::Operand
+EVMMirBuilder::loadU256FromBytes32BaseDisplaced(MInstruction *BytesBasePtr,
+                                                uint64_t BaseOffset) {
+  ZEN_ASSERT(BaseOffset <= static_cast<uint64_t>(INT32_MAX - 24) &&
+             "base displacement must fit in i32");
+
+  U256Inst Result = {};
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+
+  auto ByteSwap64 = [&](MInstruction *Value) -> MInstruction * {
+    return createInstruction<UnaryInstruction>(false, OP_bswap, I64Type, Value);
+  };
+
+  for (int Component = 0; Component < 4; ++Component) {
+    const int32_t Offset = static_cast<int32_t>(BaseOffset) +
+                           static_cast<int32_t>((3 - Component) * 8);
+    MInstruction *RawValue = createInstruction<LoadInstruction>(
+        false, I64Type, BytesBasePtr, 1, nullptr, Offset);
+    Result[Component] = ByteSwap64(RawValue);
+  }
+
+  return Operand(Result, EVMType::UINT256);
+}
+
+void EVMMirBuilder::storeU256ToBytes32Pointer(
+    MInstruction *Bytes32Ptr, const U256Inst &ValueParts,
+    uint64_t SkipLeadingZeroLimbStores) {
+  MType *I64Type = &Ctx.I64Type;
+  MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+
+  auto ByteSwap64 = [&](MInstruction *Value) -> MInstruction * {
+    return createInstruction<UnaryInstruction>(false, OP_bswap, I64Type, Value);
+  };
+  auto IsConstZeroI64 = [&](MInstruction *Value) -> bool {
+    auto *ConstInstr = llvm::dyn_cast<ConstantInstruction>(Value);
+    if (!ConstInstr) {
+      return false;
+    }
+    auto *ConstInt = llvm::dyn_cast<MConstantInt>(&ConstInstr->getConstant());
+    return ConstInt && ConstInt->getValue() == 0;
+  };
+
+  for (int Component = 0; Component < 4; ++Component) {
+    MInstruction *RawValue = ValueParts[3 - Component];
+    MInstruction *StoredValue = nullptr;
+    if (IsConstZeroI64(RawValue)) {
+      if (static_cast<uint64_t>(Component) < SkipLeadingZeroLimbStores) {
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+        ++MemStats.MStoreOverlapElidedLimbCount;
+        if (CurBlockMemStats.Active) {
+          ++CurBlockMemStats.MStoreOverlapElidedLimbCount;
+        }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+        continue;
+      }
+      StoredValue = Zero;
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+      ++MemStats.MStoreZeroLimbStoreCount;
+      if (CurBlockMemStats.Active) {
+        ++CurBlockMemStats.MStoreZeroLimbStoreCount;
+      }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    } else {
+      StoredValue = ByteSwap64(RawValue);
+    }
+    createInstruction<StoreInstruction>(true, &Ctx.VoidType, StoredValue,
+                                        Bytes32Ptr, Component * 8);
+  }
+}
+
+void EVMMirBuilder::storeU256ToBytes32BaseDisplaced(
+    MInstruction *BytesBasePtr, uint64_t BaseOffset, const U256Inst &ValueParts,
+    uint64_t SkipLeadingZeroLimbStores) {
+  ZEN_ASSERT(BaseOffset <= static_cast<uint64_t>(INT32_MAX - 24) &&
+             "base displacement must fit in i32");
+
+  MType *I64Type = &Ctx.I64Type;
+  MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+
+  auto ByteSwap64 = [&](MInstruction *Value) -> MInstruction * {
+    return createInstruction<UnaryInstruction>(false, OP_bswap, I64Type, Value);
+  };
+  auto IsConstZeroI64 = [&](MInstruction *Value) -> bool {
+    auto *ConstInstr = llvm::dyn_cast<ConstantInstruction>(Value);
+    if (!ConstInstr) {
+      return false;
+    }
+    auto *ConstInt = llvm::dyn_cast<MConstantInt>(&ConstInstr->getConstant());
+    return ConstInt && ConstInt->getValue() == 0;
+  };
+
+  for (int Component = 0; Component < 4; ++Component) {
+    MInstruction *RawValue = ValueParts[3 - Component];
+    MInstruction *StoredValue = nullptr;
+    if (IsConstZeroI64(RawValue)) {
+      if (static_cast<uint64_t>(Component) < SkipLeadingZeroLimbStores) {
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+        ++MemStats.MStoreOverlapElidedLimbCount;
+        if (CurBlockMemStats.Active) {
+          ++CurBlockMemStats.MStoreOverlapElidedLimbCount;
+        }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+        continue;
+      }
+      StoredValue = Zero;
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+      ++MemStats.MStoreZeroLimbStoreCount;
+      if (CurBlockMemStats.Active) {
+        ++CurBlockMemStats.MStoreZeroLimbStoreCount;
+      }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    } else {
+      StoredValue = ByteSwap64(RawValue);
+    }
+    const int32_t Offset =
+        static_cast<int32_t>(BaseOffset) + static_cast<int32_t>(Component * 8);
+    createInstruction<StoreInstruction>(true, &Ctx.VoidType, StoredValue,
+                                        BytesBasePtr, Offset);
+  }
 }
 
 MInstruction *EVMMirBuilder::isU256GreaterOrEqual(const U256Inst &Value,
@@ -2892,6 +5818,9 @@ EVMMirBuilder::convertCallResult(MInstruction *CallInstr) {
 }
 
 void EVMMirBuilder::normalizeOperandU64(Operand &Param, uint64_t *Value) {
+  if (Param.getType() == EVMType::BYTES32) {
+    Param = convertBytes32ToU256Operand(Param);
+  }
   if (Param.getType() != EVMType::UINT256) {
     return;
   }
@@ -2984,6 +5913,98 @@ void EVMMirBuilder::normalizeOperandU64NonConst(Operand &Param,
   }
 }
 
+MInstruction *EVMMirBuilder::extractKnownU64LowOperand(const Operand &Opnd) {
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+
+  if (Opnd.isEmpty()) {
+    return createIntConstInstruction(I64Type, 0);
+  }
+
+  if (Opnd.isConstant()) {
+    return createIntConstInstruction(I64Type, Opnd.getConstValue()[0]);
+  }
+
+  if (Opnd.getType() == EVMType::UINT64) {
+    return Opnd.getInstr();
+  }
+
+  if (Opnd.isU256MultiComponent()) {
+    U256Inst Instrs = Opnd.getU256Components();
+    if (Instrs[0] != nullptr) {
+      return Instrs[0];
+    }
+
+    U256Var Vars = Opnd.getU256VarComponents();
+    if (Vars[0] != nullptr) {
+      return createInstruction<DreadInstruction>(false, Vars[0]->getType(),
+                                                 Vars[0]->getVarIdx());
+    }
+  }
+
+  if (Opnd.getType() == EVMType::BYTES32) {
+    Operand U256Op = convertBytes32ToU256Operand(Opnd);
+    return extractKnownU64LowOperand(U256Op);
+  }
+
+  return extractU256Operand(Opnd)[0];
+}
+
+void EVMMirBuilder::normalizeOffsetWithSize(Operand &Offset, Operand &Size) {
+  normalizeOperandU64(Size);
+  if (Offset.getType() == EVMType::BYTES32) {
+    Offset = convertBytes32ToU256Operand(Offset);
+  }
+  if (Offset.getType() != EVMType::UINT256) {
+    return;
+  }
+
+  U256Inst SizeParts = extractU256Operand(Size);
+  U256Inst OffsetParts = extractU256Operand(Offset);
+
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MInstruction *Zero = createIntConstInstruction(I64Type, 0);
+
+  MInstruction *IsSizeZero = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, SizeParts[0],
+      Zero);
+
+  MInstruction *IsZero1 = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, OffsetParts[1],
+      Zero);
+  MInstruction *IsZero2 = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, OffsetParts[2],
+      Zero);
+  MInstruction *IsZero3 = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, OffsetParts[3],
+      Zero);
+
+  MInstruction *Cond12 = createInstruction<BinaryInstruction>(
+      false, OP_and, I64Type, IsZero1, IsZero2);
+  MInstruction *IsOffsetU64 = createInstruction<BinaryInstruction>(
+      false, OP_and, I64Type, Cond12, IsZero3);
+
+  MInstruction *IsOffsetInvalid = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, IsOffsetU64,
+      Zero);
+  MInstruction *IsSizeNonZero = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_EQ, &Ctx.I64Type, IsSizeZero,
+      Zero);
+  MInstruction *ShouldTrap = createInstruction<BinaryInstruction>(
+      false, OP_and, I64Type, IsSizeNonZero, IsOffsetInvalid);
+
+  MBasicBlock *TrapBB = getOrCreateExceptionSetBB(ErrorCode::GasLimitExceeded);
+  MBasicBlock *ContinueBB = createBasicBlock();
+  createInstruction<BrIfInstruction>(true, Ctx, ShouldTrap, TrapBB, ContinueBB);
+  addUniqueSuccessor(TrapBB);
+  addSuccessor(ContinueBB);
+  setInsertBlock(ContinueBB);
+
+  MInstruction *SelectedLow = createInstruction<SelectInstruction>(
+      false, I64Type, IsSizeZero, Zero, OffsetParts[0]);
+  U256Inst NewVal = {SelectedLow, Zero, Zero, Zero};
+  Offset = Operand(NewVal, EVMType::UINT256);
+}
+
 // Template function for no-argument runtime calls
 template <typename RetType>
 typename EVMMirBuilder::Operand
@@ -3003,6 +6024,23 @@ EVMMirBuilder::callRuntimeFor(RetType (*RuntimeFunc)(runtime::EVMInstance *)) {
   return convertCallResult<RetType>(CallInstr);
 }
 
+template <typename RetType>
+typename EVMMirBuilder::Operand EVMMirBuilder::callRuntimeForWithErrorCheck(
+    RetType (*RuntimeFunc)(runtime::EVMInstance *)) {
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  uint64_t FuncAddr = getFunctionAddress(RuntimeFunc);
+  MInstruction *FuncAddrInst = createIntConstInstruction(I64Type, FuncAddr);
+  MInstruction *InstancePtr = getCurrentInstancePointer();
+
+  MType *ReturnType = getMIRReturnType<RetType>();
+  const bool IsStmt = std::is_same_v<RetType, void>;
+  MInstruction *CallInstr = createInstruction<ICallInstruction>(
+      IsStmt, ReturnType, FuncAddrInst,
+      llvm::ArrayRef<MInstruction *>(InstancePtr));
+  emitRuntimeSoftErrorCheck(InstancePtr);
+  return convertCallResult<RetType>(CallInstr);
+}
+
 // Template helper function to handle uintN_t type conversion (N*64 bits)
 // example: Support multiple sources for U256 argument:
 // - BYTES32 pointer -> load 32 bytes and split into 4xI64
@@ -3016,11 +6054,10 @@ EVMMirBuilder::convertOperandToUNInstruction(const Operand &Param) {
 
   U256Inst Result = {};
   MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
-  MInstruction *Zero = createIntConstInstruction(I64Type, 0);
 
   if (Param.isEmpty()) {
     for (size_t I = 0; I < N; ++I) {
-      Result[I] = Zero;
+      Result[I] = createIntConstInstruction(I64Type, 0);
     }
   } else if (Param.getType() == EVMType::BYTES32) {
     auto U256Op = convertBytes32ToU256Operand(Param);
@@ -3028,10 +6065,24 @@ EVMMirBuilder::convertOperandToUNInstruction(const Operand &Param) {
     for (size_t I = 0; I < N; ++I) {
       Result[I] = Components[I];
     }
-  } else if (Param.isU256MultiComponent()) {
-    auto Components = Param.getU256Components();
+  } else if (Param.isDeferredValue()) {
+    auto Components = extractU256Operand(Param);
     for (size_t I = 0; I < N; ++I) {
       Result[I] = Components[I];
+    }
+  } else if (Param.isU256MultiComponent()) {
+    auto Components = Param.getU256Components();
+    if (Components[0] != nullptr) {
+      for (size_t I = 0; I < N; ++I) {
+        Result[I] = Components[I];
+      }
+    } else {
+      auto Vars = Param.getU256VarComponents();
+      for (size_t I = 0; I < N; ++I) {
+        ZEN_ASSERT(Vars[I] != nullptr);
+        Result[I] = createInstruction<DreadInstruction>(
+            false, Vars[I]->getType(), Vars[I]->getVarIdx());
+      }
     }
   } else if (Param.isConstant()) {
     const U256Value &U256Value = Param.getConstValue();
@@ -3050,7 +6101,7 @@ EVMMirBuilder::convertOperandToUNInstruction(const Operand &Param) {
 
   // Initialize high components to zero for types smaller than U256
   for (size_t I = N; I < EVM_ELEMENTS_COUNT; ++I) {
-    Result[I] = Zero;
+    Result[I] = createIntConstInstruction(I64Type, 0);
   }
 
   return Result;
@@ -3097,6 +6148,14 @@ MInstruction *EVMMirBuilder::packU256Argument(const Operand &Param,
     MInstruction *Component = Components[Index];
     if (Component == nullptr) {
       Component = createIntConstInstruction(I64Type, 0);
+    } else if (auto *ConstInstr =
+                   llvm::dyn_cast<ConstantInstruction>(Component)) {
+      // Re-materialize constants near the store to avoid long live ranges that
+      // cause the register allocator to spill them. Stale stack slots produce
+      // garbage on reload (root cause of issue #487).
+      auto *IntConst = llvm::cast<MConstantInt>(&ConstInstr->getConstant());
+      Component = createIntConstInstruction(
+          I64Type, IntConst->getValue().getZExtValue());
     }
 
     const int32_t Offset =
@@ -3205,6 +6264,97 @@ EVMMirBuilder::Operand EVMMirBuilder::callRuntimeFor(
   return convertCallResult<RetType>(CallInstr);
 }
 
+template <typename RetType, typename... ArgTypes, typename... ParamTypes>
+EVMMirBuilder::Operand EVMMirBuilder::callRuntimeForWithErrorCheck(
+    RetType (*RuntimeFunc)(runtime::EVMInstance *, ArgTypes...),
+    const ParamTypes &...Params) {
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  uint64_t FuncAddr = getFunctionAddress(RuntimeFunc);
+  MInstruction *FuncAddrInst = createIntConstInstruction(I64Type, FuncAddr);
+  MInstruction *InstancePtr = getCurrentInstancePointer();
+
+  std::vector<MInstruction *> Args = {InstancePtr};
+  auto ParamsTuple = std::forward_as_tuple(Params...);
+  std::size_t ScratchCursor = 0;
+  auto PushOne = [this, &Args, &ParamsTuple, &ScratchCursor](auto IndexTag) {
+    constexpr std::size_t I = decltype(IndexTag)::value;
+    using ArgT = typename std::tuple_element<I, std::tuple<ArgTypes...>>::type;
+    this->appendRuntimeArg<ArgT>(Args, std::get<I>(ParamsTuple), ScratchCursor);
+  };
+  auto PushAll = [&](auto Self, auto IndexTag) -> void {
+    constexpr std::size_t I = decltype(IndexTag)::value;
+    if constexpr (I < sizeof...(ArgTypes)) {
+      PushOne(IndexTag);
+      Self(Self, std::integral_constant<std::size_t, I + 1>{});
+    }
+  };
+  PushAll(PushAll, std::integral_constant<std::size_t, 0>{});
+
+  MType *ReturnType = getMIRReturnType<RetType>();
+  const bool IsStmt = std::is_same_v<RetType, void>;
+  MInstruction *CallInstr = createInstruction<ICallInstruction>(
+      IsStmt, ReturnType, FuncAddrInst, llvm::ArrayRef<MInstruction *>{Args});
+  emitRuntimeSoftErrorCheck(InstancePtr);
+  return convertCallResult<RetType>(CallInstr);
+}
+
+void EVMMirBuilder::emitRuntimeSoftErrorCheck(MInstruction *InstancePtr) {
+#if !defined(ZEN_ENABLE_CPU_EXCEPTION)
+  MType *U64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  MInstruction *GetErrAddr = createIntConstInstruction(
+      &Ctx.I64Type, getFunctionAddress(evmGetErrorCode));
+  MInstruction *ErrCodeInstr = createInstruction<ICallInstruction>(
+      false, U64Type, GetErrAddr, llvm::ArrayRef<MInstruction *>(InstancePtr));
+  Variable *ErrCodeVar =
+      storeInstructionInTemp(ErrCodeInstr, ErrCodeInstr->getType());
+  MInstruction *ErrCodeValue = loadVariable(ErrCodeVar);
+  MInstruction *NoErrorCode = createIntConstInstruction(
+      U64Type, common::to_underlying(ErrorCode::NoError));
+  MInstruction *HasNoError = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_EQ, U64Type, ErrCodeValue,
+      NoErrorCode);
+  MBasicBlock *ContinueBB = createBasicBlock();
+  MBasicBlock *CheckKnownSoftErrBB = createBasicBlock();
+  createInstruction<BrIfInstruction>(true, Ctx, HasNoError, ContinueBB,
+                                     CheckKnownSoftErrBB);
+  addSuccessor(ContinueBB);
+  addSuccessor(CheckKnownSoftErrBB);
+  setInsertBlock(CheckKnownSoftErrBB);
+
+  // We intentionally do NOT trap on every non-zero code:
+  // InstanceExit and some control-flow codes are expected runtime states.
+  // Only trap the two hostapi soft-failure codes that must stop JIT execution.
+  MInstruction *StaticViolationCode = createIntConstInstruction(
+      U64Type, common::to_underlying(ErrorCode::EVMStaticModeViolation));
+  MInstruction *GasExceededCode = createIntConstInstruction(
+      U64Type, common::to_underlying(ErrorCode::GasLimitExceeded));
+  MInstruction *HasGasExceeded = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_EQ, U64Type, ErrCodeValue,
+      GasExceededCode);
+  MBasicBlock *CheckStaticBB = createBasicBlock();
+  MBasicBlock *GasTrapBB =
+      getOrCreateExceptionSetBB(ErrorCode::GasLimitExceeded);
+  createInstruction<BrIfInstruction>(true, Ctx, HasGasExceeded, GasTrapBB,
+                                     CheckStaticBB);
+  addUniqueSuccessor(GasTrapBB);
+  addSuccessor(CheckStaticBB);
+  setInsertBlock(CheckStaticBB);
+  MInstruction *HasStaticViolation = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_EQ,
+      EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64), ErrCodeValue,
+      StaticViolationCode);
+  MBasicBlock *StaticTrapBB =
+      getOrCreateExceptionSetBB(ErrorCode::EVMStaticModeViolation);
+  createInstruction<BrIfInstruction>(true, Ctx, HasStaticViolation,
+                                     StaticTrapBB, ContinueBB);
+  addUniqueSuccessor(StaticTrapBB);
+  addUniqueSuccessor(ContinueBB);
+  setInsertBlock(ContinueBB);
+#else
+  (void)InstancePtr;
+#endif
+}
+
 MInstruction *EVMMirBuilder::getCurrentInstancePointer() {
   ZEN_ASSERT(InstanceAddr);
   // Convert instance address back to pointer type
@@ -3216,13 +6366,14 @@ void EVMMirBuilder::handleCallDataCopy(Operand DestOffsetComponents,
                                        Operand OffsetComponents,
                                        Operand SizeComponents) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  normalizeOperandU64(DestOffsetComponents);
-  normalizeOperandU64(OffsetComponents);
-  normalizeOperandU64(SizeComponents);
+  uint64_t Non64Value = std::numeric_limits<uint64_t>::max();
+  normalizeOperandU64(DestOffsetComponents, &Non64Value);
+  normalizeOperandU64(OffsetComponents, &Non64Value);
+  normalizeOperandU64(SizeComponents, &Non64Value);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemory();
 #endif
-  callRuntimeFor<void, uint64_t, uint64_t, uint64_t>(
+  callRuntimeForWithErrorCheck<void, uint64_t, uint64_t, uint64_t>(
       RuntimeFunctions.SetCallDataCopy, DestOffsetComponents, OffsetComponents,
       SizeComponents);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
@@ -3236,13 +6387,18 @@ void EVMMirBuilder::handleExtCodeCopy(Operand AddressComponents,
                                       Operand OffsetComponents,
                                       Operand SizeComponents) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  normalizeOperandU64(DestOffsetComponents);
-  normalizeOperandU64(OffsetComponents);
-  normalizeOperandU64(SizeComponents);
+  // Use max uint64_t value if the offset/size is not 64-bit, because the
+  // extcodecopy will fill zeros when offset is beyond code size or handle large
+  // size properly.
+  uint64_t Non64Value = std::numeric_limits<uint64_t>::max();
+  normalizeOperandU64(DestOffsetComponents, &Non64Value);
+  normalizeOperandU64(OffsetComponents, &Non64Value);
+  normalizeOperandU64(SizeComponents, &Non64Value);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemory();
 #endif
-  callRuntimeFor<void, const uint8_t *, uint64_t, uint64_t, uint64_t>(
+  callRuntimeForWithErrorCheck<void, const uint8_t *, uint64_t, uint64_t,
+                               uint64_t>(
       RuntimeFunctions.SetExtCodeCopy, AddressComponents, DestOffsetComponents,
       OffsetComponents, SizeComponents);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
@@ -3255,15 +6411,38 @@ void EVMMirBuilder::handleReturnDataCopy(Operand DestOffsetComponents,
                                          Operand OffsetComponents,
                                          Operand SizeComponents) {
   const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  normalizeOperandU64(DestOffsetComponents);
-  normalizeOperandU64(OffsetComponents);
-  normalizeOperandU64(SizeComponents);
+  // Use max uint64_t value if the offset/size is not 64-bit, because the
+  // returndatacopy will trigger memory access error instead of out-of-gas
+  // when offset/size is very large.
+  uint64_t Non64Value = std::numeric_limits<uint64_t>::max();
+  normalizeOperandU64(DestOffsetComponents, &Non64Value);
+  normalizeOperandU64(OffsetComponents, &Non64Value);
+  normalizeOperandU64(SizeComponents, &Non64Value);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   syncGasToMemory();
 #endif
-  callRuntimeFor<void, uint64_t, uint64_t, uint64_t>(
-      RuntimeFunctions.SetReturnDataCopy, DestOffsetComponents,
-      OffsetComponents, SizeComponents);
+  Operand StatusOp =
+      callRuntimeForWithErrorCheck<uint64_t, uint64_t, uint64_t, uint64_t>(
+          RuntimeFunctions.SetReturnDataCopy, DestOffsetComponents,
+          OffsetComponents, SizeComponents);
+
+  MType *I64Type = EVMFrontendContext::getMIRTypeFromEVMType(EVMType::UINT64);
+  U256Inst StatusParts = extractU256Operand(StatusOp);
+  MInstruction *ZeroI = createIntConstInstruction(I64Type, 0);
+  MInstruction *IsFatal = createInstruction<CmpInstruction>(
+      false, CmpInstruction::Predicate::ICMP_NE, &Ctx.I64Type, StatusParts[0],
+      ZeroI);
+
+  MBasicBlock *ContinueBB = createBasicBlock();
+  MBasicBlock *FatalBB = createBasicBlock();
+  createInstruction<BrIfInstruction>(true, Ctx, IsFatal, FatalBB, ContinueBB);
+  addSuccessor(FatalBB);
+  addSuccessor(ContinueBB);
+
+  setInsertBlock(FatalBB);
+  createInstruction<ReturnInstruction>(true, &Ctx.VoidType, nullptr);
+
+  setInsertBlock(ContinueBB);
 #ifdef ZEN_ENABLE_EVM_GAS_REGISTER
   reloadGasFromMemory();
 #endif
@@ -3271,13 +6450,1041 @@ void EVMMirBuilder::handleReturnDataCopy(Operand DestOffsetComponents,
 }
 
 typename EVMMirBuilder::Operand EVMMirBuilder::handleReturnDataSize() {
-  const auto &RuntimeFunctions = getRuntimeFunctionTable();
-  return callRuntimeFor<uint64_t>(RuntimeFunctions.GetReturnDataSize);
+  MInstruction *ReturnDataSize = getInstanceElement(
+      &Ctx.I64Type, zen::runtime::EVMInstance::getReturnDataSizeOffset());
+  ReturnDataSize = protectUnsafeValue(ReturnDataSize, &Ctx.I64Type);
+  return convertSingleInstrToU256Operand(ReturnDataSize);
+}
+
+bool EVMMirBuilder::hasMemoryCompileStats() const {
+  return MemStats.MLoadExpandCount != 0 || MemStats.MStoreExpandCount != 0 ||
+         MemStats.MStore8ExpandCount != 0 || MemStats.MCopyExpandCount != 0 ||
+         MemStats.BlockConstPrecheckCount != 0 ||
+         MemStats.LinearU64AddrFastPathCount != 0 ||
+         MemStats.ConstBasePtrInitCount != 0 ||
+         MemStats.ConstBasePtrReuseCount != 0 ||
+         MemStats.ConstDispBytes32MLoadCount != 0 ||
+         MemStats.ConstDispBytes32MStoreCount != 0 ||
+         MemStats.DispBytes32MLoadCount != 0 ||
+         MemStats.DispBytes32MStoreCount != 0 ||
+         MemStats.MStoreZeroLimbStoreCount != 0 ||
+         MemStats.MStoreOverlapElidedLimbCount != 0 ||
+         MemStats.ReloadMemorySizeCount != 0 ||
+         MemStats.GetMemoryDataPointerCount != 0 ||
+         MemStats.ExpandNeedExpandCFGCount != 0 ||
+         MemStats.SmallFrameCandidateTotal != 0 ||
+         MemStats.SmallFramePrecheckedTotal != 0 ||
+         MemStats.SmallFrameOffsetConstTotal != 0 ||
+         MemStats.SmallFrameOffsetKnownU64Total != 0 ||
+         MemStats.SmallFrameFallbackUnknownOffset != 0 ||
+         MemStats.SmallFrameFallbackOver128 != 0 ||
+         MemStats.SmallFrameFallbackNoPrecheck != 0 ||
+         MemStats.SmallFrameFallbackOverflow != 0 ||
+         MemStats.SmallFrameFallbackDynamicSize != 0 ||
+         MemStats.HashPrepRegionCandidateCount != 0 ||
+         MemStats.HashPrepRegionVerifiedCount != 0 ||
+         MemStats.HashPrepKeccakRange0_64Count != 0 ||
+         MemStats.HashPrepLiftSimCandidateRegionCount != 0 ||
+         MemStats.HashPrepMarkerCandidateRegionCount != 0 ||
+         MemStats.HashPrepMarkerMarkedRegionCount != 0 ||
+         MemStats.HashPrepMarkerRejectedRegionCount != 0;
+}
+
+bool EVMMirBuilder::hasArithCompileStats() const {
+  return MemStats.AddFastRangeU64Count != 0 ||
+         MemStats.AddFastConstU64Count != 0 || MemStats.AddFullCount != 0 ||
+         MemStats.SubFastConstU64Count != 0 || MemStats.SubFullCount != 0 ||
+         MemStats.MulFastRangeU64Count != 0 ||
+         MemStats.MulFastConstU64Count != 0 || MemStats.MulFullCount != 0 ||
+         MemStats.DivFastRangeU64Count != 0 ||
+         MemStats.DivFastConstU64Count != 0 || MemStats.DivFullCount != 0 ||
+         MemStats.ModFastRangeU64Count != 0 ||
+         MemStats.ModFastConstU64Count != 0 || MemStats.ModFullCount != 0 ||
+         MemStats.MulU128OpportunityCount != 0 ||
+         MemStats.DivU128OpportunityCount != 0 ||
+         MemStats.ModU128OpportunityCount != 0;
+}
+
+void EVMMirBuilder::noteBlockMemoryEventPC(uint64_t PC) {
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  if (!CurBlockMemStats.Active) {
+    return;
+  }
+  if (!CurBlockMemStats.HasMemoryEvent) {
+    CurBlockMemStats.FirstMemoryEventPC = PC;
+    CurBlockMemStats.HasMemoryEvent = true;
+  }
+  CurBlockMemStats.LastMemoryEventPC = PC;
+#else
+  (void)PC;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+}
+
+bool EVMMirBuilder::hasCurrentMemoryBlockStats() const {
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  return CurBlockMemStats.Active && CurBlockMemStats.HasMemoryEvent;
+#else
+  return false;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+}
+
+void EVMMirBuilder::noteSmallFrameMemoryOp(
+    SmallFrameMemoryOp Op, bool OffsetWasConst, uint64_t ConstOffset,
+    bool OffsetKnownU64, uint64_t AccessSize, bool UsedSharedPrecheck) {
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  constexpr uint64_t SmallFrameLimit = 128;
+
+  auto IsStore = [&]() {
+    return Op == SmallFrameMemoryOp::MStore ||
+           Op == SmallFrameMemoryOp::MStore8;
+  };
+  auto NoteHashPrepUnknownWriteRisk = [&]() {
+    if (CurBlockMemStats.Active && IsStore()) {
+      CurBlockMemStats.HashPrepPendingUnsupportedWrite = true;
+      CurBlockMemStats.HashPrepPendingAliasRisk = true;
+    }
+  };
+  auto NoteHashPrepConstWrite = [&](uint64_t Offset, uint64_t Size) {
+    if (!CurBlockMemStats.Active || !IsStore()) {
+      return;
+    }
+    const bool Overflows = Offset > (~uint64_t(0) - Size);
+    const uint64_t End = Overflows ? ~uint64_t(0) : Offset + Size;
+    const bool OverlapsTwoWordPreimage = !Overflows && Offset < 64 && End > 0;
+    if (Op == SmallFrameMemoryOp::MStore && Size == 32) {
+      if (Offset == 0) {
+        CurBlockMemStats.HashPrepPendingMStore0 = true;
+        return;
+      }
+      if (Offset == 32) {
+        CurBlockMemStats.HashPrepPendingMStore32 = true;
+        return;
+      }
+    }
+    if (OverlapsTwoWordPreimage) {
+      CurBlockMemStats.HashPrepPendingUnsupportedWrite = true;
+      CurBlockMemStats.HashPrepPendingInterveningWrite = true;
+    }
+  };
+
+  if (OffsetWasConst) {
+    ++MemStats.SmallFrameOffsetConstTotal;
+  } else if (OffsetKnownU64) {
+    ++MemStats.SmallFrameOffsetKnownU64Total;
+  }
+
+  if (AccessSize == 0 || AccessSize > SmallFrameLimit) {
+    NoteHashPrepUnknownWriteRisk();
+    ++MemStats.SmallFrameFallbackDynamicSize;
+    if (CurBlockMemStats.Active) {
+      ++CurBlockMemStats.SmallFrameFallbackDynamicSizeCount;
+    }
+    return;
+  }
+
+  if (!OffsetWasConst) {
+    NoteHashPrepUnknownWriteRisk();
+    if (OffsetKnownU64) {
+      ++MemStats.SmallFrameFallbackDynamicSize;
+      if (CurBlockMemStats.Active) {
+        ++CurBlockMemStats.SmallFrameFallbackDynamicSizeCount;
+      }
+    } else {
+      ++MemStats.SmallFrameFallbackUnknownOffset;
+    }
+    return;
+  }
+
+  if (ConstOffset > (~uint64_t(0) - AccessSize)) {
+    NoteHashPrepUnknownWriteRisk();
+    ++MemStats.SmallFrameFallbackOverflow;
+    return;
+  }
+
+  const uint64_t AccessEnd = ConstOffset + AccessSize;
+  NoteHashPrepConstWrite(ConstOffset, AccessSize);
+  if (AccessEnd > SmallFrameLimit) {
+    ++MemStats.SmallFrameFallbackOver128;
+    if (CurBlockMemStats.Active) {
+      ++CurBlockMemStats.SmallFrameFallbackOver128Count;
+    }
+    return;
+  }
+
+  ++MemStats.SmallFrameCandidateTotal;
+  if (CurBlockMemStats.Active) {
+    ++CurBlockMemStats.SmallFrameCandidateCount;
+  }
+
+  switch (Op) {
+  case SmallFrameMemoryOp::MLoad:
+    ++MemStats.SmallFrameMLoadCandidate;
+    break;
+  case SmallFrameMemoryOp::MStore:
+    ++MemStats.SmallFrameMStoreCandidate;
+    break;
+  case SmallFrameMemoryOp::MStore8:
+    ++MemStats.SmallFrameMStore8Candidate;
+    break;
+  }
+
+  if (UsedSharedPrecheck) {
+    ++MemStats.SmallFramePrecheckedTotal;
+    if (CurBlockMemStats.Active) {
+      ++CurBlockMemStats.SmallFramePrecheckedCount;
+    }
+    return;
+  }
+
+  ++MemStats.SmallFrameFallbackNoPrecheck;
+  if (CurBlockMemStats.Active) {
+    ++CurBlockMemStats.SmallFrameFallbackNoPrecheckCount;
+    switch (Op) {
+    case SmallFrameMemoryOp::MLoad:
+      ++CurBlockMemStats.SmallFrameNoPrecheckMLoadCount;
+      break;
+    case SmallFrameMemoryOp::MStore:
+      ++CurBlockMemStats.SmallFrameNoPrecheckMStoreCount;
+      break;
+    case SmallFrameMemoryOp::MStore8:
+      ++CurBlockMemStats.SmallFrameNoPrecheckMStore8Count;
+      break;
+    }
+  }
+#else
+  (void)Op;
+  (void)OffsetWasConst;
+  (void)ConstOffset;
+  (void)OffsetKnownU64;
+  (void)AccessSize;
+  (void)UsedSharedPrecheck;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+}
+
+void EVMMirBuilder::noteKeccak256MemoryAccess(bool OffsetWasConstU64,
+                                              uint64_t ConstOffset,
+                                              bool LengthWasConstU64,
+                                              uint64_t ConstLength) {
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  auto ResetPendingHashPrep = [&]() {
+    CurBlockMemStats.HashPrepPendingMStore0 = false;
+    CurBlockMemStats.HashPrepPendingMStore32 = false;
+    CurBlockMemStats.HashPrepPendingUnsupportedWrite = false;
+    CurBlockMemStats.HashPrepPendingAliasRisk = false;
+    CurBlockMemStats.HashPrepPendingInterveningWrite = false;
+  };
+
+  if (!CurBlockMemStats.Active) {
+    return;
+  }
+
+  if (!OffsetWasConstU64 || !LengthWasConstU64) {
+    ++CurBlockMemStats.HashPrepKeccakDynamicRangeCount;
+    ++CurBlockMemStats.HashPrepRejectedByteExactRiskCount;
+    ResetPendingHashPrep();
+    return;
+  }
+
+  ++CurBlockMemStats.HashPrepKeccakConstRangeCount;
+  if (ConstOffset > (~uint64_t(0) - ConstLength)) {
+    ++CurBlockMemStats.HashPrepKeccakOver128Count;
+    ResetPendingHashPrep();
+    return;
+  }
+
+  const uint64_t End = ConstOffset + ConstLength;
+  if (End > 128) {
+    ++CurBlockMemStats.HashPrepKeccakOver128Count;
+    ResetPendingHashPrep();
+    return;
+  }
+
+  if (ConstOffset != 0 || ConstLength != 64) {
+    ++CurBlockMemStats.HashPrepKeccakNonTwoWordRangeCount;
+    ResetPendingHashPrep();
+    return;
+  }
+
+  ++CurBlockMemStats.HashPrepKeccakRange0_64Count;
+  if (CurBlockMemStats.HashPrepPendingAliasRisk) {
+    ++CurBlockMemStats.HashPrepRejectedAliasRiskCount;
+    ++CurBlockMemStats.HashPrepRejectedAliasOrInterveningWriteCount;
+  } else if (CurBlockMemStats.HashPrepPendingInterveningWrite) {
+    ++CurBlockMemStats.HashPrepRejectedInterveningWriteCount;
+    ++CurBlockMemStats.HashPrepRejectedAliasOrInterveningWriteCount;
+  } else if (CurBlockMemStats.HashPrepPendingUnsupportedWrite) {
+    ++CurBlockMemStats.HashPrepRejectedByteExactRiskCount;
+    ++CurBlockMemStats.HashPrepRejectedAliasOrInterveningWriteCount;
+  } else if (CurBlockMemStats.HashPrepPendingMStore0 &&
+             CurBlockMemStats.HashPrepPendingMStore32) {
+    ++CurBlockMemStats.HashPrepVerifiedKeccakCount;
+  } else {
+    ++CurBlockMemStats.HashPrepRejectedOrderingRiskCount;
+    ++CurBlockMemStats.HashPrepRejectedByteExactRiskCount;
+    ++CurBlockMemStats.HashPrepRejectedMissingTwoWordStoresCount;
+  }
+  ResetPendingHashPrep();
+#else
+  (void)OffsetWasConstU64;
+  (void)ConstOffset;
+  (void)LengthWasConstU64;
+  (void)ConstLength;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+}
+
+void EVMMirBuilder::dumpMemoryCompileStats() const {
+  if (!hasMemoryCompileStats() && !hasArithCompileStats()) {
+    return;
+  }
+
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  ZEN_LOG_DEBUG(
+      "[EVM-MEM-SUMMARY] mload_expand=%llu mstore_expand=%llu "
+      "mstore8_expand=%llu mcopy_expand=%llu block_const_precheck=%llu "
+      "block_linear_precheck=%llu prechecked_mload_ops=%llu "
+      "prechecked_mstore_ops=%llu reload_mem_size=%llu get_mem_ptr=%llu "
+      "mem_base_instance_loads=%llu mem_base_cache_uses=%llu "
+      "linear_u64_addr_fast_ops=%llu linear_u64_mload_fast_ops=%llu "
+      "linear_u64_mstore_fast_ops=%llu "
+      "const_base_ptr_inits=%llu const_base_ptr_reuses=%llu "
+      "const_disp_bytes32_mload_ops=%llu const_disp_bytes32_mstore_ops=%llu "
+      "disp_bytes32_mload_ops=%llu disp_bytes32_mstore_ops=%llu "
+      "mstore_zero_limb_stores=%llu mstore_overlap_elided_limbs=%llu "
+      "mstore_addr_value_alias_reuse=%llu "
+      "need_expand_cfg=%llu",
+      static_cast<unsigned long long>(MemStats.MLoadExpandCount),
+      static_cast<unsigned long long>(MemStats.MStoreExpandCount),
+      static_cast<unsigned long long>(MemStats.MStore8ExpandCount),
+      static_cast<unsigned long long>(MemStats.MCopyExpandCount),
+      static_cast<unsigned long long>(MemStats.BlockConstPrecheckCount),
+      static_cast<unsigned long long>(MemStats.BlockLinearPrecheckCount),
+      static_cast<unsigned long long>(MemStats.PrecheckedMLoadOpCount),
+      static_cast<unsigned long long>(MemStats.PrecheckedMStoreOpCount),
+      static_cast<unsigned long long>(MemStats.ReloadMemorySizeCount),
+      static_cast<unsigned long long>(MemStats.GetMemoryDataPointerCount),
+      static_cast<unsigned long long>(MemStats.MemoryBaseInstanceLoadCount),
+      static_cast<unsigned long long>(MemStats.MemoryBaseCacheUseCount),
+      static_cast<unsigned long long>(MemStats.LinearU64AddrFastPathCount),
+      static_cast<unsigned long long>(MemStats.LinearU64MLoadFastPathCount),
+      static_cast<unsigned long long>(MemStats.LinearU64MStoreFastPathCount),
+      static_cast<unsigned long long>(MemStats.ConstBasePtrInitCount),
+      static_cast<unsigned long long>(MemStats.ConstBasePtrReuseCount),
+      static_cast<unsigned long long>(MemStats.ConstDispBytes32MLoadCount),
+      static_cast<unsigned long long>(MemStats.ConstDispBytes32MStoreCount),
+      static_cast<unsigned long long>(MemStats.DispBytes32MLoadCount),
+      static_cast<unsigned long long>(MemStats.DispBytes32MStoreCount),
+      static_cast<unsigned long long>(MemStats.MStoreZeroLimbStoreCount),
+      static_cast<unsigned long long>(MemStats.MStoreOverlapElidedLimbCount),
+      static_cast<unsigned long long>(MemStats.MStoreAddrValueAliasReuseCount),
+      static_cast<unsigned long long>(MemStats.ExpandNeedExpandCFGCount));
+
+  ZEN_LOG_DEBUG(
+      "[EVM-MEM-SUMMARY] small_frame_candidate_total=%llu "
+      "small_frame_prechecked_total=%llu "
+      "small_frame_offset_const_total=%llu "
+      "small_frame_offset_known_u64_total=%llu "
+      "small_frame_mload_candidate=%llu "
+      "small_frame_mstore_candidate=%llu "
+      "small_frame_mstore8_candidate=%llu "
+      "small_frame_fallback_unknown_offset=%llu "
+      "small_frame_fallback_over_128=%llu "
+      "small_frame_fallback_no_precheck=%llu "
+      "small_frame_fallback_overflow=%llu "
+      "small_frame_fallback_dynamic_size=%llu "
+      "small_frame_fallback_gas_or_memory_semantics_uncertain=%llu "
+      "hash_prep_region_candidates=%llu "
+      "hash_prep_region_candidate_ops=%llu "
+      "hash_prep_region_verified=%llu "
+      "hash_prep_region_verified_ops=%llu "
+      "hash_prep_keccak_const_range=%llu "
+      "hash_prep_keccak_range_0_64=%llu "
+      "hash_prep_keccak_dynamic_range=%llu "
+      "hash_prep_keccak_over_128=%llu "
+      "hash_prep_verified_two_word_preimage=%llu "
+      "hash_prep_verified_multi_hash=%llu "
+      "hash_prep_rejected_dynamic_offset=%llu "
+      "hash_prep_rejected_range_over_128=%llu "
+      "hash_prep_rejected_non_two_word_range=%llu "
+      "hash_prep_rejected_ordering_risk=%llu "
+      "hash_prep_rejected_alias_risk=%llu "
+      "hash_prep_rejected_intervening_write=%llu "
+      "hash_prep_rejected_byte_exact_risk=%llu "
+      "hash_prep_rejected_missing_two_word_stores=%llu "
+      "hash_prep_rejected_alias_or_intervening_write=%llu "
+      "hash_prep_lift_sim_candidate_regions=%llu "
+      "hash_prep_lift_sim_candidate_ops=%llu "
+      "hash_prep_lift_sim_covered_regions=%llu "
+      "hash_prep_lift_sim_covered_ops=%llu "
+      "hash_prep_lift_sim_safe_to_lift_regions=%llu "
+      "hash_prep_lift_sim_safe_to_lift_ops=%llu "
+      "hash_prep_lift_sim_rejected_regions=%llu "
+      "hash_prep_lift_sim_rejected_ops=%llu",
+      static_cast<unsigned long long>(MemStats.SmallFrameCandidateTotal),
+      static_cast<unsigned long long>(MemStats.SmallFramePrecheckedTotal),
+      static_cast<unsigned long long>(MemStats.SmallFrameOffsetConstTotal),
+      static_cast<unsigned long long>(MemStats.SmallFrameOffsetKnownU64Total),
+      static_cast<unsigned long long>(MemStats.SmallFrameMLoadCandidate),
+      static_cast<unsigned long long>(MemStats.SmallFrameMStoreCandidate),
+      static_cast<unsigned long long>(MemStats.SmallFrameMStore8Candidate),
+      static_cast<unsigned long long>(MemStats.SmallFrameFallbackUnknownOffset),
+      static_cast<unsigned long long>(MemStats.SmallFrameFallbackOver128),
+      static_cast<unsigned long long>(MemStats.SmallFrameFallbackNoPrecheck),
+      static_cast<unsigned long long>(MemStats.SmallFrameFallbackOverflow),
+      static_cast<unsigned long long>(MemStats.SmallFrameFallbackDynamicSize),
+      static_cast<unsigned long long>(
+          MemStats.SmallFrameFallbackGasOrMemorySemanticsUncertain),
+      static_cast<unsigned long long>(MemStats.HashPrepRegionCandidateCount),
+      static_cast<unsigned long long>(MemStats.HashPrepRegionCandidateOpCount),
+      static_cast<unsigned long long>(MemStats.HashPrepRegionVerifiedCount),
+      static_cast<unsigned long long>(MemStats.HashPrepRegionVerifiedOpCount),
+      static_cast<unsigned long long>(MemStats.HashPrepKeccakConstRangeCount),
+      static_cast<unsigned long long>(MemStats.HashPrepKeccakRange0_64Count),
+      static_cast<unsigned long long>(MemStats.HashPrepKeccakDynamicRangeCount),
+      static_cast<unsigned long long>(MemStats.HashPrepKeccakOver128Count),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepRegionVerifiedTwoWordPreimageCount),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepRegionVerifiedMultiHashCount),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepRegionRejectedDynamicOffset),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepRegionRejectedRangeOver128),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepRegionRejectedNonTwoWordRange),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepRegionRejectedOrderingRisk),
+      static_cast<unsigned long long>(MemStats.HashPrepRegionRejectedAliasRisk),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepRegionRejectedInterveningWrite),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepRegionRejectedByteExactRisk),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepRegionRejectedMissingTwoWordStores),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepRegionRejectedAliasOrInterveningWrite),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepLiftSimCandidateRegionCount),
+      static_cast<unsigned long long>(MemStats.HashPrepLiftSimCandidateOpCount),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepLiftSimCoveredRegionCount),
+      static_cast<unsigned long long>(MemStats.HashPrepLiftSimCoveredOpCount),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepLiftSimSafeToLiftRegionCount),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepLiftSimSafeToLiftOpCount),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepLiftSimRejectedRegionCount),
+      static_cast<unsigned long long>(MemStats.HashPrepLiftSimRejectedOpCount));
+
+  ZEN_LOG_DEBUG(
+      "[EVM-MEM-SUMMARY] hash_prep_marker_candidate_regions=%llu "
+      "hash_prep_marker_candidate_ops=%llu "
+      "hash_prep_marker_marked_regions=%llu "
+      "hash_prep_marker_covered_ops=%llu "
+      "hash_prep_marker_covered_mstore_ops=%llu "
+      "hash_prep_marker_covered_mload_ops=%llu "
+      "hash_prep_marker_covered_keccak_ops=%llu "
+      "hash_prep_marker_rejected_regions=%llu "
+      "hash_prep_marker_rejected_ops=%llu "
+      "hash_prep_marker_rejected_non_0_64_range=%llu "
+      "hash_prep_marker_rejected_dynamic_offset=%llu "
+      "hash_prep_marker_rejected_alias_or_intervening_write=%llu "
+      "hash_prep_marker_rejected_mixed_predecessor=%llu "
+      "hash_prep_marker_rejected_byte_exact_risk=%llu "
+      "hash_prep_marker_rejected_gas_memory_semantics=%llu "
+      "hash_prep_marker_rejected_pointer_instability=%llu "
+      "hash_prep_marker_rejected_unknown_helper=%llu",
+      static_cast<unsigned long long>(
+          MemStats.HashPrepMarkerCandidateRegionCount),
+      static_cast<unsigned long long>(MemStats.HashPrepMarkerCandidateOpCount),
+      static_cast<unsigned long long>(MemStats.HashPrepMarkerMarkedRegionCount),
+      static_cast<unsigned long long>(MemStats.HashPrepMarkerCoveredOpCount),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepMarkerCoveredMStoreOpCount),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepMarkerCoveredMLoadOpCount),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepMarkerCoveredKeccakOpCount),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepMarkerRejectedRegionCount),
+      static_cast<unsigned long long>(MemStats.HashPrepMarkerRejectedOpCount),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepMarkerRejectedNon0_64Range),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepMarkerRejectedDynamicOffset),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepMarkerRejectedAliasOrInterveningWrite),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepMarkerRejectedMixedPredecessor),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepMarkerRejectedByteExactRisk),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepMarkerRejectedGasMemorySemantics),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepMarkerRejectedPointerInstability),
+      static_cast<unsigned long long>(
+          MemStats.HashPrepMarkerRejectedUnknownHelper));
+
+  if (hasArithCompileStats()) {
+    ZEN_LOG_DEBUG(
+        "[EVM-ARITH-SUMMARY] add_fast_range_u64=%llu add_fast_const_u64=%llu "
+        "add_full=%llu sub_fast_const_u64=%llu sub_full=%llu "
+        "mul_fast_range_u64=%llu mul_fast_const_u64=%llu mul_full=%llu "
+        "div_fast_range_u64=%llu div_fast_const_u64=%llu div_full=%llu "
+        "mod_fast_range_u64=%llu mod_fast_const_u64=%llu mod_full=%llu "
+        "mul_u128_opportunity=%llu div_u128_opportunity=%llu "
+        "mod_u128_opportunity=%llu",
+        static_cast<unsigned long long>(MemStats.AddFastRangeU64Count),
+        static_cast<unsigned long long>(MemStats.AddFastConstU64Count),
+        static_cast<unsigned long long>(MemStats.AddFullCount),
+        static_cast<unsigned long long>(MemStats.SubFastConstU64Count),
+        static_cast<unsigned long long>(MemStats.SubFullCount),
+        static_cast<unsigned long long>(MemStats.MulFastRangeU64Count),
+        static_cast<unsigned long long>(MemStats.MulFastConstU64Count),
+        static_cast<unsigned long long>(MemStats.MulFullCount),
+        static_cast<unsigned long long>(MemStats.DivFastRangeU64Count),
+        static_cast<unsigned long long>(MemStats.DivFastConstU64Count),
+        static_cast<unsigned long long>(MemStats.DivFullCount),
+        static_cast<unsigned long long>(MemStats.ModFastRangeU64Count),
+        static_cast<unsigned long long>(MemStats.ModFastConstU64Count),
+        static_cast<unsigned long long>(MemStats.ModFullCount),
+        static_cast<unsigned long long>(MemStats.MulU128OpportunityCount),
+        static_cast<unsigned long long>(MemStats.DivU128OpportunityCount),
+        static_cast<unsigned long long>(MemStats.ModU128OpportunityCount));
+  }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+}
+
+void EVMMirBuilder::beginMemoryCompileBlock(uint64_t EntryPC) {
+  CurBlockMemStats = MemoryBlockCompileStats();
+  CurBlockConstPrecheckPlan = MemoryBlockConstPrecheckPlan();
+  CurBlockLinearPrecheckPlan = MemoryBlockLinearPrecheckPlan();
+  CurBlockMemStats.Active = true;
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  CurBlockMemStats.BlockSeqId = ++NextMemoryBlockSeqId;
+  CurBlockMemStats.BlockEntryPC = EntryPC;
+#else
+  (void)EntryPC;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+}
+
+void EVMMirBuilder::setMemoryCompileBlockConstPrecheckPlan(
+    uint64_t MaxRequiredSize, uint64_t CoveredDirectOps) {
+  if (!CurBlockMemStats.Active || CoveredDirectOps < 2) {
+    return;
+  }
+  CurBlockConstPrecheckPlan = MemoryBlockConstPrecheckPlan();
+  CurBlockConstPrecheckPlan.Active = true;
+  CurBlockConstPrecheckPlan.MaxRequiredSize = MaxRequiredSize;
+  CurBlockConstPrecheckPlan.CoveredDirectOpsTotal = CoveredDirectOps;
+  CurBlockConstPrecheckPlan.CoveredDirectOpsRemaining = CoveredDirectOps;
+}
+
+void EVMMirBuilder::setMemoryCompileBlockLinearPrecheckPlan(
+    uint64_t AccessWidth, uint64_t CoveredDirectOps,
+    bool ValueEqualsFirstAddr) {
+  if (!CurBlockMemStats.Active || CoveredDirectOps < 2) {
+    return;
+  }
+  CurBlockLinearPrecheckPlan = MemoryBlockLinearPrecheckPlan();
+  CurBlockLinearPrecheckPlan.Active = true;
+  CurBlockLinearPrecheckPlan.ValueEqualsFirstAddr = ValueEqualsFirstAddr;
+  CurBlockLinearPrecheckPlan.AccessWidth = AccessWidth;
+  CurBlockLinearPrecheckPlan.CoveredDirectOpsTotal = CoveredDirectOps;
+  CurBlockLinearPrecheckPlan.CoveredDirectOpsRemaining = CoveredDirectOps;
+}
+
+void EVMMirBuilder::prepareLinearBlockMemoryPrecheck(Operand StrideComponents) {
+  if (!CurBlockLinearPrecheckPlan.Active ||
+      CurBlockLinearPrecheckPlan.Emitted) {
+    return;
+  }
+  CurBlockLinearPrecheckPlan.PendingStrideComponents = StrideComponents;
+  CurBlockLinearPrecheckPlan.HasPendingStride = true;
+}
+
+void EVMMirBuilder::noteMemoryOpcodeInBlock(evmc_opcode Opcode, uint64_t PC) {
+  if (!CurBlockMemStats.Active) {
+    return;
+  }
+
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  noteBlockMemoryEventPC(PC);
+  CurBlockMemStats.DirectMemoryOpCount++;
+  switch (Opcode) {
+  case OP_MLOAD:
+    CurBlockMemStats.MLoadCount++;
+    break;
+  case OP_MSTORE:
+    CurBlockMemStats.MStoreCount++;
+    break;
+  case OP_MSTORE8:
+    CurBlockMemStats.MStore8Count++;
+    break;
+  case OP_MSIZE:
+    CurBlockMemStats.MSizeCount++;
+    break;
+  case OP_MCOPY:
+    CurBlockMemStats.MCopyCount++;
+    break;
+  default:
+    break;
+  }
+#else
+  (void)Opcode;
+  (void)PC;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+}
+
+void EVMMirBuilder::noteHelperOpcodeInBlock(evmc_opcode Opcode, uint64_t PC) {
+  if (!CurBlockMemStats.Active) {
+    return;
+  }
+
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  noteBlockMemoryEventPC(PC);
+  CurBlockMemStats.HelperSensitiveOpCount++;
+  CurBlockMemStats.HasHelperBarrier = true;
+  CurBlockMemStats.DirectMemoryOnlyCandidate = false;
+  switch (Opcode) {
+  case OP_LOG0:
+  case OP_LOG1:
+  case OP_LOG2:
+  case OP_LOG3:
+  case OP_LOG4:
+    CurBlockMemStats.LogCount++;
+    break;
+  case OP_KECCAK256:
+    CurBlockMemStats.KeccakCount++;
+    break;
+  case OP_CALLDATACOPY:
+  case OP_CODECOPY:
+  case OP_EXTCODECOPY:
+  case OP_RETURNDATACOPY:
+    CurBlockMemStats.CopyFamilyCount++;
+    break;
+  case OP_CALL:
+  case OP_CALLCODE:
+  case OP_DELEGATECALL:
+  case OP_STATICCALL:
+    CurBlockMemStats.CallFamilyCount++;
+    break;
+  case OP_CREATE:
+  case OP_CREATE2:
+    CurBlockMemStats.CreateFamilyCount++;
+    break;
+  default:
+    break;
+  }
+#else
+  (void)Opcode;
+  (void)PC;
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+}
+
+void EVMMirBuilder::endMemoryCompileBlock() {
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  if (!hasCurrentMemoryBlockStats()) {
+    CurBlockMemStats.Active = false;
+    CurBlockConstPrecheckPlan = MemoryBlockConstPrecheckPlan();
+    CurBlockLinearPrecheckPlan = MemoryBlockLinearPrecheckPlan();
+    return;
+  }
+
+  MemStats.HashPrepKeccakConstRangeCount +=
+      CurBlockMemStats.HashPrepKeccakConstRangeCount;
+  MemStats.HashPrepKeccakRange0_64Count +=
+      CurBlockMemStats.HashPrepKeccakRange0_64Count;
+  MemStats.HashPrepKeccakDynamicRangeCount +=
+      CurBlockMemStats.HashPrepKeccakDynamicRangeCount;
+  MemStats.HashPrepKeccakOver128Count +=
+      CurBlockMemStats.HashPrepKeccakOver128Count;
+  MemStats.HashPrepRegionRejectedDynamicOffset +=
+      CurBlockMemStats.HashPrepKeccakDynamicRangeCount;
+  MemStats.HashPrepRegionRejectedRangeOver128 +=
+      CurBlockMemStats.HashPrepKeccakOver128Count;
+  MemStats.HashPrepRegionRejectedNonTwoWordRange +=
+      CurBlockMemStats.HashPrepKeccakNonTwoWordRangeCount;
+  MemStats.HashPrepRegionRejectedOrderingRisk +=
+      CurBlockMemStats.HashPrepRejectedOrderingRiskCount;
+  MemStats.HashPrepRegionRejectedAliasRisk +=
+      CurBlockMemStats.HashPrepRejectedAliasRiskCount;
+  MemStats.HashPrepRegionRejectedInterveningWrite +=
+      CurBlockMemStats.HashPrepRejectedInterveningWriteCount;
+  MemStats.HashPrepRegionRejectedByteExactRisk +=
+      CurBlockMemStats.HashPrepRejectedByteExactRiskCount;
+  MemStats.HashPrepRegionRejectedMissingTwoWordStores +=
+      CurBlockMemStats.HashPrepRejectedMissingTwoWordStoresCount;
+  MemStats.HashPrepRegionRejectedAliasOrInterveningWrite +=
+      CurBlockMemStats.HashPrepRejectedAliasOrInterveningWriteCount;
+
+  if (CurBlockMemStats.SmallFrameFallbackNoPrecheckCount != 0 &&
+      CurBlockMemStats.KeccakCount != 0) {
+    const uint64_t MissingOps =
+        CurBlockMemStats.SmallFrameFallbackNoPrecheckCount;
+    ++MemStats.HashPrepRegionCandidateCount;
+    MemStats.HashPrepRegionCandidateOpCount += MissingOps;
+    ++MemStats.HashPrepLiftSimCandidateRegionCount;
+    MemStats.HashPrepLiftSimCandidateOpCount += MissingOps;
+    CurBlockMemStats.HashPrepMarkerCandidate = true;
+    ++MemStats.HashPrepMarkerCandidateRegionCount;
+    MemStats.HashPrepMarkerCandidateOpCount += MissingOps;
+
+    if (CurBlockMemStats.HashPrepVerifiedKeccakCount != 0) {
+      ++MemStats.HashPrepRegionVerifiedCount;
+      MemStats.HashPrepRegionVerifiedOpCount += MissingOps;
+      if (CurBlockMemStats.HashPrepVerifiedKeccakCount == 1) {
+        ++MemStats.HashPrepRegionVerifiedTwoWordPreimageCount;
+      } else {
+        ++MemStats.HashPrepRegionVerifiedMultiHashCount;
+      }
+      ++MemStats.HashPrepLiftSimCoveredRegionCount;
+      MemStats.HashPrepLiftSimCoveredOpCount += MissingOps;
+      ++MemStats.HashPrepLiftSimSafeToLiftRegionCount;
+      MemStats.HashPrepLiftSimSafeToLiftOpCount += MissingOps;
+
+      CurBlockMemStats.HashPrepMarkerMarked = true;
+      CurBlockMemStats.HashPrepMarkerId = ++NextHashPrepMarkerId;
+      CurBlockMemStats.HashPrepMarkerRangeBegin = 0;
+      CurBlockMemStats.HashPrepMarkerRangeEnd = 64;
+      CurBlockMemStats.HashPrepMarkerCoveredOpCount = MissingOps;
+      CurBlockMemStats.HashPrepMarkerCoveredMStoreOpCount =
+          CurBlockMemStats.SmallFrameNoPrecheckMStoreCount;
+      CurBlockMemStats.HashPrepMarkerCoveredMLoadOpCount =
+          CurBlockMemStats.SmallFrameNoPrecheckMLoadCount;
+      CurBlockMemStats.HashPrepMarkerCoveredKeccakOpCount =
+          CurBlockMemStats.HashPrepVerifiedKeccakCount;
+
+      ++MemStats.HashPrepMarkerMarkedRegionCount;
+      MemStats.HashPrepMarkerCoveredOpCount += MissingOps;
+      MemStats.HashPrepMarkerCoveredMStoreOpCount +=
+          CurBlockMemStats.HashPrepMarkerCoveredMStoreOpCount;
+      MemStats.HashPrepMarkerCoveredMLoadOpCount +=
+          CurBlockMemStats.HashPrepMarkerCoveredMLoadOpCount;
+      MemStats.HashPrepMarkerCoveredKeccakOpCount +=
+          CurBlockMemStats.HashPrepMarkerCoveredKeccakOpCount;
+    } else {
+      ++MemStats.HashPrepLiftSimRejectedRegionCount;
+      MemStats.HashPrepLiftSimRejectedOpCount += MissingOps;
+
+      ++MemStats.HashPrepMarkerRejectedRegionCount;
+      MemStats.HashPrepMarkerRejectedOpCount += MissingOps;
+      if (CurBlockMemStats.HashPrepKeccakDynamicRangeCount != 0) {
+        CurBlockMemStats.HashPrepMarkerRejectedReason = 1;
+        ++MemStats.HashPrepMarkerRejectedDynamicOffset;
+      } else if (CurBlockMemStats.HashPrepKeccakNonTwoWordRangeCount != 0 ||
+                 CurBlockMemStats.HashPrepKeccakOver128Count != 0) {
+        CurBlockMemStats.HashPrepMarkerRejectedReason = 2;
+        ++MemStats.HashPrepMarkerRejectedNon0_64Range;
+      } else if (CurBlockMemStats
+                     .HashPrepRejectedAliasOrInterveningWriteCount != 0) {
+        CurBlockMemStats.HashPrepMarkerRejectedReason = 3;
+        ++MemStats.HashPrepMarkerRejectedAliasOrInterveningWrite;
+      } else if (CurBlockMemStats.HashPrepRejectedByteExactRiskCount != 0 ||
+                 CurBlockMemStats.HashPrepRejectedOrderingRiskCount != 0 ||
+                 CurBlockMemStats.HashPrepRejectedMissingTwoWordStoresCount !=
+                     0) {
+        CurBlockMemStats.HashPrepMarkerRejectedReason = 4;
+        ++MemStats.HashPrepMarkerRejectedByteExactRisk;
+      } else {
+        CurBlockMemStats.HashPrepMarkerRejectedReason = 5;
+        ++MemStats.HashPrepMarkerRejectedUnknownHelper;
+      }
+    }
+  }
+
+  ZEN_LOG_DEBUG(
+      "[EVM-MEM-BLOCK] seq=%llu entry_pc=%llu first_mem_pc=%llu "
+      "last_mem_pc=%llu direct_ops=%llu mload=%llu mstore=%llu "
+      "mstore8=%llu msize=%llu mcopy=%llu helper_ops=%llu "
+      "helper_barrier=%d log=%llu keccak=%llu copy=%llu call=%llu "
+      "create=%llu expand_calls=%llu need_expand_cfg=%llu "
+      "get_mem_ptr=%llu mem_base_instance_loads=%llu "
+      "mem_base_cache_uses=%llu reload_mem_size=%llu "
+      "block_const_precheck=%llu block_linear_precheck=%llu "
+      "prechecked_direct_ops=%llu prechecked_mload_ops=%llu "
+      "prechecked_mstore_ops=%llu linear_u64_addr_fast_ops=%llu "
+      "linear_u64_mload_fast_ops=%llu linear_u64_mstore_fast_ops=%llu "
+      "const_base_ptr_inits=%llu const_base_ptr_reuses=%llu "
+      "const_disp_bytes32_mload_ops=%llu const_disp_bytes32_mstore_ops=%llu "
+      "disp_bytes32_mload_ops=%llu disp_bytes32_mstore_ops=%llu "
+      "mstore_zero_limb_stores=%llu mstore_overlap_elided_limbs=%llu "
+      "mstore_addr_value_alias_reuse=%llu "
+      "direct_only_candidate=%d "
+      "hash_prep_marker_candidate=%d hash_prep_marker_marked=%d "
+      "hash_prep_marker_id=%llu hash_prep_marker_range_begin=%llu "
+      "hash_prep_marker_range_end=%llu hash_prep_marker_covered_ops=%llu "
+      "hash_prep_marker_covered_mstore_ops=%llu "
+      "hash_prep_marker_covered_mload_ops=%llu "
+      "hash_prep_marker_covered_keccak_ops=%llu "
+      "hash_prep_marker_rejected_reason=%llu",
+      static_cast<unsigned long long>(CurBlockMemStats.BlockSeqId),
+      static_cast<unsigned long long>(CurBlockMemStats.BlockEntryPC),
+      static_cast<unsigned long long>(CurBlockMemStats.FirstMemoryEventPC),
+      static_cast<unsigned long long>(CurBlockMemStats.LastMemoryEventPC),
+      static_cast<unsigned long long>(CurBlockMemStats.DirectMemoryOpCount),
+      static_cast<unsigned long long>(CurBlockMemStats.MLoadCount),
+      static_cast<unsigned long long>(CurBlockMemStats.MStoreCount),
+      static_cast<unsigned long long>(CurBlockMemStats.MStore8Count),
+      static_cast<unsigned long long>(CurBlockMemStats.MSizeCount),
+      static_cast<unsigned long long>(CurBlockMemStats.MCopyCount),
+      static_cast<unsigned long long>(CurBlockMemStats.HelperSensitiveOpCount),
+      CurBlockMemStats.HasHelperBarrier ? 1 : 0,
+      static_cast<unsigned long long>(CurBlockMemStats.LogCount),
+      static_cast<unsigned long long>(CurBlockMemStats.KeccakCount),
+      static_cast<unsigned long long>(CurBlockMemStats.CopyFamilyCount),
+      static_cast<unsigned long long>(CurBlockMemStats.CallFamilyCount),
+      static_cast<unsigned long long>(CurBlockMemStats.CreateFamilyCount),
+      static_cast<unsigned long long>(CurBlockMemStats.ExpandCallCount),
+      static_cast<unsigned long long>(CurBlockMemStats.NeedExpandCFGCount),
+      static_cast<unsigned long long>(CurBlockMemStats.GetMemPtrCount),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.MemoryBaseInstanceLoadCount),
+      static_cast<unsigned long long>(CurBlockMemStats.MemoryBaseCacheUseCount),
+      static_cast<unsigned long long>(CurBlockMemStats.ReloadMemSizeCount),
+      static_cast<unsigned long long>(CurBlockMemStats.BlockConstPrecheckCount),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.BlockLinearPrecheckCount),
+      static_cast<unsigned long long>(CurBlockMemStats.PrecheckedDirectOpCount),
+      static_cast<unsigned long long>(CurBlockMemStats.PrecheckedMLoadOpCount),
+      static_cast<unsigned long long>(CurBlockMemStats.PrecheckedMStoreOpCount),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.LinearU64AddrFastPathCount),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.LinearU64MLoadFastPathCount),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.LinearU64MStoreFastPathCount),
+      static_cast<unsigned long long>(CurBlockMemStats.ConstBasePtrInitCount),
+      static_cast<unsigned long long>(CurBlockMemStats.ConstBasePtrReuseCount),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.ConstDispBytes32MLoadCount),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.ConstDispBytes32MStoreCount),
+      static_cast<unsigned long long>(CurBlockMemStats.DispBytes32MLoadCount),
+      static_cast<unsigned long long>(CurBlockMemStats.DispBytes32MStoreCount),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.MStoreZeroLimbStoreCount),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.MStoreOverlapElidedLimbCount),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.MStoreAddrValueAliasReuseCount),
+      CurBlockMemStats.DirectMemoryOnlyCandidate ? 1 : 0,
+      CurBlockMemStats.HashPrepMarkerCandidate ? 1 : 0,
+      CurBlockMemStats.HashPrepMarkerMarked ? 1 : 0,
+      static_cast<unsigned long long>(CurBlockMemStats.HashPrepMarkerId),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.HashPrepMarkerRangeBegin),
+      static_cast<unsigned long long>(CurBlockMemStats.HashPrepMarkerRangeEnd),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.HashPrepMarkerCoveredOpCount),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.HashPrepMarkerCoveredMStoreOpCount),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.HashPrepMarkerCoveredMLoadOpCount),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.HashPrepMarkerCoveredKeccakOpCount),
+      static_cast<unsigned long long>(
+          CurBlockMemStats.HashPrepMarkerRejectedReason));
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+
+  CurBlockMemStats.Active = false;
+  CurBlockConstPrecheckPlan = MemoryBlockConstPrecheckPlan();
+  CurBlockLinearPrecheckPlan = MemoryBlockLinearPrecheckPlan();
+}
+
+bool EVMMirBuilder::tryConsumeConstBlockMemoryPrecheck() {
+  if (!CurBlockConstPrecheckPlan.Active ||
+      CurBlockConstPrecheckPlan.CoveredDirectOpsRemaining == 0) {
+    return false;
+  }
+
+  if (!CurBlockConstPrecheckPlan.Emitted) {
+    MType *I64Type = &Ctx.I64Type;
+    MInstruction *RequiredSize = createIntConstInstruction(
+        I64Type, CurBlockConstPrecheckPlan.MaxRequiredSize);
+    MInstruction *NoOverflow = createIntConstInstruction(I64Type, 0);
+    expandMemoryIR(RequiredSize, NoOverflow);
+    CurBlockConstPrecheckPlan.Emitted = true;
+
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.BlockConstPrecheckCount;
+    if (CurBlockMemStats.Active) {
+      CurBlockMemStats.BlockConstPrecheckCount++;
+      CurBlockMemStats.PrecheckedDirectOpCount =
+          CurBlockConstPrecheckPlan.CoveredDirectOpsTotal;
+      CurBlockMemStats.ExpandCallCount++;
+    }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  }
+
+  CurBlockConstPrecheckPlan.CoveredDirectOpsRemaining--;
+  if (CurBlockConstPrecheckPlan.CoveredDirectOpsRemaining == 0) {
+    CurBlockConstPrecheckPlan.Active = false;
+  }
+  return true;
+}
+
+MInstruction *EVMMirBuilder::getConstBlockDirectMemoryBasePtr() {
+  ZEN_ASSERT(CurBlockConstPrecheckPlan.Emitted &&
+             "const block base pointer requires emitted precheck");
+
+  if (CurBlockConstPrecheckPlan.HasAnchoredBasePtr &&
+      CurBlockConstPrecheckPlan.AnchoredBasePtrVar != nullptr) {
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.ConstBasePtrReuseCount;
+    if (CurBlockMemStats.Active) {
+      ++CurBlockMemStats.ConstBasePtrReuseCount;
+    }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    return loadVariable(CurBlockConstPrecheckPlan.AnchoredBasePtrVar);
+  }
+
+  MInstruction *MemBase = getDirectMemoryDataPointer(true);
+  MInstruction *BasePtr = createInstruction<ConversionInstruction>(
+      false, OP_inttoptr, createVoidPtrType(), MemBase);
+  BasePtr = anchorDirectMemoryPointer(BasePtr);
+  Variable *BasePtrVar = storeInstructionInTemp(BasePtr, BasePtr->getType());
+  CurBlockConstPrecheckPlan.HasAnchoredBasePtr = true;
+  CurBlockConstPrecheckPlan.AnchoredBasePtrVar = BasePtrVar;
+
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  ++MemStats.ConstBasePtrInitCount;
+  if (CurBlockMemStats.Active) {
+    ++CurBlockMemStats.ConstBasePtrInitCount;
+  }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+
+  return loadVariable(BasePtrVar);
+}
+
+bool EVMMirBuilder::tryConsumeLinearBlockMemoryPrecheck(
+    MInstruction *FirstAddr, MInstruction *OrderingDep) {
+  if (!CurBlockLinearPrecheckPlan.Active ||
+      CurBlockLinearPrecheckPlan.CoveredDirectOpsRemaining == 0) {
+    return false;
+  }
+
+  if (!CurBlockLinearPrecheckPlan.Emitted) {
+    if (!CurBlockLinearPrecheckPlan.HasPendingStride) {
+      return false;
+    }
+
+    Operand StrideComponents =
+        CurBlockLinearPrecheckPlan.PendingStrideComponents;
+    normalizeOperandU64(StrideComponents);
+
+    MType *I64Type = &Ctx.I64Type;
+    U256Inst StrideParts = extractU256Operand(StrideComponents);
+    MInstruction *Stride = StrideParts[0];
+    MInstruction *LastAddr = FirstAddr;
+    MInstruction *Overflow = createIntConstInstruction(I64Type, 0);
+
+    const uint64_t LastIndex =
+        CurBlockLinearPrecheckPlan.CoveredDirectOpsTotal - 1;
+    if (LastIndex != 0) {
+      MInstruction *LastIndexConst =
+          createIntConstInstruction(I64Type, LastIndex);
+      MInstruction *MaxStride =
+          createIntConstInstruction(I64Type, UINT64_MAX / LastIndex);
+      MInstruction *MulOverflow = createInstruction<CmpInstruction>(
+          false, CmpInstruction::Predicate::ICMP_UGT, I64Type, Stride,
+          MaxStride);
+      MInstruction *StrideDelta = createInstruction<BinaryInstruction>(
+          false, OP_mul, I64Type, Stride, LastIndexConst);
+      LastAddr = createInstruction<BinaryInstruction>(false, OP_add, I64Type,
+                                                      FirstAddr, StrideDelta);
+      MInstruction *AddrOverflow = createInstruction<CmpInstruction>(
+          false, CmpInstruction::Predicate::ICMP_ULT, I64Type, LastAddr,
+          FirstAddr);
+      Overflow = createInstruction<BinaryInstruction>(
+          false, OP_or, I64Type, MulOverflow, AddrOverflow);
+    }
+
+    MInstruction *AccessWidth = createIntConstInstruction(
+        I64Type, CurBlockLinearPrecheckPlan.AccessWidth);
+    MInstruction *RequiredSize = createInstruction<BinaryInstruction>(
+        false, OP_add, I64Type, LastAddr, AccessWidth);
+    MInstruction *SizeOverflow = createInstruction<CmpInstruction>(
+        false, CmpInstruction::Predicate::ICMP_ULT, I64Type, RequiredSize,
+        LastAddr);
+    Overflow = createInstruction<BinaryInstruction>(false, OP_or, I64Type,
+                                                    Overflow, SizeOverflow);
+    if (OrderingDep != nullptr) {
+      RequiredSize = createInstruction<BinaryInstruction>(
+          false, OP_add, I64Type, RequiredSize, OrderingDep);
+    }
+
+    expandMemoryIR(RequiredSize, Overflow);
+    CurBlockLinearPrecheckPlan.Emitted = true;
+    CurBlockLinearPrecheckPlan.HasPendingStride = false;
+
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.BlockLinearPrecheckCount;
+    if (CurBlockMemStats.Active) {
+      CurBlockMemStats.BlockLinearPrecheckCount++;
+      CurBlockMemStats.PrecheckedDirectOpCount =
+          CurBlockLinearPrecheckPlan.CoveredDirectOpsTotal;
+      CurBlockMemStats.ExpandCallCount++;
+    }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  }
+
+  CurBlockLinearPrecheckPlan.CoveredDirectOpsRemaining--;
+  if (CurBlockLinearPrecheckPlan.CoveredDirectOpsRemaining == 0) {
+    CurBlockLinearPrecheckPlan.Active = false;
+  }
+  return true;
 }
 
 // ==================== Memory Operation Helper Methods ====================
 
 MInstruction *EVMMirBuilder::getMemoryDataPointer() {
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  ++MemStats.GetMemoryDataPointerCount;
+  ++MemStats.MemoryBaseInstanceLoadCount;
+  if (CurBlockMemStats.Active) {
+    CurBlockMemStats.GetMemPtrCount++;
+    ++CurBlockMemStats.MemoryBaseInstanceLoadCount;
+  }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  MType *I64Type = &Ctx.I64Type;
+  MPointerType *VoidPtrType = createVoidPtrType();
+  const int32_t MemoryBaseOffset =
+      zen::runtime::EVMInstance::getMemoryBaseOffset();
+  MInstruction *MemPtr = getInstanceElement(VoidPtrType, MemoryBaseOffset);
+  MInstruction *MemBaseInt = createInstruction<ConversionInstruction>(
+      false, OP_ptrtoint, I64Type, MemPtr);
+  if (MemoryBaseVar) {
+    createInstruction<DassignInstruction>(true, &(Ctx.VoidType), MemBaseInt,
+                                          MemoryBaseVar->getVarIdx());
+  }
+  return MemBaseInt;
+}
+
+MInstruction *EVMMirBuilder::getDirectMemoryDataPointer(bool PreferCachedBase) {
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  ++MemStats.GetMemoryDataPointerCount;
+  if (CurBlockMemStats.Active) {
+    CurBlockMemStats.GetMemPtrCount++;
+  }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+
+  if (PreferCachedBase && MemoryBaseVar) {
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    ++MemStats.MemoryBaseCacheUseCount;
+    if (CurBlockMemStats.Active) {
+      ++CurBlockMemStats.MemoryBaseCacheUseCount;
+    }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+    return loadVariable(MemoryBaseVar);
+  }
+
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  ++MemStats.MemoryBaseInstanceLoadCount;
+  if (CurBlockMemStats.Active) {
+    ++CurBlockMemStats.MemoryBaseInstanceLoadCount;
+  }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
   MType *I64Type = &Ctx.I64Type;
   MPointerType *VoidPtrType = createVoidPtrType();
   const int32_t MemoryBaseOffset =
@@ -3303,6 +7510,12 @@ MInstruction *EVMMirBuilder::getMemorySize() {
 }
 
 void EVMMirBuilder::reloadMemorySizeFromInstance() {
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  ++MemStats.ReloadMemorySizeCount;
+  if (CurBlockMemStats.Active) {
+    CurBlockMemStats.ReloadMemSizeCount++;
+  }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
   if (!MemorySizeVar) {
     return;
   }
@@ -3353,6 +7566,34 @@ EVMMirBuilder::calculateMemoryGasCostIR(MInstruction *SizeInBytes) {
 
 void EVMMirBuilder::chargeDynamicGasIR(MInstruction *GasCost) {
   MType *I64Type = &Ctx.I64Type;
+
+#ifdef ZEN_ENABLE_EVM_GAS_REGISTER
+  if (Ctx.isGasRegisterEnabled() && GasRegVar) {
+    MInstruction *CurrentGas = loadVariable(GasRegVar);
+
+    MInstruction *IsOutOfGas = createInstruction<CmpInstruction>(
+        false, CmpInstruction::Predicate::ICMP_ULT, &Ctx.I64Type, CurrentGas,
+        GasCost);
+
+    MBasicBlock *ContinueBB = createBasicBlock();
+    MBasicBlock *OutOfGasBB =
+        getOrCreateExceptionSetBB(ErrorCode::GasLimitExceeded);
+    createInstruction<BrIfInstruction>(true, Ctx, IsOutOfGas, OutOfGasBB,
+                                       ContinueBB);
+    addUniqueSuccessor(OutOfGasBB);
+    addSuccessor(ContinueBB);
+    setInsertBlock(ContinueBB);
+
+    MInstruction *NewGas = createInstruction<BinaryInstruction>(
+        false, OP_sub, I64Type, CurrentGas, GasCost);
+    createInstruction<DassignInstruction>(true, &(Ctx.VoidType), NewGas,
+                                          GasRegVar->getVarIdx());
+
+    syncGasToMemory();
+    return;
+  }
+#endif
+
   MInstruction *GasOffsetValue = createIntConstInstruction(
       I64Type, zen::runtime::EVMInstance::getGasFieldOffset());
   MInstruction *GasAddrInt = createInstruction<BinaryInstruction>(
@@ -3462,6 +7703,12 @@ void EVMMirBuilder::expandMemoryIR(MInstruction *RequiredSize,
   MInstruction *CurrentSize = getMemorySize();
 
   // Check if expansion is needed
+#ifdef ZEN_ENABLE_MULTIPASS_JIT_LOGGING
+  ++MemStats.ExpandNeedExpandCFGCount;
+  if (CurBlockMemStats.Active) {
+    CurBlockMemStats.NeedExpandCFGCount++;
+  }
+#endif // ZEN_ENABLE_MULTIPASS_JIT_LOGGING
   MInstruction *NeedExpand = createInstruction<CmpInstruction>(
       false, CmpInstruction::Predicate::ICMP_UGT, I64Type, RequiredSize,
       CurrentSize);

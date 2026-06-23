@@ -7,12 +7,59 @@
 
 #include <filesystem>
 #include <fstream>
+#include <intx/intx.hpp>
 #include <limits>
 #include <rapidjson/istreamwrapper.h>
 #include <stdexcept>
 
 namespace zen::evm_test_utils {
 using namespace zen::utils;
+
+namespace {
+intx::uint256 fakeExponential(uint64_t factor, uint64_t numerator,
+                              uint64_t denominator) noexcept {
+  intx::uint256 i = 1;
+  intx::uint256 output = 0;
+  intx::uint256 numerator_accum = intx::uint256{factor} * denominator;
+  const intx::uint256 numerator256 = numerator;
+  while (numerator_accum > 0) {
+    output += numerator_accum;
+    if (const auto p = intx::umul(numerator_accum, numerator256);
+        p <= std::numeric_limits<intx::uint256>::max()) {
+      numerator_accum = intx::uint256(p) / (denominator * i);
+    } else {
+      return std::numeric_limits<intx::uint256>::max();
+    }
+    i += 1;
+  }
+  return output / denominator;
+}
+
+evmc::uint256be computeBlobBaseFee(uint64_t excess_blob_gas,
+                                   uint64_t base_fee_update_fraction) {
+  if (base_fee_update_fraction == 0) {
+    return parseUint256("0x01");
+  }
+  const intx::uint256 base_fee =
+      fakeExponential(1, excess_blob_gas, base_fee_update_fraction);
+  evmc::uint256be result{};
+  intx::be::store(result.bytes, base_fee);
+  return result;
+}
+
+evmc::uint256be computeEffectiveGasPrice(const evmc::uint256be &max_fee,
+                                         const evmc::uint256be &max_priority,
+                                         const evmc::uint256be &base_fee) {
+  const intx::uint256 maxFee = intx::be::load<intx::uint256>(max_fee);
+  const intx::uint256 maxPriority = intx::be::load<intx::uint256>(max_priority);
+  const intx::uint256 baseFee = intx::be::load<intx::uint256>(base_fee);
+  const intx::uint256 capped =
+      (baseFee + maxPriority < maxFee) ? (baseFee + maxPriority) : maxFee;
+  evmc::uint256be result{};
+  intx::be::store(result.bytes, capped);
+  return result;
+}
+} // namespace
 
 std::vector<ParsedAccount> parsePreAccounts(const rapidjson::Value &Pre) {
   std::vector<ParsedAccount> Accounts;
@@ -111,6 +158,8 @@ std::vector<StateTestFixture> parseStateTestFile(const std::string &FilePath) {
   for (auto It = Doc.MemberBegin(); It != Doc.MemberEnd(); ++It) {
     StateTestFixture Fixture;
     Fixture.TestName = It->name.GetString();
+    std::optional<uint64_t> CurrentExcessBlobGas;
+    uint64_t BaseFeeUpdateFraction = 0x32f0ed;
 
     const rapidjson::Value &TestCase = It->value;
 
@@ -166,9 +215,7 @@ std::vector<StateTestFixture> parseStateTestFile(const std::string &FilePath) {
             stripHexPrefix(Env["currentExcessBlobGas"].GetString());
         uint64_t ExcessBlobGas =
             std::stoull(ExcessStr.empty() ? "0" : ExcessStr, nullptr, 16);
-        if (ExcessBlobGas == 0) {
-          Fixture.Environment.blob_base_fee = parseUint256("0x01");
-        }
+        CurrentExcessBlobGas = ExcessBlobGas;
       }
     }
 
@@ -181,6 +228,35 @@ std::vector<StateTestFixture> parseStateTestFile(const std::string &FilePath) {
         Fixture.Environment.chain_id =
             parseUint256(Config["chainId"].GetString());
       }
+
+      if (Config.HasMember("blobSchedule") &&
+          Config["blobSchedule"].IsObject()) {
+        const rapidjson::Value &BlobSchedule = Config["blobSchedule"];
+        const rapidjson::Value *Schedule = nullptr;
+        if (BlobSchedule.HasMember("Cancun") &&
+            BlobSchedule["Cancun"].IsObject()) {
+          Schedule = &BlobSchedule["Cancun"];
+        } else if (BlobSchedule.HasMember("Prague") &&
+                   BlobSchedule["Prague"].IsObject()) {
+          Schedule = &BlobSchedule["Prague"];
+        } else if (BlobSchedule.MemberCount() > 0 &&
+                   BlobSchedule.MemberBegin()->value.IsObject()) {
+          Schedule = &BlobSchedule.MemberBegin()->value;
+        }
+
+        if (Schedule && Schedule->HasMember("baseFeeUpdateFraction") &&
+            (*Schedule)["baseFeeUpdateFraction"].IsString()) {
+          std::string FractionStr =
+              stripHexPrefix((*Schedule)["baseFeeUpdateFraction"].GetString());
+          BaseFeeUpdateFraction =
+              std::stoull(FractionStr.empty() ? "0" : FractionStr, nullptr, 16);
+        }
+      }
+    }
+
+    if (CurrentExcessBlobGas.has_value()) {
+      Fixture.Environment.blob_base_fee =
+          computeBlobBaseFee(*CurrentExcessBlobGas, BaseFeeUpdateFraction);
     }
 
     if (TestCase.HasMember("transaction")) {
@@ -199,13 +275,13 @@ std::vector<StateTestFixture> parseStateTestFile(const std::string &FilePath) {
                  Transaction.HasMember("maxPriorityFeePerGas") &&
                  Transaction["maxPriorityFeePerGas"].IsString()) {
         // EIP-1559 transaction format
-        // For EIP-1559, tx_gas_price should be the effective gas price:
-        // min(maxFeePerGas, baseFee + maxPriorityFeePerGas)
-        // However, since we don't know baseFee at parsing time, we use
-        // maxFeePerGas
-        // The actual effective price calculation is done during execution
-        Fixture.Environment.tx_gas_price =
+        const auto MaxFeePerGas =
             parseUint256(Transaction["maxFeePerGas"].GetString());
+        const auto MaxPriorityFeePerGas =
+            parseUint256(Transaction["maxPriorityFeePerGas"].GetString());
+        Fixture.Environment.tx_gas_price =
+            computeEffectiveGasPrice(MaxFeePerGas, MaxPriorityFeePerGas,
+                                     Fixture.Environment.block_base_fee);
       }
     }
 
@@ -359,51 +435,11 @@ createTransactionFromIndex(const rapidjson::Document &Transaction,
       Transaction["authorizationList"].IsArray()) {
     const rapidjson::Value &AuthorizationLists =
         Transaction["authorizationList"];
-
-    const rapidjson::Value *AuthListForIndex = &AuthorizationLists;
-    if (!AuthorizationLists.Empty() && AuthorizationLists[0].IsArray()) {
-      if (Result.Indexes.Data < AuthorizationLists.Size()) {
-        AuthListForIndex = &AuthorizationLists[Result.Indexes.Data];
-      } else {
-        AuthListForIndex = nullptr;
-      }
-    }
-
-    if (AuthListForIndex && AuthListForIndex->IsArray()) {
-      for (rapidjson::SizeType I = 0; I < AuthListForIndex->Size(); ++I) {
-        const rapidjson::Value &Entry = (*AuthListForIndex)[I];
-        if (!Entry.IsObject()) {
-          continue;
-        }
-
-        AuthorizationListEntry ALE;
-        if (Entry.HasMember("chainId") && Entry["chainId"].IsString()) {
-          ALE.ChainId = parseUint256(Entry["chainId"].GetString());
-        } else if (Entry.HasMember("chainid") && Entry["chainid"].IsString()) {
-          ALE.ChainId = parseUint256(Entry["chainid"].GetString());
-        }
-
-        if (Entry.HasMember("address") && Entry["address"].IsString()) {
-          ALE.Address = parseAddress(Entry["address"].GetString());
-        }
-
-        if (Entry.HasMember("nonce") && Entry["nonce"].IsString()) {
-          const std::string NonceStr =
-              stripHexPrefix(Entry["nonce"].GetString());
-          try {
-            ALE.Nonce =
-                std::stoull(NonceStr.empty() ? "0" : NonceStr, nullptr, 16);
-          } catch (const std::exception &) {
-            ALE.Nonce = std::numeric_limits<uint64_t>::max();
-          }
-        }
-
-        if (Entry.HasMember("signer") && Entry["signer"].IsString()) {
-          ALE.Signer = parseAddress(Entry["signer"].GetString());
-          ALE.HasSigner = true;
-        }
-
-        PT.AuthorizationList.push_back(std::move(ALE));
+    if (Result.Indexes.Data < AuthorizationLists.Size()) {
+      const rapidjson::Value &AuthListForIndex =
+          AuthorizationLists[Result.Indexes.Data];
+      if (AuthListForIndex.IsArray()) {
+        PT.AuthorizationListSize = AuthListForIndex.Size();
       }
     }
   }

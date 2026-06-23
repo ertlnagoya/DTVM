@@ -364,7 +364,7 @@ private:
         break;
       case BR_TABLE: {
         uint32_t NumTargets = 0;
-        Ptr = readSafeLEBNumber(Ptr, NumTargets);
+        Ptr = readSafeLEBNumber(Ptr, End, NumTargets);
         for (uint32_t I = 0; I <= NumTargets; ++I) {
           Ptr = skipLEBNumber<uint32_t>(Ptr, End);
         }
@@ -580,7 +580,7 @@ private:
         break;
       }
       default:
-        ZEN_LOG_ERROR("unimplemented opcode : {%d}", Opcode);
+        ZEN_LOG_ERROR("unimplemented opcode : 0x%x", Opcode);
         ZEN_ASSERT_TODO();
         break;
       }
@@ -905,8 +905,8 @@ private:
                InterpFrame *Frame, uint32_t *&ValStackPtr,
                uint64_t LinearMemSize) {
     uint32_t Align, Offset;
-    Ip = readSafeLEBNumber(Ip, Align);
-    Ip = readSafeLEBNumber(Ip, Offset);
+    Ip = readSafeLEBNumber(Ip, IpEnd, Align);
+    Ip = readSafeLEBNumber(Ip, IpEnd, Offset);
     SrcType Val = Frame->valuePop<SrcType>(ValStackPtr);
     uint32_t Addr = Frame->valuePop<uint32_t>(ValStackPtr);
     if ((uint64_t)Offset + sizeof(DestType) + Addr > LinearMemSize) {
@@ -925,8 +925,8 @@ private:
               InterpFrame *Frame, uint32_t *&ValStackPtr,
               uint64_t LinearMemSize) {
     uint32_t Align, Offset;
-    Ip = readSafeLEBNumber(Ip, Align);
-    Ip = readSafeLEBNumber(Ip, Offset);
+    Ip = readSafeLEBNumber(Ip, IpEnd, Align);
+    Ip = readSafeLEBNumber(Ip, IpEnd, Offset);
     uint32_t Addr = Frame->valuePop<uint32_t>(ValStackPtr);
     if ((uint64_t)Offset + sizeof(SrcType) + Addr > LinearMemSize) {
       throw getError(ErrorCode::OutOfBoundsMemory);
@@ -1184,12 +1184,12 @@ void BaseInterpreterImpl::interpret() {
         BREAK;
       }
       CASE(BR) : {
-        Ip = readSafeLEBNumber(Ip, Depth);
+        Ip = readSafeLEBNumber(Ip, IpEnd, Depth);
         Frame->blockPop(ControlStackPtr, ValStackPtr, Ip, Depth);
         BREAK;
       }
       CASE(BR_IF) : {
-        Ip = readSafeLEBNumber(Ip, Depth);
+        Ip = readSafeLEBNumber(Ip, IpEnd, Depth);
         Cond = Frame->valuePop<int32_t>(ValStackPtr);
         if (Cond) {
           Frame->blockPop(ControlStackPtr, ValStackPtr, Ip, Depth);
@@ -1198,13 +1198,13 @@ void BaseInterpreterImpl::interpret() {
       }
       CASE(BR_TABLE) : {
         uint32_t Count;
-        Ip = readSafeLEBNumber(Ip, Count);
+        Ip = readSafeLEBNumber(Ip, IpEnd, Count);
         uint32_t LabelIdx =
             std::min(Count, Frame->valuePop<uint32_t>(ValStackPtr));
         for (uint32_t I = 0; I < LabelIdx; I++) {
           Ip = skipLEBNumber<uint8_t>(Ip, IpEnd);
         }
-        Ip = readSafeLEBNumber(Ip, Depth);
+        Ip = readSafeLEBNumber(Ip, IpEnd, Depth);
         Frame->blockPop(ControlStackPtr, ValStackPtr, Ip, Depth);
         BREAK;
       }
@@ -1240,19 +1240,19 @@ void BaseInterpreterImpl::interpret() {
         BREAK;
       }
       CASE(GET_GLOBAL_64) : {
-        Ip = readSafeLEBNumber(Ip, GlobalIdx);
+        Ip = readSafeLEBNumber(Ip, IpEnd, GlobalIdx);
         uint8_t *GlobalAddr = ModInst->getGlobalAddr(GlobalIdx);
         Frame->valuePush<int64_t>(ValStackPtr, *(int64_t *)GlobalAddr);
         BREAK;
       }
       CASE(SET_GLOBAL_64) : {
-        Ip = readSafeLEBNumber(Ip, GlobalIdx);
+        Ip = readSafeLEBNumber(Ip, IpEnd, GlobalIdx);
         uint8_t *GlobalAddr = ModInst->getGlobalAddr(GlobalIdx);
         *(int64_t *)GlobalAddr = Frame->valuePop<int64_t>(ValStackPtr);
         BREAK;
       }
       CASE(GET_LOCAL) : {
-        Ip = readSafeLEBNumber(Ip, LocalIdx);
+        Ip = readSafeLEBNumber(Ip, IpEnd, LocalIdx);
         LocalType = FuncInst->getLocalType(LocalIdx);
         LocalOffset = FuncInst->getLocalOffset(LocalIdx);
 
@@ -1276,7 +1276,7 @@ void BaseInterpreterImpl::interpret() {
         BREAK;
       }
       CASE(SET_LOCAL) : {
-        Ip = readSafeLEBNumber(Ip, LocalIdx);
+        Ip = readSafeLEBNumber(Ip, IpEnd, LocalIdx);
         LocalType = FuncInst->getLocalType(LocalIdx);
         LocalOffset = FuncInst->getLocalOffset(LocalIdx);
 
@@ -1297,7 +1297,7 @@ void BaseInterpreterImpl::interpret() {
         BREAK;
       }
       CASE(TEE_LOCAL) : {
-        Ip = readSafeLEBNumber(Ip, LocalIdx);
+        Ip = readSafeLEBNumber(Ip, IpEnd, LocalIdx);
         LocalType = FuncInst->getLocalType(LocalIdx);
         LocalOffset = FuncInst->getLocalOffset(LocalIdx);
 
@@ -1318,7 +1318,7 @@ void BaseInterpreterImpl::interpret() {
         BREAK;
       }
       CASE(GET_GLOBAL) : {
-        Ip = readSafeLEBNumber(Ip, GlobalIdx);
+        Ip = readSafeLEBNumber(Ip, IpEnd, GlobalIdx);
         uint8_t *GlobalAddr = ModInst->getGlobalAddr(GlobalIdx);
         WASMType GlobalType = ModInst->getGlobalType(GlobalIdx);
         switch (GlobalType) {
@@ -1336,7 +1336,7 @@ void BaseInterpreterImpl::interpret() {
         BREAK;
       }
       CASE(SET_GLOBAL) : {
-        Ip = readSafeLEBNumber(Ip, GlobalIdx);
+        Ip = readSafeLEBNumber(Ip, IpEnd, GlobalIdx);
         uint8_t *GlobalAddr = ModInst->getGlobalAddr(GlobalIdx);
         WASMType GlobalType = ModInst->getGlobalType(GlobalIdx);
         switch (GlobalType) {
@@ -1361,7 +1361,7 @@ void BaseInterpreterImpl::interpret() {
       }
       CASE(I32_CONST) : {
         int32_t I32Const;
-        Ip = readSafeLEBNumber(Ip, I32Const);
+        Ip = readSafeLEBNumber(Ip, IpEnd, I32Const);
         Frame->valuePush<int32_t>(ValStackPtr, I32Const);
         BREAK;
       }
@@ -1373,12 +1373,12 @@ void BaseInterpreterImpl::interpret() {
       }
       CASE(I64_CONST) : {
         int64_t I64Const;
-        Ip = readSafeLEBNumber(Ip, I64Const);
+        Ip = readSafeLEBNumber(Ip, IpEnd, I64Const);
         Frame->valuePush<int64_t>(ValStackPtr, I64Const);
         BREAK;
       }
       CASE(MEMORY_GROW) : {
-        Ip = readSafeLEBNumber(Ip, LocalIdx);
+        Ip = readSafeLEBNumber(Ip, IpEnd, LocalIdx);
         uint32_t GrowOldPageCount = Memory->CurPages;
         uint32_t GrowPageCount = Frame->valuePop<uint32_t>(ValStackPtr);
 
@@ -1391,7 +1391,7 @@ void BaseInterpreterImpl::interpret() {
         BREAK;
       }
       CASE(MEMORY_SIZE) : {
-        Ip = readSafeLEBNumber(Ip, LocalIdx);
+        Ip = readSafeLEBNumber(Ip, IpEnd, LocalIdx);
         Frame->valuePush(ValStackPtr, Memory->CurPages);
         BREAK;
       }
@@ -2008,7 +2008,7 @@ void BaseInterpreterImpl::interpret() {
         BREAK;
       }
       CASE(CALL) : {
-        Ip = readSafeLEBNumber(Ip, FuncIdx);
+        Ip = readSafeLEBNumber(Ip, IpEnd, FuncIdx);
 #ifdef ZEN_ENABLE_DEBUG_INTERP
         ZEN_LOG_DEBUG("fidx: %d", FuncIdx);
 #endif
@@ -2040,7 +2040,7 @@ void BaseInterpreterImpl::interpret() {
       CASE(CALL_INDIRECT) : {
 
         uint32_t TypeIdx = 0, TableIdx = 0;
-        Ip = readSafeLEBNumber(Ip, TypeIdx);
+        Ip = readSafeLEBNumber(Ip, IpEnd, TypeIdx);
         // Skip the fixed byte for `table 0`
         ++Ip;
         auto *ExpectedFuncType = Mod->getDeclaredType(TypeIdx);

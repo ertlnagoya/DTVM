@@ -94,6 +94,32 @@ private:
   }
 };
 
+class SbbInstruction : public FixedOperandInstruction<3> {
+public:
+  template <typename... Arguments>
+  static SbbInstruction *create(Arguments &&...Args) {
+    return FixedOperandInstruction::create<SbbInstruction>(
+        std::forward<Arguments>(Args)...);
+  }
+
+  static bool classof(const MInstruction *Inst) {
+    return Inst->getOpcode() == OP_sbb;
+  }
+
+private:
+  friend class FixedOperandInstruction;
+  SbbInstruction(MType *Type, MInstruction *Operand1, MInstruction *Operand2,
+                 MInstruction *Borrow)
+      : FixedOperandInstruction(MInstruction::SBB, OP_sbb, 3, Type) {
+    setOperand<0>(Operand1);
+    setOperand<1>(Operand2);
+    setOperand<2>(Borrow);
+    // Although borrow is not used in the current x86lowering, the sbb
+    // instruction still retains the borrow for potential use in future
+    // lowering on other architectures.
+  }
+};
+
 class UnaryInstruction : public FixedOperandInstruction<1> {
 public:
   template <typename... Arguments>
@@ -133,6 +159,79 @@ private:
 protected:
   NaryInstruction(Kind kind, Opcode opcode, MType *type)
       : FixedOperandInstruction(kind, opcode, 0, type) {}
+};
+
+class PhiInstruction : public DynamicOperandInstruction {
+public:
+  using Incoming = std::pair<MBasicBlock *, MInstruction *>;
+
+  static PhiInstruction *create(CompileMemPool &MemPool, MType *Type,
+                                size_t NumIncoming) {
+    return DynamicOperandInstruction::createWithMemPool<PhiInstruction>(
+        MemPool, NumIncoming, Type, NumIncoming);
+  }
+
+  static PhiInstruction *create(CompileMemPool &MemPool, MType *Type,
+                                llvm::ArrayRef<Incoming> Incomings) {
+    return DynamicOperandInstruction::createWithMemPool<PhiInstruction>(
+        MemPool, Incomings.size(), Type, Incomings);
+  }
+
+  static bool classof(const MInstruction *Inst) {
+    return Inst->getOpcode() == OP_phi;
+  }
+
+  size_t getNumIncoming() const { return getNumOperands(); }
+
+  MBasicBlock *getIncomingBlock(size_t Index) const {
+    ZEN_ASSERT(Index < Blocks.size());
+    return Blocks[Index];
+  }
+
+  const MInstruction *getIncomingValue(size_t Index) const {
+    ZEN_ASSERT(Index < getNumOperands());
+    return getOperand(static_cast<OperandNum>(Index));
+  }
+
+  void setIncoming(size_t Index, MBasicBlock *Block, MInstruction *Value) {
+    ZEN_ASSERT(Index < Blocks.size());
+    Blocks[Index] = Block;
+    if (Value != nullptr) {
+      setOperand(static_cast<OperandNum>(Index), Value);
+    } else {
+      getOperand(static_cast<OperandNum>(Index)) = nullptr;
+    }
+  }
+
+  // Update only the incoming block for an edge, leaving the incoming value
+  // unchanged. Used when the CFG edge an incoming block represents is resolved
+  // after the value has already been wired.
+  void setIncomingBlock(size_t Index, MBasicBlock *Block) {
+    ZEN_ASSERT(Index < Blocks.size());
+    Blocks[Index] = Block;
+  }
+
+private:
+  friend class DynamicOperandInstruction;
+
+  PhiInstruction(CompileMemPool &MemPool, MType *Type, size_t NumIncoming)
+      : DynamicOperandInstruction(MInstruction::PHI, OP_phi, NumIncoming, Type),
+        Blocks(NumIncoming, MemPool) {
+    for (size_t Index = 0; Index < NumIncoming; ++Index) {
+      Blocks[Index] = nullptr;
+      getOperand(static_cast<OperandNum>(Index)) = nullptr;
+    }
+  }
+
+  PhiInstruction(CompileMemPool &MemPool, MType *Type,
+                 llvm::ArrayRef<Incoming> Incomings)
+      : PhiInstruction(MemPool, Type, Incomings.size()) {
+    for (size_t Index = 0; Index < Incomings.size(); ++Index) {
+      setIncoming(Index, Incomings[Index].first, Incomings[Index].second);
+    }
+  }
+
+  CompileVector<MBasicBlock *> Blocks;
 };
 
 class DassignInstruction : public UnaryInstruction {
@@ -665,6 +764,153 @@ private:
     setOperand<1>(LHSHi);
     setOperand<2>(RHSLo);
     setOperand<3>(RHSHi);
+  }
+};
+
+// EVM 64x64->128 multiplication instruction (low 64-bit result).
+class EvmUmul128Instruction : public FixedOperandInstruction<2> {
+public:
+  template <typename... Arguments>
+  static EvmUmul128Instruction *create(Arguments &&...Args) {
+    return FixedOperandInstruction::create<EvmUmul128Instruction>(
+        std::forward<Arguments>(Args)...);
+  }
+
+  static bool classof(const MInstruction *Instr) {
+    return Instr->getKind() == EVM_UMUL128;
+  }
+
+private:
+  friend class FixedOperandInstruction;
+  EvmUmul128Instruction(Opcode Opc, MType *Type, MInstruction *LHS,
+                        MInstruction *RHS)
+      : FixedOperandInstruction(MInstruction::EVM_UMUL128, Opc, 2, Type) {
+    setOperand<0>(LHS);
+    setOperand<1>(RHS);
+  }
+};
+
+// Extract high 64-bit result from EVM umul128 instruction.
+class EvmUmul128HiInstruction : public FixedOperandInstruction<1> {
+public:
+  template <typename... Arguments>
+  static EvmUmul128HiInstruction *create(Arguments &&...Args) {
+    return FixedOperandInstruction::create<EvmUmul128HiInstruction>(
+        std::forward<Arguments>(Args)...);
+  }
+
+  static bool classof(const MInstruction *Instr) {
+    return Instr->getKind() == EVM_UMUL128_HI;
+  }
+
+private:
+  friend class FixedOperandInstruction;
+  EvmUmul128HiInstruction(MType *Type, MInstruction *MulInst)
+      : FixedOperandInstruction(MInstruction::EVM_UMUL128_HI, OP_evm_umul128_hi,
+                                1, Type) {
+    setOperand<0>(MulInst);
+  }
+};
+
+class EvmU256MulInstruction : public FixedOperandInstruction<8> {
+public:
+  template <typename... Arguments>
+  static EvmU256MulInstruction *create(Arguments &&...Args) {
+    return FixedOperandInstruction::create<EvmU256MulInstruction>(
+        std::forward<Arguments>(Args)...);
+  }
+
+  static bool classof(const MInstruction *Instr) {
+    return Instr->getKind() == EVM_U256_MUL;
+  }
+
+private:
+  friend class FixedOperandInstruction;
+  EvmU256MulInstruction(MType *Type, MInstruction *A0, MInstruction *A1,
+                        MInstruction *A2, MInstruction *A3, MInstruction *B0,
+                        MInstruction *B1, MInstruction *B2, MInstruction *B3)
+      : FixedOperandInstruction(MInstruction::EVM_U256_MUL, OP_evm_u256_mul, 8,
+                                Type) {
+    setOperand<0>(A0);
+    setOperand<1>(A1);
+    setOperand<2>(A2);
+    setOperand<3>(A3);
+    setOperand<4>(B0);
+    setOperand<5>(B1);
+    setOperand<6>(B2);
+    setOperand<7>(B3);
+  }
+};
+
+class EvmU256MulResultInstruction : public UnaryInstruction {
+public:
+  template <typename... Arguments>
+  static EvmU256MulResultInstruction *create(Arguments &&...Args) {
+    return FixedOperandInstruction::create<EvmU256MulResultInstruction>(
+        std::forward<Arguments>(Args)...);
+  }
+
+  static bool classof(const MInstruction *Instr) {
+    return Instr->getKind() == EVM_U256_MUL_RESULT;
+  }
+
+  const MInstruction *getMulInst() const { return getOperand<0>(); }
+  uint32_t getResultIdx() const { return ResultIdx; }
+
+private:
+  friend class FixedOperandInstruction;
+  EvmU256MulResultInstruction(MType *Type, MInstruction *MulInst,
+                              uint32_t ResultIdx)
+      : UnaryInstruction(MInstruction::EVM_U256_MUL_RESULT,
+                         OP_evm_u256_mul_result, Type, MulInst),
+        ResultIdx(ResultIdx) {}
+
+  uint32_t ResultIdx = 0;
+};
+
+// EVM 128-bit / 64-bit unsigned division: (hi:lo) / divisor -> quotient.
+class EvmUdiv128By64Instruction : public FixedOperandInstruction<3> {
+public:
+  template <typename... Arguments>
+  static EvmUdiv128By64Instruction *create(Arguments &&...Args) {
+    return FixedOperandInstruction::create<EvmUdiv128By64Instruction>(
+        std::forward<Arguments>(Args)...);
+  }
+
+  static bool classof(const MInstruction *Instr) {
+    return Instr->getKind() == EVM_UDIV128_BY64;
+  }
+
+private:
+  friend class FixedOperandInstruction;
+  EvmUdiv128By64Instruction(Opcode Opc, MType *Type, MInstruction *Hi,
+                            MInstruction *Lo, MInstruction *Divisor)
+      : FixedOperandInstruction(MInstruction::EVM_UDIV128_BY64, Opc, 3, Type) {
+    setOperand<0>(Hi);
+    setOperand<1>(Lo);
+    setOperand<2>(Divisor);
+  }
+};
+
+// Extract remainder from EVM udiv128_by64 instruction.
+class EvmUrem128By64Instruction : public FixedOperandInstruction<1> {
+public:
+  template <typename... Arguments>
+  static EvmUrem128By64Instruction *create(Arguments &&...Args) {
+    return FixedOperandInstruction::create<EvmUrem128By64Instruction>(
+        std::forward<Arguments>(Args)...);
+  }
+
+  static bool classof(const MInstruction *Instr) {
+    return Instr->getKind() == EVM_UREM128_BY64;
+  }
+
+private:
+  friend class FixedOperandInstruction;
+  EvmUrem128By64Instruction(MType *Type, MInstruction *DivInst)
+      : FixedOperandInstruction(MInstruction::EVM_UREM128_BY64,
+                                OP_evm_urem128_by64, 1, Type) {
+    setOperand<0>(DivInst);
   }
 };
 
