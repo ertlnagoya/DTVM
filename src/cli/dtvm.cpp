@@ -8,6 +8,7 @@
 #include "zetaengine.h"
 #include <CLI/CLI.hpp>
 #ifdef ZEN_ENABLE_EVM
+#include "evm/evm.h"
 #include "evm/storage_diff.h"
 #include "host/evm/crypto.h"
 #include "tests/evm_test_host.hpp"
@@ -636,6 +637,29 @@ int main(int argc, char *argv[]) {
                                .Create2Salt = Create2Salt,
                                .Value = zen::utils::parseUint256(ValueHex)};
     evmc_message Msg = createEvmMessage(MockedHost, MsgConfig, Bytecode);
+
+    // Deduct intrinsic (transaction-base) gas and pre-warm transaction-level
+    // accounts before execution, matching upstream DTVM transaction semantics
+    // (EIP-2028 calldata cost, EIP-3860 initcode cost, EIP-2929/3651 warming).
+    // This makes the receipt's gas_used transaction-accurate rather than
+    // execution-only.
+    const evmc_revision EvmRevision = zen::evm::DEFAULT_REVISION;
+    const int64_t IntrinsicGas = zen::utils::computeIntrinsicGas(
+        EvmRevision, MsgKind, Msg.input_data, Msg.input_size);
+    if (Msg.gas < IntrinsicGas) {
+      printf("status code: %d\n", static_cast<int>(EVMC_OUT_OF_GAS));
+      printf("status: %s\n", evmc::to_string(EVMC_OUT_OF_GAS));
+      printf("gas left: 0\n");
+      SIMPLE_LOG_ERROR("intrinsic gas (%lld) exceeds gas limit (%lld)",
+                       static_cast<long long>(IntrinsicGas),
+                       static_cast<long long>(Msg.gas));
+      return exitMain(static_cast<int>(EVMC_OUT_OF_GAS), RT.get());
+    }
+    Msg.gas -= IntrinsicGas;
+    zen::utils::prewarmTransactionAccounts(MockedHost, EvmRevision, Msg.sender,
+                                           Msg.recipient,
+                                           MockedHost.tx_context.block_coinbase);
+
     RT->callEVMMain(*Inst, Msg, ExeResult);
 
     if (EVMC_CREATE == MsgKind || EVMC_CREATE2 == MsgKind) {

@@ -3,6 +3,7 @@
 
 #include "utils/evm.h"
 #include "common/errors.h"
+#include "evm/evm.h"
 #include "host/evm/crypto.h"
 #include "intx/intx.hpp"
 #include "utils/rlp_encoding.h"
@@ -508,6 +509,55 @@ bool loadState(evmc::MockedHost &Host, const std::string &FilePath) {
   }
 
   return true;
+}
+
+// Intrinsic (transaction-base) gas, ported from upstream DTVM so the CLI's
+// receipt gas accounting matches upstream transaction semantics.
+int64_t computeIntrinsicGas(evmc_revision Revision, evmc_call_kind MsgKind,
+                            const uint8_t *InputData, size_t InputSize) {
+  using namespace zen::evm;
+  int64_t Gas = BASIC_EXECUTION_COST;
+
+  // Calldata cost (EIP-2028)
+  const int64_t NonZeroCost = Revision >= EVMC_ISTANBUL
+                                  ? TX_DATA_NON_ZERO_GAS
+                                  : TX_DATA_NON_ZERO_GAS_PRE_ISTANBUL;
+  for (size_t Idx = 0; Idx < InputSize; ++Idx) {
+    Gas += InputData[Idx] == 0 ? TX_DATA_ZERO_GAS : NonZeroCost;
+  }
+
+  // CREATE cost (Homestead+) and initcode cost (EIP-3860, Shanghai+)
+  const bool IsCreate = MsgKind == EVMC_CREATE || MsgKind == EVMC_CREATE2;
+  if (IsCreate && Revision >= EVMC_HOMESTEAD) {
+    Gas += TX_CREATE_COST;
+    if (Revision >= EVMC_SHANGHAI && InputSize > 0) {
+      Gas += static_cast<int64_t>((InputSize + 31) / 32) * INITCODE_WORD_GAS;
+    }
+  }
+
+  return Gas;
+}
+
+void prewarmTransactionAccounts(evmc::MockedHost &Host, evmc_revision Revision,
+                                const evmc::address &Sender,
+                                const evmc::address &Recipient,
+                                const evmc::address &Coinbase) {
+  // EIP-2929 (Berlin+): sender, recipient, and precompiles (0x01-0x09) are warm.
+  if (Revision >= EVMC_BERLIN) {
+    Host.access_account(Sender);
+    if (Recipient != evmc::address{}) {
+      Host.access_account(Recipient);
+    }
+    for (int PrecompileIdx = 1; PrecompileIdx <= 9; ++PrecompileIdx) {
+      evmc::address PrecompileAddr{};
+      PrecompileAddr.bytes[19] = static_cast<uint8_t>(PrecompileIdx);
+      Host.access_account(PrecompileAddr);
+    }
+  }
+  // EIP-3651 (Shanghai+): coinbase is warm at the start of a transaction.
+  if (Revision >= EVMC_SHANGHAI) {
+    Host.access_account(Coinbase);
+  }
 }
 
 } // namespace zen::utils
